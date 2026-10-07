@@ -1,0 +1,109 @@
+server:
+  address: 127.0.0.1
+  port: 18080
+
+spring:
+  config:
+    # 本地所有 Provider 与数据库设置统一由进程环境或被忽略的根目录 .env 提供。
+    import: optional:file:.env[.properties]
+  application:
+    name: eaf
+  ai:
+    dashscope:
+      # 只满足 Provider 客户端构造；每个真实出站请求都由 Model 拦截器替换为受限凭据版本。
+      api-key: eaf-dynamic-credential-placeholder
+  http:
+    clients:
+      connect-timeout: ${EAF_MODEL_HTTP_CONNECT_TIMEOUT:2s}
+      read-timeout: ${EAF_MODEL_HTTP_READ_TIMEOUT:20s}
+  task:
+    scheduling:
+      pool:
+        size: 2
+  datasource:
+    url: ${EAF_DB_URL}
+    username: ${EAF_DB_USERNAME}
+    password: ${EAF_DB_PASSWORD}
+  flyway:
+    create-schemas: true
+    default-schema: eaf_meta
+    schemas: eaf_meta
+
+eaf:
+  workflow:
+    dispatcher-enabled: ${EAF_WORKFLOW_DISPATCHER_ENABLED:true}
+    batch-enabled: ${EAF_WORKFLOW_BATCH_ENABLED:true}
+  outbound:
+    enterprise:
+      # 仅代表部署方声明已配置出口 ACL；应用无法证明实际防火墙或云网络规则生效。
+      egress-policy-confirmed: ${EAF_OUTBOUND_EGRESS_POLICY_CONFIRMED:false}
+    a2a:
+      # 格式为 https://peer.example:443/a2a=203.0.113.10,203.0.113.11；每个目标须显式登记 IP。
+      enterprise-targets: ${EAF_A2A_ENTERPRISE_TARGETS:}
+  secrets:
+    # 默认 Environment 解析只适用于本地演示；企业模式会拒绝此后端，需接入受管实现。
+    backend: environment
+  security:
+    mode: disabled
+  model:
+    # 默认始终使用确定性实现；真实 Provider 必须由本机环境变量显式启用。
+    mode: ${EAF_MODEL_MODE:deterministic}
+    scenario: ${EAF_MODEL_SCENARIO:SUCCESS}
+    max-concurrent-requests: ${EAF_MODEL_MAX_CONCURRENT_REQUESTS:16}
+    quota-mode: ${EAF_MODEL_QUOTA_MODE:local}
+    shared-max-concurrent: ${EAF_MODEL_SHARED_MAX_CONCURRENT:16}
+    shared-lease-duration: ${EAF_MODEL_SHARED_LEASE_DURATION:PT90S}
+    shared-heartbeat-interval: ${EAF_MODEL_SHARED_HEARTBEAT_INTERVAL:PT10S}
+    jev:
+      mode: ${EAF_MODEL_JEV_MODE:disabled}
+      evidence-mode: ${EAF_MODEL_JEV_EVIDENCE_MODE:disabled}
+      endpoint: ${EAF_MODEL_JEV_ENDPOINT:https://api.typesafe.ai/v1/systemone}
+      model: ${EAF_MODEL_JEV_MODEL:jev-1.13.0}
+      data-authorized: ${EAF_MODEL_JEV_DATA_AUTHORIZED:false}
+      outbound-data-scope: ${EAF_MODEL_JEV_OUTBOUND_DATA_SCOPE:}
+      run-owner: ${EAF_MODEL_JEV_RUN_OWNER:}
+      authorization-id: ${EAF_MODEL_JEV_AUTHORIZATION_ID:}
+      authorization-expiry: ${EAF_MODEL_JEV_AUTHORIZATION_EXPIRY:}
+  task:
+    max-concurrent: ${EAF_TASK_MAX_CONCURRENT:8}
+    max-queued: ${EAF_TASK_MAX_QUEUED:256}
+    max-queued-per-workspace: ${EAF_TASK_MAX_QUEUED_PER_WORKSPACE:${eaf.task.max-queued:256}}
+    fair-dispatch-enabled: ${EAF_TASK_FAIR_DISPATCH_ENABLED:true}
+    claim-scan-limit: ${EAF_TASK_CLAIM_SCAN_LIMIT:32}
+    evaluation-slot-wait: ${EAF_TASK_EVALUATION_SLOT_WAIT:PT5S}
+    shutdown-grace: ${EAF_TASK_SHUTDOWN_GRACE:PT30S}
+    dispatcher-enabled: ${EAF_TASK_DISPATCHER_ENABLED:true}
+    poll-delay: 100
+    active-duration: PT60S
+    lifetime: PT24H
+  protocol:
+    a2a:
+      endpoint: ${EAF_A2A_ENDPOINT:http://127.0.0.1:18080/a2a}
+      card-version: 0.1.0
+
+management:
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  endpoint:
+    prometheus:
+      access: read-only
+    health:
+      show-details: never
+      probes:
+        enabled: true
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState,db
+  endpoints:
+    web:
+      exposure:
+        # 只开放健康检查与 Prometheus scrape；指标由映射的 SERVICE 身份读取。
+        include:
+          - health
+          - prometheus
+# HTTP 超时要约束真实请求本身；Runtime 截止时间仍负责整轮预算与取消。
+# 本文件负责 EAF 的 application.yml 相关定义。

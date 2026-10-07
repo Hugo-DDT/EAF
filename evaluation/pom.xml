@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent><groupId>io.eaf</groupId><artifactId>eaf-parent</artifactId><version>0.1.0-SNAPSHOT</version></parent>
+    <artifactId>eaf-evaluation</artifactId>
+    <dependencies>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-shared</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-task</artifactId><version>${project.version}</version></dependency>
+        <!-- Evaluation 只通过 RuntimeQuery 公共读取接口统计工具轨迹，不读 Runtime 表。 -->
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-agent-runtime</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-agent</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-capability</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-context</artifactId><version>${project.version}</version></dependency>
+        <!-- Evaluation 通过目标域 API 复核基线当前性，不直接读取 Knowledge/Memory 表。 -->
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-knowledge</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-memory</artifactId><version>${project.version}</version></dependency>
+        <!-- Evaluation 通过 Usage API 汇总每次模型调用，不跨域读取用量表。 -->
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-usage</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-workspace</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-jdbc</artifactId></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-json</artifactId></dependency>
+    </dependencies>
+</project>
+<!-- 本文件负责 EAF 的 pom.xml 相关定义。 -->

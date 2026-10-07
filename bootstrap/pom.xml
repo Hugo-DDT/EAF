@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.eaf</groupId>
+        <artifactId>eaf-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>eaf-bootstrap</artifactId>
+
+    <dependencies>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-agent-protocol</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-agent-runtime</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-evaluation</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-integration</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-credential</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-provisioning</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-workflow</artifactId><version>${project.version}</version></dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <!--  通过受认证的 Prometheus scrape 暴露 Micrometer 聚合指标。 -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <id>live-model</id>
+            <dependencies>
+                <dependency><groupId>org.springframework.ai</groupId><artifactId>spring-ai-model</artifactId><version>${spring-ai.version}</version></dependency>
+                <!-- DeepSeek 官方 API 通过 Spring AI OpenAI 兼容适配进入 model 边界。 -->
+                <dependency><groupId>org.springframework.ai</groupId><artifactId>spring-ai-starter-model-openai</artifactId><version>${spring-ai.version}</version></dependency>
+                <!-- Boot 应用与 model profile 使用同一 DashScope 补丁版本，避免运行时类路径回退。 -->
+                <dependency><groupId>com.alibaba.cloud.ai</groupId><artifactId>spring-ai-alibaba-starter-dashscope</artifactId><version>1.1.2.2</version></dependency>
+            </dependencies>
+        </profile>
+    </profiles>
+</project>
+<!-- 本文件负责 EAF 的 pom.xml 相关定义。 -->

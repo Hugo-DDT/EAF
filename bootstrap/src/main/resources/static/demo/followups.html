@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>EAF · 团队客户跟进</title>
+  <link rel="stylesheet" href="/demo/followups.css">
+  <script type="module" src="/demo/followups.js"></script>
+</head>
+<body>
+  <header class="masthead">
+    <a class="wordmark" href="/demo/"><span class="mark">E</span><span><b>EAF</b><small>LOCAL AGENT WORKSPACE</small></span></a>
+    <div class="mast-meta"><span class="status-light"></span>LOCAL <a href="/demo/conversations.html">客户会话 ↗</a><a href="/demo/">返回演示首页 ↗</a></div>
+  </header>
+  <main class="page-shell">
+    <section class="hero">
+      <div><p class="overline">TEAM FOLLOW-UP</p>
+        <h1>接过一条跟进，<em>留下下一步。</em></h1>
+        <p>只共享经本人确认的跟进摘要与处理结果。业务记录留在团队工作区；CRM 同步单独审批，并按原操作编号回读核验。</p></div>
+      <div class="hero-seal"><span>SHARED</span><b>E</b><small>LOCAL EDITION</small></div>
+    </section>
+    <section class="identity-card" aria-labelledby="identity-heading">
+      <div class="identity-copy"><span class="number">00</span><div><h2 id="identity-heading">本地身份</h2><p>Bearer 令牌只在当前页面内存；刷新后重新连接。</p></div></div>
+      <form id="identity-form" class="identity-form">
+        <label>Workspace ID<input id="workspace-id" value="10000000-0000-4000-8000-000000000001" autocomplete="off" spellcheck="false"></label>
+        <label>身份令牌<input id="token" type="password" placeholder="输入本地身份令牌" autocomplete="off"></label>
+        <button class="button button-dark" type="submit">连接 ↗</button>
+      </form>
+      <p id="identity-status" class="identity-status" aria-live="polite">未连接</p>
+    </section>
+    <section class="toolbar" aria-label="跟进筛选">
+      <div><p class="overline">FOLLOW-UP QUEUE</p><h2>团队待办</h2></div>
+      <div class="toolbar-controls">
+        <label>视图<select id="scope"><option value="mine">我负责</option><option value="created">我创建</option><option value="team">团队可读</option></select></label>
+        <label>状态<select id="status-filter"><option value="">全部状态</option><option value="OPEN">待处理</option><option value="IN_PROGRESS">跟进中</option><option value="CLOSED">已结束</option></select></label>
+        <button id="refresh" class="button button-light" type="button">刷新列表 ↻</button>
+      </div>
+    </section>
+    <section class="desk">
+      <aside class="queue-panel">
+        <div class="queue-heading"><span>01 / QUEUE</span><b id="queue-count">0 条</b></div>
+        <div id="card-list" class="card-list"><p class="empty">连接身份后加载跟进。</p></div>
+        <button id="load-more" class="text-button" type="button" hidden>继续加载 ↓</button>
+      </aside>
+      <section class="detail-panel" aria-live="polite">
+        <div id="detail"><div class="blank-detail"><span class="blank-mark">↳</span><p class="overline">02 / RECORD</p><h2>选择一条跟进</h2><p>查看分派、处理记录与同步状态；保存结果不会调用模型或 CRM。</p></div></div>
+      </section>
+    </section>
+    <section class="create-panel">
+      <div class="create-intro"><p class="overline">03 / SHARE A FOLLOW-UP</p><h2>从本人分析创建共享任务</h2><p>客户与来源由会话绑定。确认提交的摘要成为团队可读内容，私人对话和个人经验不会共享。</p></div>
+      <form id="create-form" class="create-form">
+        <label>本人客户分析<select id="source-task" required><option value="">先连接并读取可用分析</option></select></label>
+        <label>跟进摘要<textarea id="create-summary" rows="3" maxlength="2000" required placeholder="确认后提供给同客户权限的团队成员"></textarea></label>
+        <div class="create-fields"><label>负责人<select id="assignee"><option value="">由我负责</option></select></label><label>计划日期<input id="due-at" type="datetime-local"></label></div>
+        <div class="create-footer"><span id="create-status" aria-live="polite">选择成功分析后填写共享摘要。</span><button class="button button-primary" type="submit" disabled>创建团队跟进 ↗</button></div>
+      </form>
+    </section>
+    <section class="approval-panel">
+      <div class="approval-title"><p class="overline">04 / SEPARATE APPROVAL</p><h2>待处理的审批</h2><p>审批仍按当前审批权限、自批限制和固定执行链路校验。</p></div>
+      <div id="approval-list" class="approval-list"><p class="empty">连接审批人身份后读取待办。</p></div>
+    </section>
+    <footer class="page-footer"><span>EAF / TEAM DESK</span><span>本地确定性演示 · 合成客户 · 不调用真实 CRM 或模型</span></footer>
+  </main>
+</body>
+</html>

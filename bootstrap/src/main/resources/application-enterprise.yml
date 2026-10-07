@@ -1,0 +1,32 @@
+# 企业部署仅在显式激活 enterprise Profile 后装载；缺少身份源或独立迁移凭据时启动失败。
+spring:
+  config:
+    activate:
+      on-profile: enterprise
+  flyway:
+    # Flyway 使用独立迁移角色；spring.datasource 用户应只持有运行所需的 DML 权限。
+    user: ${EAF_DB_MIGRATOR_USERNAME}
+    password: ${EAF_DB_MIGRATOR_PASSWORD}
+
+eaf:
+  security:
+    # 企业 Profile 固定启用 JWKS Bearer 验证，不接受 local alias。
+    mode: enterprise
+    enterprise:
+      issuer: ${EAF_IDP_ISSUER}
+      jwks-uri: ${EAF_IDP_JWKS_URI}
+      audience: ${EAF_IDP_AUDIENCE}
+  secrets:
+    # 未配置受管后端时使用 unavailable resolver，缺引用即失败，不退回 Environment。
+    backend: ${EAF_SECRET_BACKEND:unconfigured}
+  model:
+    # 显式声明 deterministic 或已核准的 live mode，避免生产配置隐式沿用开发默认值。
+    mode: ${EAF_MODEL_MODE}
+  outbound:
+    enterprise:
+      # 只有部署 Owner 核验网络 ACL 后才可显式确认；该值本身不证明防火墙已生效。
+      egress-policy-confirmed: ${EAF_OUTBOUND_EGRESS_POLICY_CONFIRMED:false}
+  agent-protocol:
+    # 未逐客户端验证的入口默认关闭；按批准的部署清单逐个开启。
+    mcp-enabled: ${EAF_MCP_ENABLED:false}
+    a2a-enabled: ${EAF_A2A_ENABLED:false}

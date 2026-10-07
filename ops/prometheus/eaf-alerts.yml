@@ -1,0 +1,83 @@
+groups:
+  - name: eaf.enterprise-operations
+    interval: 30s
+    rules:
+      - alert: EAFExecutionUnknown
+        expr: eaf_execution_unknown > 0
+        for: 2m
+        labels:
+          severity: critical
+          owner: platform-operations
+        annotations:
+          summary: EAF 存在待核验的外部操作
+          action: 使用授权的 Execution 核验入口对账；保持 UNKNOWN，不重发外部写入。
+
+      - alert: EAFOutboxFailed
+        expr: eaf_outbox_events{state="FAILED"} > 0
+        for: 5m
+        labels:
+          severity: warning
+          owner: platform-operations
+        annotations:
+          summary: EAF 域 Outbox 持续失败
+          action: 按 domain 标签联系数据 Owner 检查下游与 Audit 可用性；仅通过该域幂等 API 恢复。
+
+      - alert: EAFOutboxPendingAge
+        expr: eaf_outbox_oldest_seconds{state="PENDING"} > 300
+        for: 5m
+        labels:
+          severity: warning
+          owner: platform-operations
+        annotations:
+          summary: EAF Outbox 事件积压超过五分钟
+          action: 检查对应域的投递器和依赖状态；人工审批等待不由此规则判断。
+
+      - alert: EAFTaskQueueBacklog
+        expr: eaf_task_state{state="QUEUED"} > 50
+        for: 5m
+        labels:
+          severity: warning
+          owner: task-operations
+        annotations:
+          summary: EAF Task 队列持续积压
+          action: 检查 Dispatcher、Worker 与数据库容量；先恢复处理能力，不自动扩大预算。
+
+      - alert: EAFWorkflowWaitingTooLong
+        expr: eaf_workflow_waiting_oldest_seconds > 3600
+        for: 10m
+        labels:
+          severity: warning
+          owner: workflow-operations
+        annotations:
+          summary: EAF Workflow 子任务等待超过一小时
+          action: 用授权 Workflow 查询定位实例及依赖；人工审批等待不计为系统失败。
+
+      - alert: EAFUnknownUsageCost
+        expr: eaf_usage_unknown_cost > 0
+        for: 10m
+        labels:
+          severity: warning
+          owner: finance-operations
+        annotations:
+          summary: EAF 存在未知价格或用量记录
+          action: 对照 Provider 账单补核费用；未知费用继续占用预算，不得按零成本处理。
+
+      - alert: EAFBudgetRefusalObserved
+        expr: increase(eaf_usage_budget_denials_total[5m]) > 0 or increase(eaf_runtime_operations_total{phase="budget",outcome="denied"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: info
+          owner: workspace-operations
+        annotations:
+          summary: EAF 在最近五分钟拒绝了预算请求
+          action: 核对当前费用上限和拒绝明细；预算拒绝是治理结果，不自动提高额度。
+
+      - alert: EAFRuntimeFailures
+        expr: sum(rate(eaf_runtime_operations_total{outcome=~"failed|timed_out"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          owner: platform-operations
+        annotations:
+          summary: EAF 模型、工具或 Runtime 错误率持续升高
+          action: 按 phase 聚合指标查看受授权 Trace；指标不含 Task ID、Prompt、参数或错误文本。

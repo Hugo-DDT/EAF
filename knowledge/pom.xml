@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent><groupId>io.eaf</groupId><artifactId>eaf-parent</artifactId><version>0.1.0-SNAPSHOT</version></parent>
+    <artifactId>eaf-knowledge</artifactId>
+    <dependencies>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-shared</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-workspace</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-identity</artifactId><version>${project.version}</version></dependency>
+        <!-- 发布事件通过 Audit API 幂等留痕，不跨域写审计表。 -->
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-audit</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-model</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-jdbc</artifactId></dependency>
+        <!-- Knowledge 域只发布自己的 Outbox 聚合指标。 -->
+        <dependency><groupId>io.micrometer</groupId><artifactId>micrometer-core</artifactId></dependency>
+        <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId></dependency>
+    </dependencies>
+</project>
+<!-- 本模块只承载正式知识的原文、版本和文档级授权，不提前实现检索派生数据。 -->

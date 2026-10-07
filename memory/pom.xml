@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent><groupId>io.eaf</groupId><artifactId>eaf-parent</artifactId><version>0.1.0-SNAPSHOT</version></parent>
+    <artifactId>eaf-memory</artifactId>
+    <dependencies>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-shared</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-workspace</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-audit</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-jdbc</artifactId></dependency>
+        <!-- Memory 域只发布自己的 Outbox 聚合指标。 -->
+        <dependency><groupId>io.micrometer</groupId><artifactId>micrometer-core</artifactId></dependency>
+        <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId></dependency>
+    </dependencies>
+</project>
+<!-- Memory 自有版本、来源和访问状态；不负责学习候选或 Context 编排。 -->

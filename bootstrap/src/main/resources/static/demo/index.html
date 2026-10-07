@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>EAF · 本地工作台</title>
+  <link rel="stylesheet" href="/demo/styles.css">
+  <script type="module" src="/demo/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/demo/" aria-label="EAF 本地工作台首页">
+      <span class="brand-mark">E</span><span><b>EAF</b><small>LOCAL AGENT WORKSPACE</small></span>
+    </a>
+    <div class="top-meta"><span class="live-dot"></span><span>LOCAL</span><span class="top-date">TEAM FOLLOW-UP / REVIEW</span></div>
+  </header>
+
+  <main class="shell">
+    <section class="intro">
+      <div>
+        <p class="eyebrow">EAF <span>·</span> EVIDENCE FIRST</p>
+        <h1>把知识变成<br><em>可核对的行动。</em></h1>
+        <p class="intro-copy">在授权材料里寻找答案，或把客户分析整理成一条由你确认的跟进。每一步都保留来源与进度。</p>
+      </div>
+      <div class="intro-stamp"><span>DESK</span><b>09</b><small>LOCAL EDITION</small></div>
+    </section>
+
+    <section class="identity-panel" aria-labelledby="identity-title">
+      <div class="identity-title"><span class="section-index">00</span><div><h2 id="identity-title">本地身份</h2><p>Bearer 令牌仅保存在此页面内存；刷新后请重新连接。</p></div></div>
+      <form id="identity-form" class="identity-form">
+        <label>Workspace ID<input id="workspace-id" value="10000000-0000-4000-8000-000000000001" autocomplete="off" spellcheck="false"></label>
+        <label class="token-label">本地身份令牌<input id="token-input" type="password" placeholder="输入已配置的本地令牌" autocomplete="off"></label>
+        <button class="button button-dark" type="submit">连接身份 <span aria-hidden="true">↗</span></button>
+      </form>
+      <p id="connection-status" class="connection-status" aria-live="polite">尚未连接。请输入本地令牌后开始。</p>
+    </section>
+
+    <div class="workspace-grid">
+      <nav class="rail" aria-label="工作台视图">
+        <p class="rail-label">WORKSPACE</p>
+        <button class="nav-button active" data-view="knowledge"><span>01</span>知识库</button>
+        <button class="nav-button" data-view="qa"><span>02</span>知识问答</button>
+        <button class="nav-button" data-view="followup"><span>03</span>客户跟进</button>
+        <button class="nav-button" data-view="history"><span>04</span>任务记录</button>
+        <a class="nav-button" href="/demo/conversations.html"><span>11</span>个人经验工作台 ↗</a>
+          <a class="nav-button" href="/demo/followups.html"><span>12</span>团队跟进工作台 ↗</a>
+        <div class="rail-note"><span class="tiny-rule"></span><p>演示数据<br>合成样例 · 本机运行</p></div>
+      </nav>
+
+      <div class="content-area">
+        <section class="view" id="view-knowledge" aria-labelledby="knowledge-title">
+          <div class="view-heading"><div><p class="eyebrow">01 / SOURCE MATERIAL</p><h2 id="knowledge-title">知识库</h2></div><p class="view-note">导入 UTF-8 Markdown 或 TXT，发布后才参与检索。</p></div>
+          <div class="two-column">
+            <article class="card upload-card">
+              <div class="card-kicker"><span class="section-index">A</span><span>ADD A DOCUMENT</span></div>
+              <h3>添一份可追溯的材料</h3>
+              <p class="muted">文件内容直接写入 EAF Knowledge。发布和检索会再次检查当前身份权限。</p>
+              <form id="document-form" class="stack-form">
+                <label>标题<input id="document-title" maxlength="200" placeholder="例如：演示服务条款"></label>
+                <label class="file-picker">选择文件<input id="document-file" type="file" accept=".md,.markdown,.txt,text/plain,text/markdown"></label>
+                <button class="button button-accent" type="submit">导入、建索引并发布 <span aria-hidden="true">＋</span></button>
+              </form>
+              <p id="document-status" class="inline-status" aria-live="polite"></p>
+            </article>
+            <article class="card search-card">
+              <div class="card-kicker"><span class="section-index">B</span><span>RETRIEVAL CHECK</span></div>
+              <h3>检索一条规则</h3>
+              <form id="search-form" class="search-form"><label class="sr-only" for="search-query">检索问题</label><input id="search-query" placeholder="输入产品编号或自然语言问题"><button class="button button-dark" type="submit">检索</button></form>
+              <div id="search-results" class="result-list" aria-live="polite"><p class="empty-state">检索结果会显示标题路径、来源和命中通道。</p></div>
+            </article>
+          </div>
+          <article class="card list-card"><div class="card-heading"><div><div class="card-kicker"><span class="section-index">C</span><span>AUTHORIZED DOCUMENTS</span></div><h3>当前可读取的文档</h3></div><button class="button button-quiet" id="refresh-documents" type="button">重新查询 ↻</button></div><div id="document-list" class="document-list"><p class="empty-state">连接身份后加载文档。</p></div></article>
+        </section>
+
+        <section class="view" id="view-qa" aria-labelledby="qa-title" hidden>
+          <div class="view-heading"><div><p class="eyebrow">02 / KNOWLEDGE ANSWER</p><h2 id="qa-title">知识问答</h2></div><p class="view-note">答案只来自当前身份可读的正式知识片段。</p></div>
+          <article class="card question-card"><div class="card-kicker"><span class="section-index">ASK</span><span>KNOWLEDGE QA · HYBRID RETRIEVAL</span></div><form id="qa-form" class="stack-form"><label for="qa-question">你想确认什么？</label><textarea id="qa-question" rows="4" maxlength="4000" placeholder="例如：标准续约产品的编号是什么？"></textarea><div class="form-footer"><span>无可用知识时会直接说明证据不足。</span><button class="button button-accent" type="submit">生成带引用的回答 <span aria-hidden="true">↗</span></button></div></form><p id="qa-status" class="inline-status" aria-live="polite"></p></article>
+          <div id="qa-result" class="answer-layout"><article class="card answer-card"><p class="eyebrow">ANSWER / CURRENT TASK</p><div id="qa-answer" class="answer-copy empty-state">提交问题后，回答会出现在这里。</div><div id="qa-missing" class="missing-list"></div></article><aside class="card source-card"><p class="eyebrow">SOURCES / CURRENTNESS</p><div id="qa-sources"><p class="empty-state">尚无引用。</p></div></aside></div>
+        </section>
+
+        <section class="view" id="view-followup" aria-labelledby="followup-title" hidden>
+          <div class="view-heading"><div><p class="eyebrow">03 / CUSTOMER FOLLOW-UP</p><h2 id="followup-title">客户跟进</h2></div><p class="view-note">先分析，再编辑确认。CRM 写入仍经过独立审批与核验。</p></div>
+          <article class="card customer-card"><div class="card-kicker"><span class="section-index">01</span><span>SYNTHETIC CUSTOMER MATERIAL</span></div><form id="followup-form" class="stack-form"><div class="two-inputs"><label>客户 ID<input id="customer-id" maxlength="160" placeholder="synthetic-customer-001" required></label><label>材料摘要<textarea id="customer-material" rows="5" maxlength="7000" placeholder="粘贴合成客户材料，例如续约状态、最近联系和投诉摘要。" required></textarea></label></div><div class="form-footer"><span>模型提供的客户 ID 不作为可信值；服务端从绑定注入。</span><button class="button button-accent" type="submit">分析并起草 <span aria-hidden="true">↗</span></button></div></form><p id="followup-status" class="inline-status" aria-live="polite"></p></article>
+          <div class="answer-layout"><article class="card answer-card"><p class="eyebrow">ANALYSIS / DRAFT</p><div id="followup-result" class="empty-state">分析结果和可编辑草稿会显示在这里。</div><label class="draft-label" for="draft-summary">确认前修改跟进摘要</label><textarea id="draft-summary" rows="4" maxlength="2000" disabled></textarea><button class="button button-dark" id="confirm-followup" type="button" disabled>确认并提交审批 <span aria-hidden="true">↗</span></button><div id="workflow-status" class="inline-status" aria-live="polite"></div></article><aside class="card source-card"><p class="eyebrow">EVIDENCE / APPROVAL</p><div id="followup-sources"><p class="empty-state">客户分析引用会显示在这里。</p></div><div id="approval-actions"></div></aside></div>
+        </section>
+
+        <section class="view" id="view-history" aria-labelledby="history-title" hidden>
+          <div class="view-heading"><div><p class="eyebrow">04 / TASK JOURNAL</p><h2 id="history-title">任务记录</h2></div><p class="view-note">状态、来源、用量和跟进实例均从领域 API 查询。</p></div>
+          <article class="card list-card"><div class="card-heading"><div><div class="card-kicker"><span class="section-index">NOW</span><span>VISIBLE TASKS</span></div><h3>当前身份的任务</h3></div><button class="button button-quiet" id="refresh-tasks" type="button">重新查询 ↻</button></div><div id="task-list" class="task-list"><p class="empty-state">连接身份后加载任务。</p></div></article>
+          <article class="card task-detail" id="task-detail"><p class="empty-state">选择一个任务查看可见结果与跟进进度。</p></article>
+        </section>
+      </div>
+    </div>
+    <footer class="footer"><span>EAF / LOCAL DESK</span><span>授权范围由服务端逐次检查 · 数据只用于本地演示</span></footer>
+  </main>
+</body>
+</html>

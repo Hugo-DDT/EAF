@@ -1,0 +1,33 @@
+spring:
+  ai:
+    openai:
+      # Provider Builder 需要非秘密占位值；实际出站前由 EAF 按请求版本替换。
+      api-key: eaf-dynamic-credential-placeholder
+      base-url: ${EAF_MODEL_LIVE_BASE_URL}
+      chat:
+        # DeepSeek 官方端点不带 /v1；保持与 EAF 的精确出站目标白名单一致。
+        completions-path: ${EAF_MODEL_LIVE_CHAT_COMPLETIONS_PATH:/chat/completions}
+        options:
+          model: ${EAF_MODEL_LIVE_MODEL}
+          temperature: ${EAF_MODEL_LIVE_TEMPERATURE}
+
+eaf:
+  model:
+    # profile 只装配 Provider；调用模式与本次授权参数仍由环境变量决定。
+    mode: ${EAF_MODEL_MODE:deterministic}
+    live:
+      provider: ${EAF_MODEL_LIVE_PROVIDER}
+      profile: ${EAF_MODEL_PROFILE}
+      model: ${EAF_MODEL_LIVE_MODEL}
+      base-url: ${EAF_MODEL_LIVE_BASE_URL}
+      credential-ref: ${EAF_MODEL_LIVE_CREDENTIAL_REF}
+      # 缺少本轮外发授权时默认拒绝真实数据出站。
+      data-authorized: ${EAF_MODEL_LIVE_DATA_AUTHORIZED:false}
+      outbound-data-scope: ${EAF_MODEL_LIVE_OUTBOUND_DATA_SCOPE:}
+      fee-cap: ${EAF_MODEL_LIVE_FEE_CAP:}
+      fee-currency: ${EAF_MODEL_LIVE_FEE_CURRENCY:}
+      run-owner: ${EAF_MODEL_LIVE_RUN_OWNER:}
+      authorization-id: ${EAF_MODEL_LIVE_AUTHORIZATION_ID:}
+      authorization-expiry: ${EAF_MODEL_LIVE_AUTHORIZATION_EXPIRY:}
+      stop-condition: ${EAF_MODEL_LIVE_STOP_CONDITION:}
+# 本文件只在显式激活 deepseek profile 时生效，避免默认启动意外产生付费请求。

@@ -1,0 +1,14 @@
+-- 新 Agent 版本仅固定绑定 P7 CRM 只读 Tool，不改写既有已发布 Agent 版本。
+insert into agent.version(id, tenant_id, workspace_id, name, asset_version, prompt_id, prompt_version, model_profile_id, status)
+select id, tenant_id, workspace_id, 'customer-risk-analysis-crm-read-contract', '2.1.0',
+       prompt_id, prompt_version, model_profile_id, 'PUBLISHED'
+from agent.version
+where id = '20000000-0000-4000-8000-000000000001'
+  and workspace_id = '10000000-0000-4000-8000-000000000001'
+  and asset_version = '2.0.0' and status = 'PUBLISHED'
+on conflict (id, workspace_id, asset_version) do nothing;
+
+insert into agent.tool_binding(tenant_id, workspace_id, agent_id, agent_version, tool_name, tool_version)
+values ('70000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000001',
+        '20000000-0000-4000-8000-000000000001', '2.1.0', 'crm.customer.query', '1.1.0')
+on conflict do nothing;

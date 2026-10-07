@@ -1,0 +1,12 @@
+spring:
+  config:
+    import: optional:file:.env[.properties]
+
+server:
+  address: 127.0.0.1
+
+eaf:
+  security:
+    mode: local
+# local 默认仍使用确定性模型；真实 DeepSeek 运行必须显式激活 deepseek profile。
+# 本文件负责 EAF 的 application-local.yml 相关定义。

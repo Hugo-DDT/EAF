@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>EAF · 个人经验工作台</title>
+  <link rel="stylesheet" href="/demo/conversations.css">
+  <script type="module" src="/demo/conversations.js"></script>
+</head>
+<body>
+  <header class="masthead">
+    <a class="wordmark" href="/demo/"><span class="mark">E</span><span><b>EAF</b><small>LOCAL AGENT WORKSPACE</small></span></a>
+    <div class="mast-meta"><span class="status-light"></span>LOCAL <a href="/demo/followups.html">团队跟进 ↗</a><a href="/demo/">返回演示首页 ↗</a></div>
+  </header>
+  <main class="page-shell">
+    <section class="hero">
+      <div><p class="overline">PERSONAL EXPERIENCE</p>
+        <h1>记下有效经验，<em>再由自己确认。</em></h1>
+        <p>纠正与依据可以整理成私人经验卡。卡片仅供本人参考，正式回答仍以当前知识证据为准。</p></div>
+      <div class="hero-seal"><span>PRIVATE</span><b>E</b><small>LOCAL EDITION</small></div>
+    </section>
+
+    <section class="identity-card" aria-labelledby="identity-heading">
+      <div class="identity-copy"><span class="number">00</span><div><h2 id="identity-heading">本地身份</h2><p>令牌只在页面内存中。刷新后重新连接，再从链接中的会话 ID 恢复。</p></div></div>
+      <form id="identity-form" class="identity-form">
+        <label>Workspace ID<input id="workspace-id" value="10000000-0000-4000-8000-000000000001" autocomplete="off" spellcheck="false"></label>
+        <label>身份令牌<input id="token" type="password" placeholder="输入已配置的本地令牌" autocomplete="off"></label>
+        <button class="button button-primary" type="submit">连接 ↗</button>
+      </form>
+      <p id="identity-status" class="identity-status" aria-live="polite">未连接</p>
+    </section>
+
+    <section class="desk" aria-label="个人经验与连续对话工作台">
+      <aside class="sessions-panel">
+        <div class="panel-top"><div><p class="overline">YOUR SESSIONS</p><h2>会话</h2></div><button id="refresh-sessions" class="icon-button" type="button" aria-label="刷新会话">↻</button></div>
+        <form id="new-session" class="new-session">
+          <label for="session-mode">新建会话</label>
+          <select id="session-mode"><option value="KNOWLEDGE_QA">知识问答</option><option value="CUSTOMER_ASSISTANT">客户助手</option></select>
+          <label for="session-title">标题</label><input id="session-title" maxlength="200" placeholder="例如：续约条款与延期规则">
+          <div id="customer-field" hidden><label for="new-customer">合成客户 ID</label><input id="new-customer" maxlength="160" placeholder="synthetic-customer-001"></div>
+          <button class="button button-dark" type="submit">创建会话 <span>＋</span></button>
+        </form>
+        <div class="session-filter"><button type="button" class="filter active" data-session-status="ACTIVE">进行中</button><button type="button" class="filter" data-session-status="ARCHIVED">已归档</button></div>
+        <div id="session-list" class="session-list"><p class="quiet">连接身份后加载会话。</p></div>
+        <p class="sidebar-foot"><span></span>每个会话只对创建者开放</p>
+      </aside>
+
+      <section class="conversation-panel" aria-labelledby="conversation-title">
+        <div class="conversation-head">
+          <div><p class="overline" id="conversation-mode">NO SESSION SELECTED</p><h2 id="conversation-title">选择一个会话</h2><p id="conversation-meta" class="submeta">连续问题、当前任务和结果会显示在这里。</p></div>
+          <div class="session-actions"><button id="rename-session" class="button button-light" type="button" disabled>重命名</button><button id="archive-session" class="button button-light" type="button" disabled>归档</button></div>
+        </div>
+        <div id="notice" class="notice" aria-live="polite"></div>
+        <div id="message-list" class="message-list" aria-live="polite"><div class="welcome-note"><span class="welcome-index">01</span><p>会话消息在这里按轮次恢复。来源只用于本轮答案；历史回复只帮助理解，不作为新证据。</p></div></div>
+        <form id="composer" class="composer">
+          <label for="message-input">本轮补充或问题</label>
+          <textarea id="message-input" rows="3" maxlength="8000" placeholder="例如：那延期规则也适用于加急产品吗？" disabled></textarea>
+          <div class="composer-bottom"><span>本轮最多使用 3 轮近期历史；活动轮次期间不能另发。</span><button id="send-message" class="button button-primary" type="submit" disabled>发送本轮 ↗</button></div>
+        </form>
+        <div class="conversation-foot"><span id="poll-state">终态任务停止轮询</span><div><button id="refresh-conversation" class="text-button" type="button">重新查询状态</button><button id="cancel-turn" class="text-button" type="button" hidden>取消活动轮次</button></div></div>
+      </section>
+
+      <aside class="brief-panel">
+        <section id="team-results-section" class="brief-section team-results-section" hidden>
+          <div class="panel-top"><div><p class="overline">TEAM FOLLOW-UP RECORDS</p><h2>团队处理结果</h2></div><button id="refresh-team-results" class="text-button" type="button">刷新</button></div>
+          <p class="brief-caption">仅选择同一客户的共享业务记录，最多 3 条。CRM 核验只表示内容已回读，不证明记录内容真实。</p>
+          <div id="team-result-list" class="team-result-list"><p class="quiet">选择客户会话后加载。</p></div>
+          <p id="team-result-status" class="small-status" aria-live="polite"></p>
+        </section>
+        <section class="brief-section experience-section">
+          <div class="panel-top"><div><p class="overline">PERSONAL FIELDNOTES</p><h2>个人经验卡</h2></div><div class="experience-tools"><button id="refresh-experience-cards" class="text-button" type="button">刷新</button><button id="new-experience-card" class="text-button" type="button">＋ 新建</button></div></div>
+          <p class="brief-caption">草稿不会进入会话；启用后仅你本人可用。经验用于表达参考，不是事实证据。</p>
+          <form id="experience-card-form" class="experience-form">
+            <label>标题<input id="experience-title" maxlength="80" required placeholder="例如：先确认适用产品范围"></label>
+            <label>经验正文<textarea id="experience-content" rows="4" maxlength="800" required placeholder="记录可复用的操作方法或表达偏好。"></textarea></label>
+            <div class="experience-fields"><label>类型<select id="experience-type"><option value="PROCEDURAL">操作经验</option><option value="PREFERENCE">表达偏好</option></select></label><label>适用范围<select id="experience-applicability"><option value="GENERAL">个人通用</option><option value="CUSTOMER">指定客户</option></select></label></div>
+            <div id="experience-customer-field" hidden><label>合成客户 ID<input id="experience-customer" maxlength="160" placeholder="synthetic-customer-001"></label></div>
+            <label>有效期<input id="experience-expiry" type="datetime-local"></label>
+            <p id="experience-source-note" class="small-status" aria-live="polite">手工卡不绑定反馈来源。</p>
+            <div class="experience-actions"><button id="save-experience-card" class="button button-dark" type="submit">保存草稿</button><button id="cancel-experience-edit" class="button button-light" type="button" hidden>取消编辑</button></div>
+          </form>
+          <p id="experience-status" class="small-status" aria-live="polite"></p>
+          <div id="experience-card-list" class="experience-card-list"><p class="quiet">连接身份后加载个人卡片。</p></div>
+          <button id="load-more-experience-cards" class="text-button experience-load-more" type="button" hidden>加载更多经验卡 ↓</button>
+        </section>
+        <section class="brief-section">
+          <div class="panel-top"><div><p class="overline">CONFIRMED MATERIAL</p><h2>已确认简报</h2></div><span id="brief-revision" class="revision">R—</span></div>
+          <p class="brief-caption">只有已确认的内容会进入下一轮；分析建议需由你确认。</p>
+          <label class="sr-only" for="brief-content">简报内容</label><textarea id="brief-content" rows="8" maxlength="2000" placeholder="可记录已核实的产品主题或客户资料。" disabled></textarea>
+          <div id="suggestion" class="suggestion" hidden><p class="overline">MODEL SUGGESTION · REVIEW BEFORE SAVE</p><p id="suggestion-summary"></p><button id="apply-suggestion" class="button button-sage" type="button">载入建议到编辑框</button></div>
+          <button id="save-brief" class="button button-dark wide" type="button" disabled>保存简报修订</button>
+          <button id="save-and-analyze" class="button button-primary wide" type="button" hidden>保存并重新分析 ↗</button>
+          <p id="brief-status" class="small-status" aria-live="polite"></p>
+        </section>
+        <section id="comparison-section" class="brief-section" hidden><div class="panel-top"><div><p class="overline">REVISION REVIEW</p><h2>前后分析</h2></div><button id="refresh-comparison" class="text-button" type="button">更新</button></div><div id="comparison" class="comparison"><p class="quiet">至少两次分析后显示变化。</p></div></section>
+        <section class="brief-section"><div class="panel-top"><div><p class="overline">USAGE & FOLLOW-UP</p><h2>本会话记录</h2></div><button id="refresh-side-data" class="text-button" type="button">刷新</button></div><div id="usage" class="usage"><p class="quiet">暂无计量数据。</p></div><div id="followups" class="followups"><p class="quiet">已确认的跟进流程会显示在这里。</p></div></section>
+      </aside>
+    </section>
+    <footer class="page-footer"><span>EAF / CUSTOMER ANALYSIS DESK</span><span>确定性演示 · 合成资料 · 不调用真实 Provider</span></footer>
+  </main>
+</body>
+</html>

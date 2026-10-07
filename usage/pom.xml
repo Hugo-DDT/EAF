@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent><groupId>io.eaf</groupId><artifactId>eaf-parent</artifactId><version>0.1.0-SNAPSHOT</version></parent>
+    <artifactId>eaf-usage</artifactId>
+    <dependencies>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-shared</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-workspace</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-jdbc</artifactId></dependency>
+        <!-- Usage 域只发布自己的未知费用与停止预算聚合指标，并通过 Workspace API 校验运维查询授权。 -->
+        <dependency><groupId>io.micrometer</groupId><artifactId>micrometer-core</artifactId></dependency>
+    </dependencies>
+</project>
+<!-- 本文件负责 EAF 的 pom.xml 相关定义。 -->

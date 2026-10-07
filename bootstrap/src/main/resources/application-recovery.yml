@@ -1,0 +1,30 @@
+# 恢复实例先隔离调度与投递；停机事实由 Workspace Owner 命令持久化后才可关闭此 profile。
+spring:
+  config:
+    activate:
+      on-profile: recovery
+
+eaf:
+  recovery:
+    mode: true
+  security:
+    # 恢复期间只接受当前企业身份源映射，不回退到开发别名。
+    mode: enterprise
+  secrets:
+    # 恢复期不自动复用旧备份所含秘密引用；未配置当前受管后端时解析保持不可用。
+    backend: unconfigured
+  outbound:
+    enterprise:
+      # 覆盖部署原有出口声明，完成身份/凭据/外部副作用对账前不允许 Provider 或 A2A 网络出站。
+      egress-policy-confirmed: false
+  task:
+    dispatcher-enabled: false
+  workflow:
+    dispatcher-enabled: false
+  execution:
+    outbox-publisher-enabled: false
+    remote-poller-enabled: false
+  knowledge:
+    outbox-publisher-enabled: false
+  memory:
+    outbox-publisher-enabled: false

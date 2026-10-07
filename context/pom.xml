@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent><groupId>io.eaf</groupId><artifactId>eaf-parent</artifactId><version>0.1.0-SNAPSHOT</version></parent>
+    <artifactId>eaf-context</artifactId>
+    <dependencies>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-shared</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-knowledge</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-memory</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-workspace</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>org.springframework</groupId><artifactId>spring-context</artifactId></dependency>
+    </dependencies>
+</project>
+<!-- context 只编排授权知识结果和预算，不拥有知识原文或数据库表。 -->

@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.16</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>io.eaf</groupId>
+    <artifactId>eaf-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <modules>
+        <module>shared</module>
+        <module>organization</module>
+        <module>identity</module>
+        <module>workspace</module>
+        <module>knowledge</module>
+        <module>context</module>
+        <module>prompt</module>
+        <module>tool</module>
+        <!-- Skill 只定义复用行为及固定依赖，不负责执行工具。 -->
+        <module>skill</module>
+        <!-- Capability 将可信 Manifest 解析结果交给 Task；真正运行仍由 Runtime/Execution 完成。 -->
+        <module>capability</module>
+        <!--  Memory 是带 Workspace 授权与有效期的正式资产。 -->
+        <module>memory</module>
+        <module>agent</module>
+        <module>policy</module>
+        <!-- provisioning 只协调成员开通/停用，授权数据仍由各业务域 API 拥有。 -->
+        <module>provisioning</module>
+        <module>approval</module>
+        <module>connector</module>
+        <module>integration</module>
+        <!-- Secret 只解析后端引用；Credential 拥有出站凭据元数据与版本。 -->
+        <module>secret</module>
+        <module>credential</module>
+        <module>execution</module>
+        <module>model</module>
+        <module>audit</module>
+        <module>usage</module>
+        <module>observability</module>
+        <module>task</module>
+        <!-- Workflow 仅保存确定流程定义与启动快照；步骤推进由后续任务承载。 -->
+        <module>workflow</module>
+        <module>agent-runtime</module>
+        <module>evaluation</module>
+        <!-- Learning 只保存可追溯反馈和候选输入，不接管目标资产。 -->
+        <module>learning</module>
+        <module>agent-protocol</module>
+        <module>bootstrap</module>
+    </modules>
+
+    <properties>
+        <java.version>21</java.version>
+        <spring-ai.version>1.1.2</spring-ai.version>
+        <!-- 暂时覆盖 Spring Boot 3.5.16 管理的四组易受影响依赖；升级 Boot 后须重新扫描并复核覆盖是否仍需保留。 -->
+        <jackson-bom.version>2.21.7</jackson-bom.version>
+        <log4j2.version>2.25.5</log4j2.version>
+        <postgresql.version>42.7.13</postgresql.version>
+        <tomcat.version>10.1.60</tomcat.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.ai</groupId>
+                <artifactId>spring-ai-bom</artifactId>
+                <version>${spring-ai.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>toolchain-baseline</id>
+                        <goals><goal>enforce</goal></goals>
+                        <configuration>
+                            <rules>
+                                <requireJavaVersion><version>[21,22)</version></requireJavaVersion>
+                                <requireMavenVersion><version>[3.9.11,3.10)</version></requireMavenVersion>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+<!-- 本文件负责 EAF 的 pom.xml 相关定义。 -->
