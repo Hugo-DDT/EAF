@@ -158,3 +158,6 @@ docker compose -f compose.yml down
 - Provider、模型语义质量、外部 CRM/服务台和业务效率收益，需要各自独立的真实授权与验证。
 - 外部连接默认关闭；能力包导入不执行任意代码，也不绕过现有身份、Policy、Approval 或 Execution 控制。
 
+## 许可证
+
+本项目采用 Apache License 2.0，详见 [LICENSE](LICENSE)。

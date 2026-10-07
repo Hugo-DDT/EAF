@@ -146,3 +146,6 @@ Integration tests use Docker to start an isolated PostgreSQL environment. Defaul
 - Provider quality, model semantics, external CRM/service-desk behavior, and business impact each require their own authorization and verification.
 - External connectors are disabled by default. Capability-package import does not execute arbitrary code or bypass identity, Policy, Approval, or Execution controls.
 
+## License
+
+This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
