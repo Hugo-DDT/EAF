@@ -10,6 +10,7 @@ import io.eaf.shared.ActorType;
 import io.eaf.shared.EafException;
 import io.eaf.shared.Hashing;
 import io.eaf.shared.Ids;
+import io.eaf.task.infrastructure.TaskClusterCapacityMaintenance;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.Map;
@@ -25,6 +26,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.flywaydb.core.Flyway;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -67,6 +69,8 @@ class P5KnowledgeVersionTest {
     @Autowired MockMvc mvc;
     @Autowired AuditPort audit;
     @Autowired PlatformTransactionManager transactionManager;
+    // 本测试从 V60 启动并手动迁移；隔离 P20 的当前版本启动检查，避免它提前访问 V206 表。
+    @MockitoBean TaskClusterCapacityMaintenance taskClusterCapacityMaintenance;
 
     @Test
     void preparedVersionStaysOutOfRetrievalUntilBaseVersionPublication() throws Exception {

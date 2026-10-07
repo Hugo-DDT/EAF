@@ -158,7 +158,7 @@ class P7RestoreReconciliationTest {
                     String.class)).isEqualTo("外部核对前保持隔离");
             // 备份恢复保留当前数据库结构版本。
             assertThat(restoredJdbc.queryForObject("select version from eaf_meta.flyway_schema_history "
-                    + "where success order by installed_rank desc limit 1", String.class)).isEqualTo("176");
+                    + "where success order by installed_rank desc limit 1", String.class)).isEqualTo("229");
             assertThat(restoredJdbc.queryForList("select enabled from workspace.operational_gate where tenant_id = ? "
                             + "and workspace_id = ? order by gate_name", Boolean.class, Ids.TENANT_A, Ids.WORKSPACE_A))
                     .containsExactly(true, true);

@@ -24,6 +24,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -141,7 +142,7 @@ class P7LoadMeasurementTest {
         }).toList();
 
         try (var workers = Executors.newFixedThreadPool(concurrency)) {
-            var createBatch = sendTogether(client, workers, createRequests, concurrency);
+            var createBatch = sendTogether(client, workers, createRequests, concurrency, true);
             var createdIds = new ArrayList<String>();
             for (var sample : createBatch.samples()) {
                 if (sample.statusCode() == 202) {
@@ -157,7 +158,7 @@ class P7LoadMeasurementTest {
                     .header("Authorization", "Bearer eaf-local-alice")
                     .GET()
                     .build()).toList();
-            var readBatch = sendTogether(client, workers, readRequests, concurrency);
+            var readBatch = sendTogether(client, workers, readRequests, concurrency, false);
             var poolPressureBatch = measureConnectionPoolPressure(client, readRequests, concurrency);
             var readableQueued = readBatch.samples().stream()
                     .filter(sample -> sample.statusCode() == 200)
@@ -195,7 +196,7 @@ class P7LoadMeasurementTest {
             for (int index = 0; index < dataSource.getMaximumPoolSize() - 1; index++)
                 heldConnections.add(dataSource.getConnection());
             try (var workers = Executors.newFixedThreadPool(concurrency)) {
-                var batch = sendTogether(client, workers, requests, concurrency);
+                var batch = sendTogether(client, workers, requests, concurrency, false);
                 System.out.printf(Locale.ROOT,
                         "P7_LOAD_POOL op=task-read-pool-pressure pool_max=%d peak_active=%d peak_waiting=%d held_connections=%d provider_calls=0 external_writes=0%n",
                         dataSource.getMaximumPoolSize(), batch.maximumActiveConnections(),
@@ -343,7 +344,7 @@ class P7LoadMeasurementTest {
     }
 
     private Batch sendTogether(HttpClient client, ExecutorService workers,
-                               List<HttpRequest> requests, int concurrency) throws Exception {
+                               List<HttpRequest> requests, int concurrency, boolean retryCapacity) throws Exception {
         if (requests.isEmpty()) return new Batch(List.of(), 0L, 0, 0);
         var keepSampling = new AtomicBoolean(true);
         var maximumActiveConnections = new AtomicInteger();
@@ -367,6 +368,12 @@ class P7LoadMeasurementTest {
                 if (!start.await(30, TimeUnit.SECONDS)) return new Sample(0, 0L, "", "start barrier timeout");
                 var before = System.nanoTime();
                 var response = client.send(request, HttpResponse.BodyHandlers.ofString());
+                // 队列 admission 短锁争用会返回可重试 429；沿用同一幂等键退避重试并打散重试波峰。
+                for (int retry = 0; retry < 100 && retryCapacity && response.statusCode() == 429; retry++) {
+                    var backoffMs = ThreadLocalRandom.current().nextLong(5, 21);
+                    LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(backoffMs));
+                    response = client.send(request, HttpResponse.BodyHandlers.ofString());
+                }
                 return new Sample(response.statusCode(), System.nanoTime() - before,
                         response.body(), "");
             } catch (Exception failure) {

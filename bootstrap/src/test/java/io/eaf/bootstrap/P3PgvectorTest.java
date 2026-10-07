@@ -309,6 +309,8 @@ class P3PgvectorTest {
                 Integer.class, reportId)).isEqualTo(60);
 
         // evaluation:run 不能隐式读取报告；只有单独获得 evaluation:read 后才返回报告。
+        jdbc.update("update workspace.\"grant\" set status = 'REVOKED' where workspace_id = ? and actor_id = ? and action = 'evaluation:read'",
+                UUID.fromString(WORKSPACE), ACTOR);
         mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get(
                         "/api/v1/workspaces/" + WORKSPACE + "/evaluations/p3/" + reportId)
                         .header("Authorization", "Bearer eaf-local-alice"))
@@ -368,9 +370,11 @@ class P3PgvectorTest {
 
         assertThat(report.path("status").asText()).isEqualTo("FAILED");
         assertThat(report.path("failureReason").asText()).isEqualTo("DEPENDENCY_UNAVAILABLE");
+        assertThat(report.path("costStatus").asText()).isEqualTo("UNKNOWN_PRICE");
         assertThat(report.path("completedSamples").asInt()).isEqualTo(1);
         assertThat(report.path("failedSamples").asInt()).isEqualTo(1);
-        assertThat(report.path("modelCalls").asInt()).isZero();
+        // 模型调用次数按已记录的 Gateway 尝试统计；失败原因与用量计价状态各自保留。
+        assertThat(report.path("modelCalls").asInt()).isEqualTo(1);
         assertThat(report.path("safetyViolations").asInt()).isZero();
         assertThat(report.path("samples").get(0).path("errorCode").asText()).isEqualTo("DEPENDENCY_UNAVAILABLE");
         verify(modelGateway).call(any(ModelRequest.class));

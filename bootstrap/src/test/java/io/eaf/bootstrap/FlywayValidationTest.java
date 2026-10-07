@@ -89,8 +89,8 @@ class FlywayValidationTest {
                     .locations(locations).createSchemas(true).defaultSchema("eaf_meta").schemas("eaf_meta").load();
             latest.migrate();
 
-            //  追加客户会话、个人经验和团队跟进数据及固定资产。
-            assertThat(latest.info().current().getVersion().getVersion()).isEqualTo("176");
+            //  从 V100 完整升级到当前迁移，同时保留下面逐项核对的历史数据。
+            assertThat(latest.info().current().getVersion().getVersion()).isEqualTo("229");
             assertThat(jdbc.queryForObject("select to_regclass('task.conversation') is not null and to_regclass('task.conversation_turn') is not null and to_regclass('task.conversation_brief_revision') is not null and to_regclass('task.conversation_brief_save') is not null", Boolean.class)).isTrue();
             assertThat(jdbc.queryForObject("select to_regclass('task.customer_followup') is not null and to_regclass('task.customer_followup_result') is not null and to_regclass('task.customer_followup_command') is not null and to_regclass('task.customer_followup_sync') is not null", Boolean.class)).isTrue();
             assertThat(jdbc.queryForObject("select count(*) from agent.version where response_profile in ('CONVERSATIONAL_KNOWLEDGE_QA_V1','CONVERSATIONAL_CUSTOMER_FOLLOWUP_V1') and status = 'PUBLISHED'", Integer.class)).isEqualTo(2);

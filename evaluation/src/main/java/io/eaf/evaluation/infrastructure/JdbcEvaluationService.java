@@ -369,6 +369,11 @@ public class JdbcEvaluationService implements EvaluationService {
     private String p3UsageFailureReason(List<UsageRecord> records) {
         if (records.stream().anyMatch(record -> "SPEND_CAP_EXCEEDED".equals(record.errorCode())
                 || "SPEND_SCOPE_STOPPED".equals(record.errorCode()))) return "FEE_CAP_REACHED";
+        // 保留更具体的调用错误；未知价格仍单独出现在 costStatus 中。
+        var callFailure = records.stream().map(UsageRecord::errorCode)
+                .filter(code -> code != null && !List.of("UNKNOWN_PRICE", "UNKNOWN_USAGE").contains(code))
+                .findFirst().orElse(null);
+        if (callFailure != null) return callFailure;
         if (records.stream().anyMatch(record -> "UNKNOWN_PRICE".equals(record.costStatus()))) return "UNKNOWN_PRICE";
         if (records.stream().anyMatch(record -> "UNKNOWN_USAGE".equals(record.usageStatus())
                 || "UNKNOWN_USAGE".equals(record.costStatus()))) return "UNKNOWN_USAGE";
