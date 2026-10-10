@@ -48,6 +48,9 @@ EAF also treats evaluation and experience reuse as platform concerns. Teams can 
 - Policy denials take precedence over model suggestions. Write operations that require approval must satisfy authorization, self-approval restrictions, and execution budgets.
 - Use idempotent operation identities and read-back verification for external writes. When the result is uncertain, query using the original operation identity instead of blindly creating a new write.
 - External connectors such as CRM and service desks are disabled by default. Local examples use synthetic data and loopback fixtures.
+- Connect team workflows with authorized business-system reads, approval-gated writes, project briefs, and employee handoffs. External connectors are disabled by default, and local examples use synthetic data and loopback fixtures.
+- Support bounded work digests and subscriptions that create ordinary tasks, alongside explicit discovery and controlled review, publication, and use of team experience and capability improvements.
+- Keep model choices bound to task execution and usage records, and expose capability declarations through authorized resources that existing task interfaces can consume. Local checks do not establish real Provider quality, cost savings, third-party compatibility, or business outcomes.
 
 ### Evaluation and controlled improvement
 
