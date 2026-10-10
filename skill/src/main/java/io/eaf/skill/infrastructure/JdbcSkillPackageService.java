@@ -36,10 +36,43 @@ public class JdbcSkillPackageService implements SkillPackageService {
 
     @Override
     public byte[] export(ActorContext actor, UUID workspaceId, ExportSource source) {
+        requireExportAccess(actor, workspaceId, source);
+        return codec.export(source);
+    }
+
+    @Override
+    public DeclarationPackage describe(ActorContext actor, UUID workspaceId, ExportSource source) {
+        requireExportAccess(actor, workspaceId, source);
+        var rendered = codec.render(source);
+        return new DeclarationPackage(packageSource(source), PROFILE, rendered.packageHash(), codec.describe(rendered));
+    }
+
+    @Override
+    public DeclarationFile readDeclarationFile(ActorContext actor, UUID workspaceId, ExportSource source,
+                                               String expectedPackageHash, String relativePath) {
+        requireExportAccess(actor, workspaceId, source);
+        if (expectedPackageHash == null || !expectedPackageHash.matches("[0-9a-f]{64}"))
+            throw EafException.invalid("packageHash 格式无效。");
+        var rendered = codec.render(source);
+        if (!expectedPackageHash.equals(rendered.packageHash()))
+            throw EafException.conflict("PACKAGE_VERSION_CHANGED", "声明包版本已变化，请重新发现当前声明。");
+        var content = codec.readFile(rendered, relativePath);
+        var info = codec.describe(rendered).stream().filter(file -> file.path().equals(relativePath)).findFirst()
+                .orElseThrow(() -> EafException.invalid("声明文件路径无效。"));
+        return new DeclarationFile(info, content);
+    }
+
+    private void requireExportAccess(ActorContext actor, UUID workspaceId, ExportSource source) {
         workspaces.require(actor, workspaceId, "skill:read");
         if (source == null || !workspaceId.equals(source.sourceWorkspaceId()))
             throw EafException.invalid("导出来源 Workspace 必须与请求 Workspace 一致。");
-        return codec.export(source);
+    }
+
+    private static PackageSource packageSource(ExportSource source) {
+        var capability = source.capability();
+        var skill = source.skill();
+        return new PackageSource(source.sourceWorkspaceId(), capability.id(), capability.version(), capability.contentHash(),
+                skill.id(), skill.version(), skill.contentHash());
     }
 
     @Override

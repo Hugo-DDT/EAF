@@ -10,6 +10,8 @@ public interface ApprovalService {
     ApprovalSnapshot get(ActorContext actor, UUID workspaceId, UUID approvalId);
     ApprovalPendingPage listPending(ActorContext actor, UUID workspaceId, Instant cursorCreatedAt,
                                     UUID cursorId, int pageSize);
+    ApprovalActionablePage listActionablePending(ActorContext actor, UUID workspaceId,
+            Instant cursorCreatedAt, UUID cursorId, int pageSize);
     // Outbox 详情只读本域行并执行 approval:read 校验，不返回审批绑定正文或 payload。
     ApprovalOutboxPage listOutboxOperations(ActorContext actor, UUID workspaceId, Set<String> statuses,
                                             Instant createdAfter, Instant cursorCreatedAt,

@@ -43,41 +43,49 @@ public final class OutboundTargetPolicy {
 
     /** 当前 CRM 实现只服务合成 loopback fixture，不允许在 enterprise 模式冒充真实 CRM。 */
     public URI testCrmEndpoint(ConnectorDefinition connector, String suffix) {
-        var base = parse(connector == null ? null : connector.baseUrl(), "测试 CRM 目标登记无效。");
-        if (enterprise || connector == null || !"TEST_CRM".equals(connector.provider())
-                || !validLoopbackUri(base) || (base.getRawPath() != null && !base.getRawPath().isEmpty()
-                && !"/".equals(base.getRawPath())))
-            throw unavailable("测试 CRM 仅允许非 enterprise 模式下的显式 loopback fixture。");
-        return URI.create(base.toString().replaceAll("/$", "") + suffix);
+        return loopbackFixtureEndpoint(connector, suffix, "测试 CRM 目标登记无效。",
+                "测试 CRM 仅允许非 enterprise 模式下的显式 loopback fixture。", Set.of("TEST_CRM"));
     }
 
     /** CRM 契约夹具也只允许非 enterprise loopback，不能充当真实企业 CRM。 */
     public URI crmContractFixtureEndpoint(ConnectorDefinition connector, String suffix) {
-        var base = parse(connector == null ? null : connector.baseUrl(), "CRM 契约夹具目标登记无效。");
-        if (enterprise || connector == null || !Set.of("P7_CRM_READ_CONTRACT_FIXTURE", "P7_CRM_WRITE_CONTRACT_FIXTURE").contains(connector.provider())
-                || !validLoopbackUri(base) || (base.getRawPath() != null && !base.getRawPath().isEmpty()
-                && !"/".equals(base.getRawPath())))
-            throw unavailable("CRM 契约夹具仅允许非 enterprise 模式下的显式 loopback fixture。");
-        return URI.create(base.toString().replaceAll("/$", "") + suffix);
+        return loopbackFixtureEndpoint(connector, suffix, "CRM 契约夹具目标登记无效。",
+                "CRM 契约夹具仅允许非 enterprise 模式下的显式 loopback fixture。",
+                Set.of("P7_CRM_READ_CONTRACT_FIXTURE", "P7_CRM_WRITE_CONTRACT_FIXTURE"));
     }
 
     /** 结果 fixture 单独使用 loopback Connector 与结果专用凭据，不改写既有写入快照。 */
     public URI crmOutcomeFixtureEndpoint(ConnectorDefinition connector, String suffix) {
-        var base = parse(connector == null ? null : connector.baseUrl(), "CRM 结果 fixture 目标无效。");
-        if (enterprise || connector == null || !"P12_CRM_OUTCOME_FIXTURE".equals(connector.provider())
-                || !validLoopbackUri(base) || (base.getRawPath() != null && !base.getRawPath().isEmpty()
-                && !"/".equals(base.getRawPath())))
-            throw unavailable("CRM 结果 fixture 仅允许非 enterprise 模式下的显式 loopback 目标。");
-        return URI.create(base.toString().replaceAll("/$", "") + suffix);
+        return loopbackFixtureEndpoint(connector, suffix, "CRM 结果 fixture 目标无效。",
+                "CRM 结果 fixture 仅允许非 enterprise 模式下的显式 loopback 目标。",
+                Set.of("P12_CRM_OUTCOME_FIXTURE"));
     }
 
     /** 服务台只允许非 enterprise 模式下显式登记的 loopback 合成目标。 */
     public URI serviceRequestFixtureEndpoint(ConnectorDefinition connector, String suffix) {
-        var base = parse(connector == null ? null : connector.baseUrl(), "服务台 fixture 目标无效。");
-        if (enterprise || connector == null || !"P15_INTERNAL_SERVICE_DESK_FIXTURE".equals(connector.provider())
+        return loopbackFixtureEndpoint(connector, suffix, "服务台 fixture 目标无效。",
+                "服务台 fixture 仅允许非 enterprise 模式下的显式 loopback 目标。",
+                Set.of("P15_INTERNAL_SERVICE_DESK_FIXTURE"));
+    }
+
+    public URI p27OaFixtureEndpoint(ConnectorDefinition connector, String suffix) {
+        return loopbackFixtureEndpoint(connector, suffix, "OA fixture 目标登记无效。",
+                "P27 OA 只允许非 enterprise 模式下的显式 loopback fixture。", Set.of("P27_OA_TODO_FIXTURE"));
+    }
+
+    public URI p27ServiceDeskFixtureEndpoint(ConnectorDefinition connector, String suffix) {
+        return loopbackFixtureEndpoint(connector, suffix, "P27 服务台 fixture 目标登记无效。",
+                "P27 服务台只允许非 enterprise 模式下的显式 loopback fixture。",
+                Set.of("P27_SERVICE_DESK_RESULT_FIXTURE"));
+    }
+
+    private URI loopbackFixtureEndpoint(ConnectorDefinition connector, String suffix, String invalidTargetMessage,
+            String rejectedTargetMessage, Set<String> providers) {
+        var base = parse(connector == null ? null : connector.baseUrl(), invalidTargetMessage);
+        if (enterprise || connector == null || !providers.contains(connector.provider())
                 || !validLoopbackUri(base) || (base.getRawPath() != null && !base.getRawPath().isEmpty()
                 && !"/".equals(base.getRawPath())))
-            throw unavailable("服务台 fixture 仅允许非 enterprise 模式下的显式 loopback 目标。");
+            throw unavailable(rejectedTargetMessage);
         return URI.create(base.toString().replaceAll("/$", "") + suffix);
     }
 

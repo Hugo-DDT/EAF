@@ -21,6 +21,8 @@ import io.eaf.knowledge.api.ScopedKnowledgeSearchResult;
 import io.eaf.knowledge.api.KnowledgeOutboxItem;
 import io.eaf.knowledge.api.KnowledgeOutboxPage;
 import io.eaf.knowledge.api.KnowledgeOutboxReplayReceipt;
+import io.eaf.knowledge.api.ManagedKnowledgeSource;
+import io.eaf.knowledge.api.PublishedKnowledgeChunk;
 import io.eaf.audit.api.AuditFact;
 import io.eaf.audit.api.AuditPort;
 import io.eaf.model.api.EmbeddingCallScope;
@@ -34,6 +36,9 @@ import io.eaf.shared.ActorType;
 import io.eaf.shared.EafException;
 import io.eaf.shared.Hashing;
 import io.eaf.identity.api.IdentityDirectory;
+import io.eaf.identity.api.IdentityService;
+import io.eaf.identity.api.DelegationResourceAuthorizer;
+import io.eaf.identity.api.McpReadonlyDelegationScope;
 import io.eaf.workspace.api.WorkspaceAccess;
 import io.eaf.workspace.api.WorkspaceAuthorization;
 import io.eaf.workspace.api.WorkspaceCatalog;
@@ -48,6 +53,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.TreeSet;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -59,9 +67,11 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.beans.factory.annotation.Autowired;
 
 @Service
-public class JdbcKnowledgeService implements KnowledgeService {
+public class JdbcKnowledgeService implements KnowledgeService, DelegationResourceAuthorizer {
     private static final Set<String> OUTBOX_STATUSES = Set.of("PENDING", "DELIVERED", "FAILED");
     private static final int MAX_CONTENT_BYTES = 100 * 1024;
+    private static final int MAX_MANAGED_BATCH_ITEMS = 20;
+    private static final int MAX_MANAGED_BATCH_BYTES = 1024 * 1024;
     private static final int MAX_PGVECTOR_DIMENSION = 16_000;
     private static final Pattern METADATA_KEY = Pattern.compile("[A-Za-z][A-Za-z0-9_.-]{0,63}");
     private static final Map<String, Integer> CHUNK_LIMITS = Map.of("p3-plain-1", 800, "p3-plain-2", 400, "p9-structure-1", 800);
@@ -73,6 +83,7 @@ public class JdbcKnowledgeService implements KnowledgeService {
     private final WorkspaceAuthorization workspaces;
     private final WorkspaceCatalog workspaceCatalog;
     private final IdentityDirectory identities;
+    private final IdentityService delegationIdentities;
     private final ObjectMapper mapper;
     private final Clock clock;
     private final EmbeddingGateway embeddings;
@@ -81,11 +92,13 @@ public class JdbcKnowledgeService implements KnowledgeService {
     @Autowired
     public JdbcKnowledgeService(JdbcTemplate jdbc, WorkspaceAuthorization workspaces,
                                 WorkspaceCatalog workspaceCatalog, IdentityDirectory identities,
-                                ObjectMapper mapper, Clock clock, EmbeddingGateway embeddings, AuditPort audit) {
+                                IdentityService delegationIdentities, ObjectMapper mapper, Clock clock,
+                                EmbeddingGateway embeddings, AuditPort audit) {
         this.jdbc = jdbc;
         this.workspaces = workspaces;
         this.workspaceCatalog = workspaceCatalog;
         this.identities = identities;
+        this.delegationIdentities = delegationIdentities;
         this.mapper = mapper;
         this.clock = clock;
         this.embeddings = embeddings;
@@ -95,7 +108,26 @@ public class JdbcKnowledgeService implements KnowledgeService {
     /** 保留既有测试/嵌入式组装方的单空间构造入口； 分享 API 仅由 Spring 主装配启用。 */
     public JdbcKnowledgeService(JdbcTemplate jdbc, WorkspaceAuthorization workspaces,
                                 ObjectMapper mapper, Clock clock, EmbeddingGateway embeddings, AuditPort audit) {
-        this(jdbc, workspaces, null, null, mapper, clock, embeddings, audit);
+        this(jdbc, workspaces, null, null, null, mapper, clock, embeddings, audit);
+    }
+
+    @Override
+    public boolean mayDelegateKnowledgeRead(UUID tenantId, UUID ownerId, UUID delegateId,
+                                            UUID workspaceId, UUID documentId) {
+        if (tenantId == null || ownerId == null || delegateId == null || workspaceId == null || documentId == null
+                || !workspaces.isAuthorized(tenantId, ownerId, workspaceId, "knowledge:read")
+                || !workspaces.isAuthorized(tenantId, delegateId, workspaceId, "knowledge:read")) return false;
+        var count = jdbc.queryForObject("select count(*) from knowledge.document d "
+                        + "join knowledge.document_publication p on p.tenant_id = d.tenant_id and p.workspace_id = d.workspace_id and p.document_id = d.id and p.status = 'ACTIVE' "
+                        + "join knowledge.document_version v on v.tenant_id = p.tenant_id and v.workspace_id = p.workspace_id and v.document_id = p.document_id and v.asset_version = p.asset_version and v.status = 'PUBLISHED' "
+                        + "join knowledge.index_build b on b.id = p.build_id and b.tenant_id = p.tenant_id and b.workspace_id = p.workspace_id and b.document_id = p.document_id and b.asset_version = p.asset_version and b.status = 'READY' "
+                        + "where d.tenant_id = ? and d.workspace_id = ? and d.id = ? and d.status = 'PUBLISHED' "
+                        + "and b.total_chunks = b.completed_chunks and b.completed_chunks = (select count(*) from knowledge.embedding e where e.build_id = b.id) "
+                        + "and exists (select 1 from knowledge.document_permission p1 where p1.tenant_id = d.tenant_id and p1.workspace_id = d.workspace_id and p1.document_id = d.id and p1.actor_id = ? and p1.action = 'knowledge:read' and p1.status = 'ACTIVE') "
+                        + "and exists (select 1 from knowledge.document_permission p2 where p2.tenant_id = d.tenant_id and p2.workspace_id = d.workspace_id and p2.document_id = d.id and p2.actor_id = ? and p2.action = 'knowledge:read' and p2.status = 'ACTIVE')"
+                        + managedSourceReadGuard() + managedSourceReadGuard(),
+                Integer.class, tenantId, workspaceId, documentId, ownerId, delegateId, ownerId, delegateId);
+        return count != null && count == 1;
     }
 
     @Override
@@ -136,27 +168,695 @@ public class JdbcKnowledgeService implements KnowledgeService {
                 "DRAFT", now, 1);
     }
 
+    @Override
+    @Transactional
+    public ManagedKnowledgeSource createManagedSource(ManagedKnowledgeSource.CreateCommand command) {
+        if (command == null || command.actor() == null || command.workspaceId() == null)
+            throw EafException.invalid("受管来源上下文不能为空。");
+        requireDirectHuman(command.actor(), "受管来源管理");
+        var access = workspaces.require(command.actor(), command.workspaceId(), "knowledge:source:manage");
+        workspaces.require(command.actor(), command.workspaceId(), "knowledge:write");
+        if (blank(command.name()) || command.name().strip().length() > 160 || hasControl(command.name())
+                || !"MANAGED_TEXT_V1".equals(command.type()))
+            throw EafException.invalid("来源名称或类型无效；首版仅支持 MANAGED_TEXT_V1。");
+        requireIdempotencyKey(command.idempotencyKey());
+        var name = command.name().strip();
+        var keyHash = Hashing.sha256(String.join("\u001f", access.tenantId().toString(), access.workspaceId().toString(),
+                command.actor().actorId().toString(), command.idempotencyKey()));
+        var requestHash = Hashing.sha256(name + "\u001f" + command.type());
+        var prior = managedSourceByCreateKey(access, command.actor().actorId(), keyHash);
+        if (prior != null) {
+            if (!requestHash.equals(prior.createRequestHash()))
+                throw EafException.conflict("IDEMPOTENCY_CONFLICT", "来源创建幂等键已用于不同请求。");
+            return prior.source();
+        }
+        var now = Timestamp.from(Instant.now(clock));
+        var sourceId = UUID.randomUUID();
+        var inserted = jdbc.update("insert into knowledge.managed_source(id, tenant_id, workspace_id, owner_id, name, source_type, status, source_revision, create_key_hash, create_request_hash, created_at, updated_at) values (?, ?, ?, ?, ?, 'MANAGED_TEXT_V1', 'ACTIVE', 1, ?, ?, ?, ?) on conflict (tenant_id, workspace_id, owner_id, create_key_hash) do nothing",
+                sourceId, access.tenantId(), access.workspaceId(), command.actor().actorId(), name, keyHash, requestHash, now, now);
+        if (inserted == 0) {
+            prior = managedSourceByCreateKey(access, command.actor().actorId(), keyHash);
+            if (prior == null || !requestHash.equals(prior.createRequestHash()))
+                throw EafException.conflict("IDEMPOTENCY_CONFLICT", "来源创建幂等键已被并发请求占用。");
+            return prior.source();
+        }
+        return new ManagedKnowledgeSource(sourceId, access.tenantId(), access.workspaceId(), command.actor().actorId(),
+                name, command.type(), "ACTIVE", 1, now.toInstant(), now.toInstant());
+    }
+
+    @Override
+    public List<ManagedKnowledgeSource> listManagedSources(ActorContext actor, UUID workspaceId, int limit, int offset) {
+        var access = requireSourceManager(actor, workspaceId);
+        if (limit < 1 || limit > 50 || offset < 0 || offset > 100_000)
+            throw EafException.invalid("来源分页参数无效。");
+        return jdbc.query("select * from knowledge.managed_source where tenant_id = ? and workspace_id = ? and owner_id = ? order by created_at desc, id desc limit ? offset ?",
+                (rs, row) -> mapManagedSource(rs), access.tenantId(), workspaceId, actor.actorId(), limit, offset);
+    }
+
+    @Override
+    public ManagedKnowledgeSource getManagedSource(ActorContext actor, UUID workspaceId, UUID sourceId) {
+        var access = requireSourceManager(actor, workspaceId);
+        return managedSource(access.tenantId(), workspaceId, actor.actorId(), sourceId, false)
+                .orElseThrow(EafException::notFound);
+    }
+
+    @Override
+    @Transactional
+    public ManagedKnowledgeSource.StateReceipt changeManagedSourceState(ActorContext actor, UUID workspaceId,
+            UUID sourceId, long expectedSourceRevision, String status, String idempotencyKey) {
+        var access = requireSourceManager(actor, workspaceId);
+        if (sourceId == null || expectedSourceRevision < 1 || !("ACTIVE".equals(status) || "DISABLED".equals(status)))
+            throw EafException.invalid("来源状态变更参数无效。");
+        requireIdempotencyKey(idempotencyKey);
+        var keyHash = sourceOperationKeyHash(access, sourceId, actor.actorId(), idempotencyKey);
+        var requestHash = Hashing.sha256("STATE\u001f" + expectedSourceRevision + "\u001f" + status);
+        var prior = managedSourceOperation(access.tenantId(), workspaceId, sourceId, keyHash);
+        if (prior != null) return requireMatchingStateReplay(actor, requestHash, prior);
+        var source = managedSource(access.tenantId(), workspaceId, actor.actorId(), sourceId, true)
+                .orElseThrow(EafException::notFound);
+        prior = managedSourceOperation(access.tenantId(), workspaceId, sourceId, keyHash);
+        if (prior != null) return requireMatchingStateReplay(actor, requestHash, prior);
+        if (source.sourceRevision() != expectedSourceRevision)
+            throw EafException.conflict("SOURCE_REVISION_CONFLICT", "来源版本已变化，请重新读取后提交。");
+        var revision = "ACTIVE".equals(source.status()) == "ACTIVE".equals(status)
+                ? source.sourceRevision() : source.sourceRevision() + 1;
+        var now = Timestamp.from(Instant.now(clock));
+        if (revision != source.sourceRevision()) {
+            jdbc.update("update knowledge.managed_source set status = ?, source_revision = ?, updated_at = ? where tenant_id = ? and workspace_id = ? and id = ? and source_revision = ?",
+                    status, revision, now, access.tenantId(), workspaceId, sourceId, expectedSourceRevision);
+        }
+        var operationId = UUID.randomUUID();
+        jdbc.update("insert into knowledge.managed_source_operation(id, tenant_id, workspace_id, source_id, actor_id, operation_type, request_key_hash, request_hash, previous_source_revision, source_revision, result_status, result_source_status, observed_at) values (?, ?, ?, ?, ?, 'STATE', ?, ?, ?, ?, 'APPLIED', ?, ?)",
+                operationId, access.tenantId(), workspaceId, sourceId, actor.actorId(), keyHash, requestHash,
+                source.sourceRevision(), revision, status, now);
+        audit.append(new AuditFact("managed-knowledge-source-state:" + operationId, access.tenantId(), workspaceId,
+                actor.actorId(), null, "KNOWLEDGE_SOURCE_STATE_CHANGED", "APPLIED",
+                "{\"sourceId\":\"" + sourceId + "\",\"status\":\"" + status + "\",\"sourceRevision\":" + revision + "}", null));
+        return new ManagedKnowledgeSource.StateReceipt(operationId, sourceId, status,
+                source.sourceRevision(), revision, now.toInstant(), false);
+    }
+
+    @Override
+    @Transactional
+    public ManagedKnowledgeSource.SyncReceipt applyManagedSourceSync(ManagedKnowledgeSource.BatchCommand command) {
+        if (command == null || command.actor() == null || command.workspaceId() == null || command.sourceId() == null)
+            throw EafException.invalid("受管来源批次上下文不能为空。");
+        var access = requireSourceManager(command.actor(), command.workspaceId());
+        workspaces.require(command.actor(), command.workspaceId(), "knowledge:write");
+        validateManagedBatch(command);
+        var keyHash = sourceOperationKeyHash(access, command.sourceId(), command.actor().actorId(), command.idempotencyKey());
+        var requestHash = managedBatchHash(command);
+        var prior = managedSourceOperation(access.tenantId(), command.workspaceId(), command.sourceId(), keyHash);
+        if (prior != null) return requireMatchingSyncReplay(command.actor(), requestHash, prior);
+        var source = managedSource(access.tenantId(), command.workspaceId(), command.actor().actorId(), command.sourceId(), true)
+                .orElseThrow(EafException::notFound);
+        prior = managedSourceOperation(access.tenantId(), command.workspaceId(), command.sourceId(), keyHash);
+        if (prior != null) return requireMatchingSyncReplay(command.actor(), requestHash, prior);
+        if (source.sourceRevision() != command.expectedSourceRevision())
+            throw EafException.conflict("SOURCE_REVISION_CONFLICT", "来源版本已变化，请重新读取后提交。");
+        validateManagedReaders(access, command.workspaceId(), command.changes());
+        var now = Timestamp.from(Instant.now(clock));
+        var syncId = UUID.randomUUID();
+        var nextRevision = source.sourceRevision() + 1;
+        jdbc.update("insert into knowledge.managed_source_operation(id, tenant_id, workspace_id, source_id, actor_id, operation_type, request_key_hash, request_hash, previous_source_revision, source_revision, result_status, observed_at) values (?, ?, ?, ?, ?, 'SYNC', ?, ?, ?, ?, 'APPLIED', ?)",
+                syncId, access.tenantId(), command.workspaceId(), command.sourceId(), command.actor().actorId(),
+                keyHash, requestHash, source.sourceRevision(), nextRevision, now);
+        var results = new ArrayList<ManagedKnowledgeSource.ChangeResult>();
+        for (int position = 0; position < command.changes().size(); position++)
+            results.add(applyManagedChange(command.actor(), access, command.sourceId(), syncId,
+                    command.changes().get(position), position, now));
+        if (jdbc.update("update knowledge.managed_source set source_revision = ?, updated_at = ? where tenant_id = ? and workspace_id = ? and id = ? and source_revision = ?",
+                nextRevision, now, access.tenantId(), command.workspaceId(), command.sourceId(), source.sourceRevision()) != 1)
+            throw EafException.conflict("SOURCE_REVISION_CONFLICT", "来源版本已变化，请重新读取后提交。");
+        audit.append(new AuditFact("managed-knowledge-source-sync:" + syncId, access.tenantId(), command.workspaceId(),
+                command.actor().actorId(), null, "KNOWLEDGE_SOURCE_SYNC_APPLIED", "APPLIED",
+                "{\"sourceId\":\"" + command.sourceId() + "\",\"itemCount\":" + results.size()
+                        + ",\"sourceRevision\":" + nextRevision + "}", null));
+        return new ManagedKnowledgeSource.SyncReceipt(syncId, command.sourceId(), "APPLIED", source.sourceRevision(),
+                nextRevision, now.toInstant(), List.copyOf(results), false);
+    }
+
+    @Override
+    public ManagedKnowledgeSource.SyncReceipt getManagedSourceSync(ActorContext actor, UUID workspaceId,
+            UUID sourceId, UUID syncId) {
+        var access = requireSourceManager(actor, workspaceId);
+        managedSource(access.tenantId(), workspaceId, actor.actorId(), sourceId, false).orElseThrow(EafException::notFound);
+        var operation = jdbc.query("select * from knowledge.managed_source_operation where tenant_id = ? and workspace_id = ? and source_id = ? and id = ? and operation_type = 'SYNC'",
+                rs -> rs.next() ? mapManagedOperation(rs) : null, access.tenantId(), workspaceId, sourceId, syncId);
+        if (operation == null) throw EafException.notFound();
+        return syncReceipt(operation, false);
+    }
+
+    @Override
+    public List<ManagedKnowledgeSource.ItemSummary> listManagedSourceItems(ActorContext actor, UUID workspaceId,
+            UUID sourceId, int limit, int offset) {
+        var access = requireSourceManager(actor, workspaceId);
+        managedSource(access.tenantId(), workspaceId, actor.actorId(), sourceId, false).orElseThrow(EafException::notFound);
+        if (limit < 1 || limit > 50 || offset < 0 || offset > 100_000)
+            throw EafException.invalid("来源条目分页参数无效。");
+        return jdbc.query("select i.item_id, i.document_id, i.display_title, i.source_version, i.content_hash, i.acl_version, i.availability, i.reason_code, i.observed_at, (select max(v.document_version) from knowledge.managed_source_version v join knowledge.document_version dv on dv.tenant_id = v.tenant_id and dv.workspace_id = v.workspace_id and dv.document_id = v.document_id and dv.asset_version = v.document_version and dv.status = 'DRAFT' where v.tenant_id = i.tenant_id and v.workspace_id = i.workspace_id and v.document_id = i.document_id) draft_version from knowledge.managed_source_item i where i.tenant_id = ? and i.workspace_id = ? and i.source_id = ? order by i.item_id limit ? offset ?",
+                (rs, row) -> new ManagedKnowledgeSource.ItemSummary(rs.getString("item_id"), rs.getObject("document_id", UUID.class),
+                        rs.getString("display_title"), rs.getString("source_version"), rs.getString("content_hash"),
+                        rs.getString("acl_version"), rs.getString("availability"), rs.getString("reason_code"),
+                        rs.getTimestamp("observed_at").toInstant(), (Integer) rs.getObject("draft_version")),
+                access.tenantId(), workspaceId, sourceId, limit, offset);
+    }
+
+    @Override
+    public ManagedKnowledgeSource.SourceVersion getManagedSourceVersion(ActorContext actor, UUID workspaceId,
+            UUID documentId, int documentVersion) {
+        var access = workspaces.require(actor, workspaceId, "knowledge:read");
+        if (documentId == null || documentVersion < 1) throw EafException.invalid("来源版本引用无效。");
+        return jdbc.query("select sv.source_id, sv.item_id, sv.source_version, sv.content_hash, sv.acl_version, sv.acl_hash, sv.sync_id, sv.observed_at, i.source_version current_source_version, i.content_hash current_content_hash, i.availability, i.reason_code, s.status source_status from knowledge.managed_source_version sv join knowledge.managed_source_item i on i.tenant_id = sv.tenant_id and i.workspace_id = sv.workspace_id and i.source_id = sv.source_id and i.item_id = sv.item_id join knowledge.managed_source s on s.tenant_id = i.tenant_id and s.workspace_id = i.workspace_id and s.id = i.source_id where sv.tenant_id = ? and sv.workspace_id = ? and sv.document_id = ? and sv.document_version = ? and exists (select 1 from knowledge.document_permission p where p.tenant_id = sv.tenant_id and p.workspace_id = sv.workspace_id and p.document_id = sv.document_id and p.actor_id = ? and p.action = 'knowledge:read' and p.status = 'ACTIVE') and exists (select 1 from knowledge.managed_source_reader r where r.tenant_id = sv.tenant_id and r.workspace_id = sv.workspace_id and r.source_id = sv.source_id and r.item_id = sv.item_id and r.actor_id = ?)",
+                (org.springframework.jdbc.core.ResultSetExtractor<Optional<ManagedKnowledgeSource.SourceVersion>>) rs ->
+                        rs.next() ? Optional.of(mapManagedSourceVersion(rs)) : Optional.empty(),
+                access.tenantId(), workspaceId, documentId, documentVersion, actor.actorId(), actor.actorId())
+                .orElseThrow(EafException::notFound);
+    }
+
+    @Override
+    public KnowledgeDocument getManagedSourceVersionForOwner(ActorContext actor, UUID workspaceId, UUID sourceId,
+            String itemId, int documentVersion) {
+        var access = requireSourceManager(actor, workspaceId);
+        workspaces.require(actor, workspaceId, "knowledge:write");
+        if (documentVersion < 1 || !validManagedItemId(itemId)) throw EafException.invalid("来源历史版本引用无效。");
+        managedSource(access.tenantId(), workspaceId, actor.actorId(), sourceId, false).orElseThrow(EafException::notFound);
+        var binding = jdbc.query("select document_id from knowledge.managed_source_version where tenant_id = ? and workspace_id = ? and source_id = ? and item_id = ? and document_version = ?",
+                rs -> rs.next() ? rs.getObject("document_id", UUID.class) : null,
+                access.tenantId(), workspaceId, sourceId, itemId, documentVersion);
+        if (binding == null) throw EafException.notFound();
+        return rawKnowledgeVersion(access, binding, documentVersion);
+    }
+
+    @Override
+    public ManagedKnowledgeSource.Neighborhood neighborhood(ManagedKnowledgeSource.NeighborhoodRequest request) {
+        if (request == null || request.actor() == null) throw EafException.invalid("邻段读取上下文不能为空。");
+        requireDirectHuman(request.actor(), "Knowledge 邻段读取");
+        var access = workspaces.require(request.actor(), request.workspaceId(), "knowledge:read");
+        if (request.documentId() == null || request.buildId() == null || request.chunkId() == null
+                || request.documentVersion() < 1 || request.tokenBudget() < 1 || request.tokenBudget() > 2000)
+            throw EafException.invalid("邻段引用或 tokenBudget 无效。");
+        var seed = jdbc.query("select c.id, c.tenant_id, c.workspace_id, c.document_id, c.asset_version, c.source_ref, c.chunking_version, c.chunk_order, c.start_offset, c.end_offset, c.offset_unit, c.content, c.content_hash, c.heading_path::text from knowledge.chunk c join knowledge.document d on d.tenant_id = c.tenant_id and d.workspace_id = c.workspace_id and d.id = c.document_id join knowledge.document_version v on v.tenant_id = c.tenant_id and v.workspace_id = c.workspace_id and v.document_id = c.document_id and v.asset_version = c.asset_version join knowledge.index_build b on b.id = ? and b.tenant_id = c.tenant_id and b.workspace_id = c.workspace_id and b.document_id = c.document_id and b.asset_version = c.asset_version and b.chunking_version = c.chunking_version and b.status = 'READY' join knowledge.document_publication p on p.tenant_id = b.tenant_id and p.workspace_id = b.workspace_id and p.document_id = b.document_id and p.asset_version = b.asset_version and p.build_id = b.id and p.status = 'ACTIVE' where c.id = ? and c.document_id = ? and c.asset_version = ? and d.status = 'PUBLISHED' and v.status = 'PUBLISHED' and exists (select 1 from knowledge.document_permission dp where dp.tenant_id = d.tenant_id and dp.workspace_id = d.workspace_id and dp.document_id = d.id and dp.actor_id = ? and dp.action = 'knowledge:read' and dp.status = 'ACTIVE')"
+                        + managedSourceReadGuard(),
+                (org.springframework.jdbc.core.ResultSetExtractor<Optional<KnowledgeChunk>>) rs ->
+                        rs.next() ? Optional.of(mapChunk(rs)) : Optional.empty(), request.buildId(), request.chunkId(),
+                request.documentId(), request.documentVersion(), request.actor().actorId(), request.actor().actorId())
+                .orElseThrow(EafException::notFound);
+        var seedTokens = estimatedTokens(seed.content());
+        if (seedTokens > request.tokenBudget())
+            throw EafException.conflict("NEIGHBORHOOD_BUDGET_TOO_SMALL", "tokenBudget 小于种子片段，不能截断来源正文。");
+        var neighbors = jdbc.query("select c.id, c.tenant_id, c.workspace_id, c.document_id, c.asset_version, c.source_ref, c.chunking_version, c.chunk_order, c.start_offset, c.end_offset, c.offset_unit, c.content, c.content_hash, c.heading_path::text from knowledge.chunk c join knowledge.index_build b on b.id = ? and b.tenant_id = c.tenant_id and b.workspace_id = c.workspace_id and b.document_id = c.document_id and b.asset_version = c.asset_version and b.chunking_version = c.chunking_version and b.status = 'READY' where c.tenant_id = ? and c.workspace_id = ? and c.document_id = ? and c.asset_version = ? and c.chunking_version = ? and c.heading_path = ?::jsonb and c.chunk_order <> ? and exists (select 1 from knowledge.embedding e where e.build_id = b.id and e.chunk_id = c.id) order by c.chunk_order",
+                (rs, row) -> mapChunk(rs), request.buildId(), access.tenantId(), request.workspaceId(),
+                request.documentId(), request.documentVersion(), seed.chunkingVersion(), jsonString(seed.headingPath()), seed.chunkOrder());
+        var previous = neighbors.stream().filter(c -> c.chunkOrder() < seed.chunkOrder()).max(Comparator.comparingInt(KnowledgeChunk::chunkOrder)).orElse(null);
+        var next = neighbors.stream().filter(c -> c.chunkOrder() > seed.chunkOrder()).min(Comparator.comparingInt(KnowledgeChunk::chunkOrder)).orElse(null);
+        var remaining = request.tokenBudget() - seedTokens;
+        var items = new ArrayList<ManagedKnowledgeSource.NeighborhoodItem>();
+        items.add(new ManagedKnowledgeSource.NeighborhoodItem(seed, "SEED", seedTokens));
+        var omitted = new ArrayList<String>();
+        for (var pair : List.of(new Neighbor("PREVIOUS", previous), new Neighbor("NEXT", next))) {
+            if (pair.chunk() == null) omitted.add(pair.relation() + "_SECTION_BOUNDARY");
+            else {
+                var tokens = estimatedTokens(pair.chunk().content());
+                if (tokens <= remaining) {
+                    items.add(new ManagedKnowledgeSource.NeighborhoodItem(pair.chunk(), pair.relation(), tokens));
+                    remaining -= tokens;
+                } else omitted.add(pair.relation() + "_BUDGET");
+            }
+        }
+        items.sort(Comparator.comparingInt(item -> item.chunk().chunkOrder()));
+        return new ManagedKnowledgeSource.Neighborhood(request.documentId(), request.documentVersion(), request.buildId(),
+                List.copyOf(items), List.copyOf(omitted));
+    }
+
+    private WorkspaceAccess requireSourceManager(ActorContext actor, UUID workspaceId) {
+        requireDirectHuman(actor, "受管来源管理");
+        return workspaces.require(actor, workspaceId, "knowledge:source:manage");
+    }
+
+    private void requireDirectHuman(ActorContext actor, String operation) {
+        if (actor == null || actor.type() != ActorType.HUMAN || actor.delegated())
+            throw EafException.forbidden(operation + "只接受本人直接操作的 HUMAN 身份。");
+    }
+
+    private void requireIdempotencyKey(String key) {
+        if (blank(key) || key.length() > 200 || hasControl(key))
+            throw EafException.invalid("Idempotency-Key 必须为 1-200 个可记录字符。");
+    }
+
+    private boolean validManagedItemId(String value) {
+        return value != null && value.matches("[A-Za-z0-9._-]{1,120}");
+    }
+
+    private void validateManagedBatch(ManagedKnowledgeSource.BatchCommand command) {
+        requireIdempotencyKey(command.idempotencyKey());
+        if (command.expectedSourceRevision() < 1 || command.changes() == null || command.changes().isEmpty()
+                || command.changes().size() > MAX_MANAGED_BATCH_ITEMS)
+            throw EafException.invalid("来源批次 revision 或条目数量无效。");
+        var seen = new HashSet<String>();
+        long bytes = 0;
+        for (var change : command.changes()) {
+            if (change == null || !validManagedItemId(change.itemId()) || !seen.add(change.itemId()))
+                throw EafException.invalid("来源批次 itemId 无效或重复。");
+            switch (String.valueOf(change.changeType())) {
+                case "UPSERT" -> {
+                    if (!validSourceVersion(change.sourceVersion()) || blank(change.title()) || change.title().strip().length() > 200
+                            || hasControl(change.title()) || !("MARKDOWN".equals(change.format()) || "PLAIN_TEXT".equals(change.format()))
+                            || blank(change.content()) || change.content().getBytes(StandardCharsets.UTF_8).length > MAX_CONTENT_BYTES
+                            || !validSourceVersion(change.aclVersion()) || change.readActorIds() == null)
+                        throw EafException.invalid("UPSERT 必须提供有效正文、版本、标题和完整访问名单。");
+                    bytes += change.content().getBytes(StandardCharsets.UTF_8).length;
+                }
+                case "DELETE" -> {
+                    if (!validSourceVersion(change.sourceVersion())) throw EafException.invalid("DELETE 必须提供 sourceVersion。");
+                }
+                case "ACCESS" -> {
+                    if (!validSourceVersion(change.aclVersion()) || change.readActorIds() == null)
+                        throw EafException.invalid("ACCESS 必须提供 ACL 版本和完整访问名单。");
+                }
+                case "UNAVAILABLE" -> {
+                    if (change.reasonCode() == null || !change.reasonCode().matches("[A-Z0-9_]{1,80}"))
+                        throw EafException.invalid("UNAVAILABLE 必须提供有限 reasonCode。");
+                }
+                default -> throw EafException.invalid("不支持的来源变更类型。");
+            }
+            if (change.readActorIds() != null && change.readActorIds().stream().anyMatch(java.util.Objects::isNull))
+                throw EafException.invalid("来源访问名单不能包含空主体。");
+            if (change.readActorIds() != null && change.readActorIds().size() > 100)
+                throw EafException.invalid("来源访问名单最多包含 100 个主体。");
+        }
+        if (bytes > MAX_MANAGED_BATCH_BYTES) throw EafException.invalid("来源批次正文总量超过 1 MiB 限制。");
+    }
+
+    private boolean validSourceVersion(String value) {
+        return value != null && !value.isBlank() && value.length() <= 160 && !hasControl(value);
+    }
+
+    private void validateManagedReaders(WorkspaceAccess access, UUID workspaceId,
+                                        List<ManagedKnowledgeSource.Change> changes) {
+        for (var change : changes) {
+            if (change.readActorIds() == null) continue;
+            for (var readerId : change.readActorIds()) {
+                if (readerId == null || !workspaces.isAuthorized(access.tenantId(), readerId, workspaceId, "knowledge:read"))
+                    throw EafException.invalid("来源访问名单只能包含当前 Workspace 内已有 knowledge:read 的有效主体。");
+            }
+        }
+    }
+
+    private String managedBatchHash(ManagedKnowledgeSource.BatchCommand command) {
+        var value = new StringBuilder();
+        appendHashField(value, "SYNC");
+        appendHashField(value, Long.toString(command.expectedSourceRevision()));
+        for (var change : command.changes()) {
+            appendHashField(value, change.changeType());
+            appendHashField(value, change.itemId());
+            appendHashField(value, change.sourceVersion());
+            appendHashField(value, change.title());
+            appendHashField(value, change.format());
+            appendHashField(value, change.content());
+            appendHashField(value, change.aclVersion());
+            appendHashField(value, change.reasonCode());
+            if (change.readActorIds() == null) appendHashField(value, null);
+            else {
+                appendHashField(value, Integer.toString(change.readActorIds().size()));
+                change.readActorIds().stream().sorted().forEach(id -> appendHashField(value, id.toString()));
+            }
+        }
+        return Hashing.sha256(value.toString());
+    }
+
+    private void appendHashField(StringBuilder target, String field) {
+        if (field == null) target.append("-1:");
+        else target.append(field.length()).append(':').append(field);
+    }
+
+    private String sourceOperationKeyHash(WorkspaceAccess access, UUID sourceId, UUID actorId, String key) {
+        return Hashing.sha256(String.join("\u001f", access.tenantId().toString(), access.workspaceId().toString(),
+                sourceId.toString(), actorId.toString(), key));
+    }
+
+    private ManagedSourceCreatePrior managedSourceByCreateKey(WorkspaceAccess access, UUID ownerId, String keyHash) {
+        return jdbc.query("select * from knowledge.managed_source where tenant_id = ? and workspace_id = ? and owner_id = ? and create_key_hash = ?",
+                (org.springframework.jdbc.core.ResultSetExtractor<Optional<ManagedSourceCreatePrior>>) rs -> rs.next()
+                        ? Optional.of(new ManagedSourceCreatePrior(mapManagedSource(rs), rs.getString("create_request_hash")))
+                        : Optional.empty(), access.tenantId(), access.workspaceId(), ownerId, keyHash).orElse(null);
+    }
+
+    private Optional<ManagedKnowledgeSource> managedSource(UUID tenantId, UUID workspaceId, UUID ownerId,
+                                                            UUID sourceId, boolean forUpdate) {
+        return jdbc.query("select * from knowledge.managed_source where tenant_id = ? and workspace_id = ? and owner_id = ? and id = ?"
+                        + (forUpdate ? " for update" : ""),
+                (org.springframework.jdbc.core.ResultSetExtractor<Optional<ManagedKnowledgeSource>>) rs -> rs.next()
+                        ? Optional.of(mapManagedSource(rs)) : Optional.empty(), tenantId, workspaceId, ownerId, sourceId);
+    }
+
+    private ManagedKnowledgeSource mapManagedSource(java.sql.ResultSet rs) throws java.sql.SQLException {
+        return new ManagedKnowledgeSource(rs.getObject("id", UUID.class), rs.getObject("tenant_id", UUID.class),
+                rs.getObject("workspace_id", UUID.class), rs.getObject("owner_id", UUID.class), rs.getString("name"),
+                rs.getString("source_type"), rs.getString("status"), rs.getLong("source_revision"),
+                rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant());
+    }
+
+    private ManagedOperation managedSourceOperation(UUID tenantId, UUID workspaceId, UUID sourceId, String keyHash) {
+        return jdbc.query("select * from knowledge.managed_source_operation where tenant_id = ? and workspace_id = ? and source_id = ? and request_key_hash = ?",
+                (org.springframework.jdbc.core.ResultSetExtractor<ManagedOperation>) rs -> rs.next() ? mapManagedOperation(rs) : null,
+                tenantId, workspaceId, sourceId, keyHash);
+    }
+
+    private ManagedOperation mapManagedOperation(java.sql.ResultSet rs) throws java.sql.SQLException {
+        return new ManagedOperation(rs.getObject("id", UUID.class), rs.getObject("source_id", UUID.class),
+                rs.getObject("actor_id", UUID.class), rs.getString("operation_type"), rs.getString("request_hash"),
+                rs.getLong("previous_source_revision"), rs.getLong("source_revision"),
+                rs.getString("result_source_status"), rs.getTimestamp("observed_at").toInstant());
+    }
+
+    private ManagedKnowledgeSource.StateReceipt requireMatchingStateReplay(ActorContext actor, String requestHash,
+                                                                            ManagedOperation prior) {
+        if (!"STATE".equals(prior.type()) || !actor.actorId().equals(prior.actorId())
+                || !requestHash.equals(prior.requestHash()))
+            throw EafException.conflict("SOURCE_OPERATION_CONFLICT", "来源幂等键已用于不同操作。");
+        return new ManagedKnowledgeSource.StateReceipt(prior.id(), prior.sourceId(), prior.sourceStatus(),
+                prior.previousRevision(), prior.revision(), prior.observedAt(), true);
+    }
+
+    private ManagedKnowledgeSource.SyncReceipt requireMatchingSyncReplay(ActorContext actor, String requestHash,
+                                                                          ManagedOperation prior) {
+        if (!"SYNC".equals(prior.type()) || !actor.actorId().equals(prior.actorId())
+                || !requestHash.equals(prior.requestHash()))
+            throw EafException.conflict("SOURCE_OPERATION_CONFLICT", "来源幂等键已用于不同操作。");
+        return syncReceipt(prior, true);
+    }
+
+    private ManagedKnowledgeSource.SyncReceipt syncReceipt(ManagedOperation operation, boolean replayed) {
+        var items = jdbc.query("select * from knowledge.managed_source_sync_item where sync_id = ? order by position",
+                (rs, row) -> new ManagedKnowledgeSource.ChangeResult(rs.getString("item_id"), rs.getString("change_type"),
+                        rs.getString("result"), rs.getObject("document_id", UUID.class),
+                        (Integer) rs.getObject("document_version"), rs.getString("source_version"),
+                        rs.getString("availability"), rs.getString("reason_code")), operation.id());
+        return new ManagedKnowledgeSource.SyncReceipt(operation.id(), operation.sourceId(), "APPLIED",
+                operation.previousRevision(), operation.revision(), operation.observedAt(), List.copyOf(items), replayed);
+    }
+
+    private ManagedKnowledgeSource.SourceVersion mapManagedSourceVersion(java.sql.ResultSet rs) throws java.sql.SQLException {
+        return new ManagedKnowledgeSource.SourceVersion(rs.getObject("source_id", UUID.class), rs.getString("item_id"),
+                rs.getString("source_version"), rs.getString("content_hash"), rs.getString("acl_version"),
+                rs.getString("acl_hash"), rs.getObject("sync_id", UUID.class), rs.getTimestamp("observed_at").toInstant(),
+                rs.getString("current_source_version"), rs.getString("current_content_hash"), rs.getString("availability"),
+                rs.getString("reason_code"), rs.getString("source_status"));
+    }
+
+    private ManagedKnowledgeSource.ChangeResult applyManagedChange(ActorContext actor, WorkspaceAccess access,
+            UUID sourceId, UUID syncId, ManagedKnowledgeSource.Change change, int position, Timestamp now) {
+        var item = managedSourceItem(access.tenantId(), access.workspaceId(), sourceId, change.itemId(), true).orElse(null);
+        String type = change.changeType();
+        if (item == null && !"UPSERT".equals(type)) throw EafException.notFound();
+        UUID documentId;
+        Integer documentVersion = null;
+        String sourceVersion = item == null ? null : item.sourceVersion();
+        String contentHash = item == null ? null : item.contentHash();
+        String aclVersion = item == null ? null : item.aclVersion();
+        String aclHash = item == null ? null : item.aclHash();
+        String availability = item == null ? null : item.availability();
+        String reasonCode = null;
+        String result;
+        if ("UPSERT".equals(type)) {
+            contentHash = Hashing.sha256(change.content());
+            aclHash = managedAclHash(change.readActorIds());
+            validateNextSourceVersion(access, sourceId, change.itemId(), item, change.sourceVersion(), contentHash);
+            validateNextAclVersion(access, sourceId, change.itemId(), item, change.aclVersion(), aclHash);
+            if (item == null) {
+                var sourceRef = "eaf-managed-text:" + sourceId + ":" + change.itemId();
+                var created = create(new CreateKnowledgeDocumentCommand(actor, access.workspaceId(), change.title(),
+                        sourceRef, change.content(), Map.of(), managedCreateKey(sourceId, change.itemId()),
+                        "managed-source:" + syncId));
+                documentId = created.id();
+                sourceVersion = change.sourceVersion();
+                aclVersion = change.aclVersion();
+                availability = "AVAILABLE";
+                result = "CREATED_DRAFT";
+                jdbc.update("insert into knowledge.managed_source_item(tenant_id, workspace_id, source_id, item_id, document_id, display_title, source_version, content_hash, acl_version, acl_hash, availability, observed_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AVAILABLE', ?)",
+                        access.tenantId(), access.workspaceId(), sourceId, change.itemId(), documentId, change.title().strip(),
+                        sourceVersion, contentHash, aclVersion, aclHash, now);
+                replaceManagedSourceReaders(access, sourceId, change.itemId(), documentId, change.readActorIds());
+                recordManagedSourceVersion(access, sourceId, change.itemId(), documentId, created.version(), sourceVersion,
+                        contentHash, aclVersion, aclHash, syncId, now);
+                documentVersion = created.version();
+            } else {
+                documentId = item.documentId();
+                boolean contentChanged = !item.contentHash().equals(contentHash);
+                boolean aclChanged = !item.aclHash().equals(aclHash);
+                if (contentChanged) {
+                    var state = lockDocumentForVersion(access, actor, documentId).orElseThrow(EafException::notFound);
+                    var version = createKnowledgeVersion(new CreateKnowledgeVersionCommand(actor, access.workspaceId(),
+                            documentId, state.rowVersion(), change.content(), managedVersionKey(sourceId, change.itemId(), change.sourceVersion())),
+                            access, true);
+                    documentVersion = version.version();
+                    result = "UPDATED_DRAFT";
+                } else {
+                    documentVersion = currentManagedDocumentVersion(access, documentId, contentHash);
+                    result = aclChanged ? "ACCESS_UPDATED" : "UNCHANGED";
+                }
+                sourceVersion = change.sourceVersion();
+                aclVersion = change.aclVersion();
+                availability = "AVAILABLE";
+                jdbc.update("update knowledge.managed_source_item set display_title = ?, source_version = ?, content_hash = ?, acl_version = ?, acl_hash = ?, availability = 'AVAILABLE', reason_code = null, observed_at = ? where tenant_id = ? and workspace_id = ? and source_id = ? and item_id = ?",
+                        change.title().strip(), sourceVersion, contentHash, aclVersion, aclHash, now,
+                        access.tenantId(), access.workspaceId(), sourceId, change.itemId());
+                replaceManagedSourceReaders(access, sourceId, change.itemId(), documentId, change.readActorIds());
+                if (contentChanged) recordManagedSourceVersion(access, sourceId, change.itemId(), documentId,
+                        documentVersion, sourceVersion, contentHash, aclVersion, aclHash, syncId, now);
+            }
+        } else if ("DELETE".equals(type)) {
+            validateNextDeleteVersion(access, sourceId, change.itemId(), item, change.sourceVersion());
+            documentId = item.documentId();
+            sourceVersion = change.sourceVersion();
+            availability = "DELETED";
+            result = "MARKED_DELETED";
+            jdbc.update("update knowledge.managed_source_item set source_version = ?, availability = 'DELETED', reason_code = null, observed_at = ? where tenant_id = ? and workspace_id = ? and source_id = ? and item_id = ?",
+                    sourceVersion, now, access.tenantId(), access.workspaceId(), sourceId, change.itemId());
+            documentVersion = currentManagedDocumentVersion(access, documentId, contentHash);
+        } else if ("ACCESS".equals(type)) {
+            aclHash = managedAclHash(change.readActorIds());
+            validateNextAclVersion(access, sourceId, change.itemId(), item, change.aclVersion(), aclHash);
+            documentId = item.documentId();
+            aclVersion = change.aclVersion();
+            availability = item.availability();
+            reasonCode = item.reasonCode();
+            result = item.aclHash().equals(aclHash) ? "UNCHANGED" : "ACCESS_UPDATED";
+            jdbc.update("update knowledge.managed_source_item set acl_version = ?, acl_hash = ?, observed_at = ? where tenant_id = ? and workspace_id = ? and source_id = ? and item_id = ?",
+                    aclVersion, aclHash, now, access.tenantId(), access.workspaceId(), sourceId, change.itemId());
+            replaceManagedSourceReaders(access, sourceId, change.itemId(), documentId, change.readActorIds());
+            documentVersion = currentManagedDocumentVersion(access, documentId, contentHash);
+        } else {
+            documentId = item.documentId();
+            availability = "UNAVAILABLE";
+            reasonCode = change.reasonCode();
+            result = "MARKED_UNAVAILABLE";
+            jdbc.update("update knowledge.managed_source_item set availability = 'UNAVAILABLE', reason_code = ?, observed_at = ? where tenant_id = ? and workspace_id = ? and source_id = ? and item_id = ?",
+                    reasonCode, now, access.tenantId(), access.workspaceId(), sourceId, change.itemId());
+            documentVersion = currentManagedDocumentVersion(access, documentId, contentHash);
+        }
+        // ACCESS/UNAVAILABLE 也是当时观察到的来源事实，保留其当前 sourceVersion 供批次追溯。
+        var factSourceVersion = sourceVersion;
+        jdbc.update("insert into knowledge.managed_source_sync_item(sync_id, position, item_id, change_type, result, document_id, document_version, source_version, content_hash, acl_version, acl_hash, availability, reason_code) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                syncId, position, change.itemId(), type, result, documentId, documentVersion, factSourceVersion,
+                contentHash, aclVersion, aclHash, availability, reasonCode);
+        return new ManagedKnowledgeSource.ChangeResult(change.itemId(), type, result, documentId, documentVersion,
+                sourceVersion, availability, reasonCode);
+    }
+
+    private Optional<ManagedItem> managedSourceItem(UUID tenantId, UUID workspaceId, UUID sourceId,
+            String itemId, boolean forUpdate) {
+        return jdbc.query("select * from knowledge.managed_source_item where tenant_id = ? and workspace_id = ? and source_id = ? and item_id = ?"
+                        + (forUpdate ? " for update" : ""),
+                (org.springframework.jdbc.core.ResultSetExtractor<Optional<ManagedItem>>) rs -> rs.next()
+                        ? Optional.of(new ManagedItem(rs.getObject("document_id", UUID.class), rs.getString("display_title"),
+                                rs.getString("source_version"), rs.getString("content_hash"), rs.getString("acl_version"),
+                                rs.getString("acl_hash"), rs.getString("availability"), rs.getString("reason_code")))
+                        : Optional.empty(), tenantId, workspaceId, sourceId, itemId);
+    }
+
+    private String managedAclHash(Set<UUID> actorIds) {
+        return Hashing.sha256(actorIds.stream().sorted().map(UUID::toString).collect(java.util.stream.Collectors.joining("\u001f")));
+    }
+
+    private void validateNextSourceVersion(WorkspaceAccess access, UUID sourceId, String itemId, ManagedItem item,
+                                           String sourceVersion, String contentHash) {
+        var latest = jdbc.query("select si.change_type from knowledge.managed_source_sync_item si join knowledge.managed_source_operation so on so.id = si.sync_id where so.source_id = ? and si.item_id = ? and si.source_version = ? order by so.source_revision desc, so.observed_at desc limit 1",
+                (org.springframework.jdbc.core.ResultSetExtractor<String>) rs -> rs.next() ? rs.getString(1) : null,
+                sourceId, itemId, sourceVersion);
+        if (latest != null && (item == null || !sourceVersion.equals(item.sourceVersion()) || !"UPSERT".equals(latest)
+                || !contentHash.equals(item.contentHash())))
+            throw EafException.conflict("SOURCE_VERSION_CONFLICT", "sourceVersion 已用于其他事实或正文摘要。");
+        if (item != null && sourceVersion.equals(item.sourceVersion()) && !contentHash.equals(item.contentHash()))
+            throw EafException.conflict("SOURCE_VERSION_CONFLICT", "同一 sourceVersion 不能对应不同正文。");
+    }
+
+    private void validateNextDeleteVersion(WorkspaceAccess access, UUID sourceId, String itemId, ManagedItem item,
+                                           String sourceVersion) {
+        var latest = jdbc.query("select si.change_type from knowledge.managed_source_sync_item si join knowledge.managed_source_operation so on so.id = si.sync_id where so.source_id = ? and si.item_id = ? and si.source_version = ? order by so.source_revision desc, so.observed_at desc limit 1",
+                (org.springframework.jdbc.core.ResultSetExtractor<String>) rs -> rs.next() ? rs.getString(1) : null,
+                sourceId, itemId, sourceVersion);
+        if (latest != null && (!sourceVersion.equals(item.sourceVersion()) || !"DELETE".equals(latest)))
+            throw EafException.conflict("SOURCE_VERSION_CONFLICT", "DELETE 必须使用当前 head 未用过的新 sourceVersion。");
+    }
+
+    private void validateNextAclVersion(WorkspaceAccess access, UUID sourceId, String itemId, ManagedItem item,
+                                        String aclVersion, String aclHash) {
+        if (item != null && aclVersion.equals(item.aclVersion())) {
+            if (!aclHash.equals(item.aclHash()))
+                throw EafException.conflict("SOURCE_ACL_VERSION_CONFLICT", "同一 aclVersion 不能对应不同访问名单。");
+            return;
+        }
+        var seen = jdbc.queryForObject("select count(*) from knowledge.managed_source_sync_item si join knowledge.managed_source_operation so on so.id = si.sync_id where so.source_id = ? and si.item_id = ? and si.acl_version = ?",
+                Integer.class, sourceId, itemId, aclVersion);
+        if (seen != null && seen > 0)
+            throw EafException.conflict("SOURCE_ACL_VERSION_CONFLICT", "历史 aclVersion 不能重新作为来源 head。");
+    }
+
+    private void replaceManagedSourceReaders(WorkspaceAccess access, UUID sourceId, String itemId, UUID documentId,
+                                            Set<UUID> actorIds) {
+        var existing = new HashSet<>(jdbc.queryForList("select actor_id from knowledge.managed_source_reader where tenant_id = ? and workspace_id = ? and source_id = ? and item_id = ?",
+                UUID.class, access.tenantId(), access.workspaceId(), sourceId, itemId));
+        var next = actorIds == null ? Set.<UUID>of() : actorIds;
+        for (var removed : existing) {
+            if (next.contains(removed)) continue;
+            jdbc.update("delete from knowledge.managed_source_reader where tenant_id = ? and workspace_id = ? and source_id = ? and item_id = ? and actor_id = ?",
+                    access.tenantId(), access.workspaceId(), sourceId, itemId, removed);
+            jdbc.update("update knowledge.document_permission set status = 'REVOKED' where tenant_id = ? and workspace_id = ? and document_id = ? and actor_id = ? and action = 'knowledge:read' and grant_origin = 'MANAGED_SOURCE'",
+                    access.tenantId(), access.workspaceId(), documentId, removed);
+        }
+        for (var reader : next) {
+            jdbc.update("insert into knowledge.managed_source_reader(tenant_id, workspace_id, source_id, item_id, actor_id) values (?, ?, ?, ?, ?) on conflict do nothing",
+                    access.tenantId(), access.workspaceId(), sourceId, itemId, reader);
+            jdbc.update("insert into knowledge.document_permission(tenant_id, workspace_id, document_id, actor_id, action, status, grant_origin) values (?, ?, ?, ?, 'knowledge:read', 'ACTIVE', 'MANAGED_SOURCE') on conflict (tenant_id, document_id, actor_id, action) do update set status = 'ACTIVE', grant_origin = case when knowledge.document_permission.status = 'ACTIVE' and knowledge.document_permission.grant_origin <> 'MANAGED_SOURCE' then knowledge.document_permission.grant_origin else 'MANAGED_SOURCE' end, workspace_id = excluded.workspace_id",
+                    access.tenantId(), access.workspaceId(), documentId, reader);
+        }
+    }
+
+    private void recordManagedSourceVersion(WorkspaceAccess access, UUID sourceId, String itemId, UUID documentId,
+            int documentVersion, String sourceVersion, String contentHash, String aclVersion, String aclHash,
+            UUID syncId, Timestamp now) {
+        jdbc.update("insert into knowledge.managed_source_version(tenant_id, workspace_id, source_id, item_id, document_id, document_version, source_version, content_hash, acl_version, acl_hash, sync_id, observed_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                access.tenantId(), access.workspaceId(), sourceId, itemId, documentId, documentVersion,
+                sourceVersion, contentHash, aclVersion, aclHash, syncId, now);
+    }
+
+    private Integer currentManagedDocumentVersion(WorkspaceAccess access, UUID documentId, String contentHash) {
+        return jdbc.query("select max(asset_version) from knowledge.document_version where tenant_id = ? and workspace_id = ? and document_id = ? and content_hash = ? and status <> 'REVOKED'",
+                rs -> rs.next() ? (Integer) rs.getObject(1) : null, access.tenantId(), access.workspaceId(), documentId, contentHash);
+    }
+
+    private String managedCreateKey(UUID sourceId, String itemId) {
+        return "managed-source-v1:" + sourceId + ":" + Hashing.sha256(itemId).substring(0, 16);
+    }
+
+    private String managedVersionKey(UUID sourceId, String itemId, String sourceVersion) {
+        return "managed-source-v1:" + sourceId + ":" + Hashing.sha256(itemId).substring(0, 12)
+                + ":" + Hashing.sha256(sourceVersion).substring(0, 16);
+    }
+
+    private KnowledgeDocument rawKnowledgeVersion(WorkspaceAccess access, UUID documentId, int version) {
+        return jdbc.query("select d.id, d.tenant_id, d.workspace_id, d.owner_id, d.title, d.source_ref, d.metadata::text, v.asset_version, v.content, v.content_hash, v.status, d.created_at, d.row_version from knowledge.document d join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id where d.tenant_id = ? and d.workspace_id = ? and d.id = ? and v.asset_version = ?",
+                (org.springframework.jdbc.core.ResultSetExtractor<Optional<KnowledgeDocument>>) rs -> rs.next()
+                        ? Optional.of(map(rs)) : Optional.empty(), access.tenantId(), access.workspaceId(), documentId, version)
+                .orElseThrow(EafException::notFound);
+    }
+
+    private String managedSourceReadGuard() {
+        return " and not exists (select 1 from knowledge.managed_source_item msi "
+                + "join knowledge.managed_source ms on ms.tenant_id = msi.tenant_id and ms.workspace_id = msi.workspace_id and ms.id = msi.source_id "
+                + "where msi.tenant_id = d.tenant_id and msi.workspace_id = d.workspace_id and msi.document_id = d.id "
+                + "and (ms.status <> 'ACTIVE' or msi.availability <> 'AVAILABLE' or d.status <> 'PUBLISHED' "
+                + "or v.status <> 'PUBLISHED' or coalesce(msi.content_hash, '') <> v.content_hash "
+                + "or not exists (select 1 from knowledge.managed_source_reader r where r.tenant_id = msi.tenant_id "
+                + "and r.workspace_id = msi.workspace_id and r.source_id = msi.source_id and r.item_id = msi.item_id and r.actor_id = ?)))";
+    }
+
+    private KnowledgeChunk mapChunk(java.sql.ResultSet rs) throws java.sql.SQLException {
+        return new KnowledgeChunk(rs.getObject("id", UUID.class), rs.getObject("tenant_id", UUID.class),
+                rs.getObject("workspace_id", UUID.class), rs.getObject("document_id", UUID.class),
+                rs.getInt("asset_version"), rs.getString("source_ref"), rs.getString("chunking_version"),
+                rs.getInt("chunk_order"), rs.getInt("start_offset"), rs.getInt("end_offset"),
+                rs.getString("offset_unit"), rs.getString("content"), rs.getString("content_hash"),
+                stringList(rs.getString("heading_path")));
+    }
+
+    private int estimatedTokens(String text) {
+        int codePoints = text.codePointCount(0, text.length());
+        return Math.max(1, (codePoints + 3) / 4);
+    }
+
+    private boolean isManagedSourceDocument(WorkspaceAccess access, UUID documentId) {
+        var count = jdbc.queryForObject("select count(*) from knowledge.managed_source_item where tenant_id = ? and workspace_id = ? and document_id = ?",
+                Integer.class, access.tenantId(), access.workspaceId(), documentId);
+        return count != null && count > 0;
+    }
+
+    private boolean isManagedSourceOwner(ActorContext actor, UUID workspaceId, UUID documentId) {
+        if (actor == null || actor.type() != ActorType.HUMAN || actor.delegated()) return false;
+        var count = jdbc.queryForObject("select count(*) from knowledge.managed_source_item i join knowledge.managed_source s on s.tenant_id = i.tenant_id and s.workspace_id = i.workspace_id and s.id = i.source_id where i.tenant_id = ? and i.workspace_id = ? and i.document_id = ? and s.owner_id = ?",
+                Integer.class, actor.tenantId(), workspaceId, documentId, actor.actorId());
+        return count != null && count > 0;
+    }
+
+    private void requireCurrentManagedSourceVersion(ActorContext actor, WorkspaceAccess access,
+            UUID documentId, int documentVersion) {
+        var source = jdbc.query("select s.owner_id, s.status, i.availability, i.content_hash, v.content_hash version_hash from knowledge.managed_source_item i join knowledge.managed_source s on s.tenant_id = i.tenant_id and s.workspace_id = i.workspace_id and s.id = i.source_id join knowledge.document_version v on v.tenant_id = i.tenant_id and v.workspace_id = i.workspace_id and v.document_id = i.document_id and v.asset_version = ? where i.tenant_id = ? and i.workspace_id = ? and i.document_id = ?",
+                (org.springframework.jdbc.core.ResultSetExtractor<ManagedSourceVersionGate>) rs -> rs.next()
+                        ? new ManagedSourceVersionGate(rs.getObject("owner_id", UUID.class), rs.getString("status"),
+                                rs.getString("availability"), rs.getString("content_hash"), rs.getString("version_hash"))
+                        : null, documentVersion, access.tenantId(), access.workspaceId(), documentId);
+        if (source == null) return;
+        if (actor.type() != ActorType.HUMAN || actor.delegated() || !actor.actorId().equals(source.ownerId()))
+            throw EafException.notFound();
+        if (!"ACTIVE".equals(source.status())) throw EafException.conflict("SOURCE_DISABLED", "受管来源已停用，不能索引或发布。");
+        if (!"AVAILABLE".equals(source.availability()))
+            throw EafException.conflict("SOURCE_UNAVAILABLE", "受管来源当前不可用，不能索引或发布。");
+        if (!source.contentHash().equals(source.versionHash()))
+            throw EafException.conflict("SOURCE_CONTENT_CHANGED", "知识版本不再匹配来源当前正文，不能索引或发布。");
+    }
+
+    private record ManagedSourceCreatePrior(ManagedKnowledgeSource source, String createRequestHash) { }
+    private record ManagedOperation(UUID id, UUID sourceId, UUID actorId, String type, String requestHash,
+                                    long previousRevision, long revision, String sourceStatus, Instant observedAt) { }
+    private record ManagedItem(UUID documentId, String title, String sourceVersion, String contentHash,
+                               String aclVersion, String aclHash, String availability, String reasonCode) { }
+    private record ManagedSourceVersionGate(UUID ownerId, String status, String availability,
+                                            String contentHash, String versionHash) { }
+    private record Neighbor(String relation, KnowledgeChunk chunk) { }
+
     // 对文档加行锁后 CAS 递增 rowVersion，防止两个编辑基于同一旧版本覆盖顺序。
     @Override
     @Transactional
     public KnowledgeDocument createVersion(CreateKnowledgeVersionCommand command) {
+        return createKnowledgeVersion(command, null, false);
+    }
+
+    private KnowledgeDocument createKnowledgeVersion(CreateKnowledgeVersionCommand command, WorkspaceAccess managedAccess,
+                                                      boolean managedSourceWrite) {
         if (command == null || command.actor() == null || command.workspaceId() == null || command.documentId() == null
                 || blank(command.content()) || command.content().getBytes(StandardCharsets.UTF_8).length > MAX_CONTENT_BYTES
                 || blank(command.idempotencyKey()) || command.idempotencyKey().length() > 200 || hasControl(command.idempotencyKey()))
             throw EafException.invalid("新知识版本需要正文、范围和有效幂等键。");
-        var access = workspaces.require(command.actor(), command.workspaceId(), "knowledge:write");
+        var access = managedAccess == null
+                ? workspaces.require(command.actor(), command.workspaceId(), "knowledge:write") : managedAccess;
+        if (!managedSourceWrite && isManagedSourceDocument(access, command.documentId()))
+            throw EafException.conflict("MANAGED_SOURCE_VERSION_REQUIRED", "受管来源正文只能通过来源变更批次追加版本。");
         var requestHash = Hashing.sha256("KNOWLEDGE_VERSION|" + command.content());
         var prior = findVersionByIdempotency(access, command.documentId(), command.idempotencyKey());
         if (prior != null) {
             if (!requestHash.equals(prior.requestHash())) throw EafException.conflict("IDEMPOTENCY_CONFLICT", "版本幂等键已用于不同正文。");
-            return getVersion(command.actor(), command.workspaceId(), command.documentId(), prior.assetVersion());
+            return managedSourceWrite ? rawKnowledgeVersion(access, command.documentId(), prior.assetVersion())
+                    : getVersion(command.actor(), command.workspaceId(), command.documentId(), prior.assetVersion());
         }
         var document = lockDocumentForVersion(access, command.actor(), command.documentId()).orElseThrow(EafException::notFound);
         // 锁后再次读同键事实，收敛两个并发的相同版本请求。
         prior = findVersionByIdempotency(access, command.documentId(), command.idempotencyKey());
         if (prior != null) {
             if (!requestHash.equals(prior.requestHash())) throw EafException.conflict("IDEMPOTENCY_CONFLICT", "版本幂等键已用于不同正文。");
-            return getVersion(command.actor(), command.workspaceId(), command.documentId(), prior.assetVersion());
+            return managedSourceWrite ? rawKnowledgeVersion(access, command.documentId(), prior.assetVersion())
+                    : getVersion(command.actor(), command.workspaceId(), command.documentId(), prior.assetVersion());
         }
         if (document.rowVersion() != command.expectedRowVersion())
             throw EafException.conflict("VERSION_CONFLICT", "文档基线已变化，请重新读取后创建版本。");
@@ -173,7 +873,8 @@ public class JdbcKnowledgeService implements KnowledgeService {
         if (jdbc.update("update knowledge.document set row_version = ?, updated_at = ? where tenant_id = ? and workspace_id = ? and id = ? and row_version = ?",
                 nextVersion, now, access.tenantId(), access.workspaceId(), command.documentId(), command.expectedRowVersion()) != 1)
             throw EafException.conflict("VERSION_CONFLICT", "文档基线已变化，请重新读取后创建版本。");
-        return getVersion(command.actor(), command.workspaceId(), command.documentId(), assetVersion);
+        return managedSourceWrite ? rawKnowledgeVersion(access, command.documentId(), assetVersion)
+                : getVersion(command.actor(), command.workspaceId(), command.documentId(), assetVersion);
     }
 
     @Override
@@ -182,9 +883,10 @@ public class JdbcKnowledgeService implements KnowledgeService {
         if (!workspaces.isAuthorized(actor.tenantId(), actor.actorId(), workspaceId, "knowledge:read")) {
             throw EafException.notFound();
         }
-        return jdbc.query("select d.id, d.tenant_id, d.workspace_id, d.owner_id, d.title, d.source_ref, d.metadata::text, v.asset_version, v.content, v.content_hash, v.status, d.created_at, d.row_version from knowledge.document d join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id and v.asset_version = coalesce((select p.asset_version from knowledge.document_publication p where p.tenant_id = d.tenant_id and p.workspace_id = d.workspace_id and p.document_id = d.id and p.status = 'ACTIVE'), (select max(draft.asset_version) from knowledge.document_version draft where draft.tenant_id = d.tenant_id and draft.workspace_id = d.workspace_id and draft.document_id = d.id and draft.status <> 'REVOKED')) join knowledge.document_permission p on p.tenant_id = d.tenant_id and p.workspace_id = d.workspace_id and p.document_id = d.id and p.actor_id = ? and p.action = 'knowledge:read' and p.status = 'ACTIVE' where d.id = ? and d.tenant_id = ? and d.workspace_id = ?",
-                (org.springframework.jdbc.core.ResultSetExtractor<Optional<KnowledgeDocument>>) rs -> rs.next() ? Optional.of(map(rs)) : Optional.empty(), actor.actorId(), documentId, actor.tenantId(), workspaceId)
-                .orElseThrow(EafException::notFound);
+        return jdbc.query("select d.id, d.tenant_id, d.workspace_id, d.owner_id, d.title, d.source_ref, d.metadata::text, v.asset_version, v.content, v.content_hash, v.status, d.created_at, d.row_version from knowledge.document d join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id and v.asset_version = coalesce((select p.asset_version from knowledge.document_publication p where p.tenant_id = d.tenant_id and p.workspace_id = d.workspace_id and p.document_id = d.id and p.status = 'ACTIVE'), (select max(draft.asset_version) from knowledge.document_version draft where draft.tenant_id = d.tenant_id and draft.workspace_id = d.workspace_id and draft.document_id = d.id and draft.status <> 'REVOKED')) join knowledge.document_permission p on p.tenant_id = d.tenant_id and p.workspace_id = d.workspace_id and p.document_id = d.id and p.actor_id = ? and p.action = 'knowledge:read' and p.status = 'ACTIVE' where d.id = ? and d.tenant_id = ? and d.workspace_id = ?"
+                        + managedSourceReadGuard(),
+                (org.springframework.jdbc.core.ResultSetExtractor<Optional<KnowledgeDocument>>) rs -> rs.next() ? Optional.of(map(rs)) : Optional.empty(), actor.actorId(), documentId, actor.tenantId(), workspaceId, actor.actorId())
+                        .orElseThrow(EafException::notFound);
     }
 
     @Override
@@ -196,10 +898,20 @@ public class JdbcKnowledgeService implements KnowledgeService {
         var where = " from knowledge.document d where d.tenant_id = ? and d.workspace_id = ? "
                 + "and exists (select 1 from knowledge.document_permission p where p.tenant_id = d.tenant_id "
                 + "and p.workspace_id = d.workspace_id and p.document_id = d.id and p.actor_id = ? "
-                + "and p.action = 'knowledge:read' and p.status = 'ACTIVE')";
+                + "and p.action = 'knowledge:read' and p.status = 'ACTIVE')"
+                + " and not exists (select 1 from knowledge.managed_source_item msi join knowledge.managed_source ms "
+                + "on ms.tenant_id = msi.tenant_id and ms.workspace_id = msi.workspace_id and ms.id = msi.source_id "
+                + "where msi.tenant_id = d.tenant_id and msi.workspace_id = d.workspace_id and msi.document_id = d.id "
+                + "and (ms.status <> 'ACTIVE' or msi.availability <> 'AVAILABLE' or not exists (select 1 from knowledge.document_publication p "
+                + "join knowledge.document_version v on v.tenant_id = p.tenant_id and v.workspace_id = p.workspace_id "
+                + "and v.document_id = p.document_id and v.asset_version = p.asset_version and v.status = 'PUBLISHED' "
+                + "where p.tenant_id = d.tenant_id and p.workspace_id = d.workspace_id and p.document_id = d.id "
+                + "and p.status = 'ACTIVE' and v.content_hash = msi.content_hash) or not exists (select 1 from knowledge.managed_source_reader r "
+                + "where r.tenant_id = msi.tenant_id and r.workspace_id = msi.workspace_id and r.source_id = msi.source_id "
+                + "and r.item_id = msi.item_id and r.actor_id = ?)))";
         var total = jdbc.queryForObject("select count(*)" + where, Long.class,
-                access.tenantId(), workspaceId, actor.actorId());
-        var args = new java.util.ArrayList<Object>(List.of(access.tenantId(), workspaceId, actor.actorId()));
+                access.tenantId(), workspaceId, actor.actorId(), actor.actorId());
+        var args = new java.util.ArrayList<Object>(List.of(access.tenantId(), workspaceId, actor.actorId(), actor.actorId()));
         var pageWhere = new StringBuilder(where);
         if (cursorCreatedAt != null) {
             pageWhere.append(" and (d.created_at, d.id) < (?, ?)");
@@ -349,9 +1061,10 @@ public class JdbcKnowledgeService implements KnowledgeService {
     public KnowledgeDocument getVersion(ActorContext actor, UUID workspaceId, UUID documentId, int assetVersion) {
         if (assetVersion < 1) throw EafException.invalid("assetVersion 必须为正数。");
         if (!workspaces.isAuthorized(actor.tenantId(), actor.actorId(), workspaceId, "knowledge:read")) throw EafException.notFound();
-        return jdbc.query("select d.id, d.tenant_id, d.workspace_id, d.owner_id, d.title, d.source_ref, d.metadata::text, v.asset_version, v.content, v.content_hash, v.status, d.created_at, d.row_version from knowledge.document d join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id join knowledge.document_permission p on p.tenant_id = d.tenant_id and p.workspace_id = d.workspace_id and p.document_id = d.id and p.actor_id = ? and p.action = 'knowledge:read' and p.status = 'ACTIVE' where d.id = ? and d.tenant_id = ? and d.workspace_id = ? and v.asset_version = ?",
+        return jdbc.query("select d.id, d.tenant_id, d.workspace_id, d.owner_id, d.title, d.source_ref, d.metadata::text, v.asset_version, v.content, v.content_hash, v.status, d.created_at, d.row_version from knowledge.document d join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id join knowledge.document_permission p on p.tenant_id = d.tenant_id and p.workspace_id = d.workspace_id and p.document_id = d.id and p.actor_id = ? and p.action = 'knowledge:read' and p.status = 'ACTIVE' where d.id = ? and d.tenant_id = ? and d.workspace_id = ? and v.asset_version = ?"
+                        + managedSourceReadGuard(),
                 (org.springframework.jdbc.core.ResultSetExtractor<Optional<KnowledgeDocument>>) rs -> rs.next() ? Optional.of(map(rs)) : Optional.empty(),
-                actor.actorId(), documentId, actor.tenantId(), workspaceId, assetVersion).orElseThrow(EafException::notFound);
+                actor.actorId(), documentId, actor.tenantId(), workspaceId, assetVersion, actor.actorId()).orElseThrow(EafException::notFound);
     }
 
     @Override
@@ -368,6 +1081,7 @@ public class JdbcKnowledgeService implements KnowledgeService {
         var source = jdbc.query("select d.source_ref, v.asset_version, v.content from knowledge.document d join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id and v.asset_version = ? and v.status in ('DRAFT', 'PUBLISHED') where d.id = ? and d.tenant_id = ? and d.workspace_id = ? and d.status in ('DRAFT', 'PUBLISHED') and exists (select 1 from knowledge.document_permission p where p.tenant_id = d.tenant_id and p.workspace_id = d.workspace_id and p.document_id = d.id and p.actor_id = ? and p.action = 'knowledge:write' and p.status = 'ACTIVE') and exists (select 1 from knowledge.document_permission p where p.tenant_id = d.tenant_id and p.workspace_id = d.workspace_id and p.document_id = d.id and p.actor_id = ? and p.action = 'knowledge:read' and p.status = 'ACTIVE')",
                 (org.springframework.jdbc.core.ResultSetExtractor<Optional<ChunkSource>>) rs -> rs.next() ? Optional.of(new ChunkSource(rs.getString("source_ref"), rs.getInt("asset_version"), rs.getString("content"))) : Optional.empty(),
                 assetVersion, documentId, access.tenantId(), access.workspaceId(), actor.actorId(), actor.actorId()).orElseThrow(EafException::notFound);
+        requireCurrentManagedSourceVersion(actor, access, documentId, assetVersion);
         var ranges = "p9-structure-1".equals(chunkingVersion)
                 ? splitStructured(source.content(), maxCodePoints) : split(source.content(), maxCodePoints);
         var now = Timestamp.from(Instant.now(clock));
@@ -394,10 +1108,11 @@ public class JdbcKnowledgeService implements KnowledgeService {
         if (!CHUNK_LIMITS.containsKey(chunkingVersion)) throw EafException.invalid("不支持的 chunkingVersion。");
         if (assetVersion < 1) throw EafException.invalid("assetVersion 必须为正数。");
         var access = workspaces.require(actor, workspaceId, "knowledge:write");
+        var source = findBuildSource(actor, access, documentId, assetVersion, chunkingVersion).orElseThrow(EafException::notFound);
+        requireCurrentManagedSourceVersion(actor, access, documentId, assetVersion);
         var profile = embeddings.profile();
         requireStoredDimension(profile);
         requireExternalEmbedding(actor, workspaceId, profile);
-        var source = findBuildSource(actor, access, documentId, assetVersion, chunkingVersion).orElseThrow(EafException::notFound);
         if (source.totalChunks() == 0) throw EafException.conflict("INDEX_BUILD_NO_CHUNKS", "文档尚未完成切块，不能构建索引。");
         var signature = configurationSignature(chunkingVersion, profile);
         var now = Instant.now(clock);
@@ -423,7 +1138,8 @@ public class JdbcKnowledgeService implements KnowledgeService {
 
     @Override
     public KnowledgeIndexBuild getIndexBuild(ActorContext actor, UUID workspaceId, UUID documentId, UUID buildId) {
-        var access = workspaces.require(actor, workspaceId, "knowledge:read");
+        var access = isManagedSourceOwner(actor, workspaceId, documentId)
+                ? requireSourceManager(actor, workspaceId) : workspaces.require(actor, workspaceId, "knowledge:read");
         return jdbc.query("select b.* from knowledge.index_build b where b.id = ? and b.tenant_id = ? and b.workspace_id = ? and b.document_id = ? and exists (select 1 from knowledge.document_permission p where p.tenant_id = b.tenant_id and p.workspace_id = b.workspace_id and p.document_id = b.document_id and p.actor_id = ? and p.action = 'knowledge:read' and p.status = 'ACTIVE')",
                 (org.springframework.jdbc.core.ResultSetExtractor<Optional<KnowledgeIndexBuild>>) rs -> rs.next() ? Optional.of(mapBuild(rs)) : Optional.empty(),
                 buildId, access.tenantId(), access.workspaceId(), documentId, actor.actorId()).orElseThrow(EafException::notFound);
@@ -432,10 +1148,11 @@ public class JdbcKnowledgeService implements KnowledgeService {
     @Override
     public KnowledgeIndexBuild retryIndex(ActorContext actor, UUID workspaceId, UUID documentId, UUID buildId) {
         var access = workspaces.require(actor, workspaceId, "knowledge:write");
+        var build = getIndexBuild(actor, workspaceId, documentId, buildId);
+        requireCurrentManagedSourceVersion(actor, access, documentId, build.assetVersion());
         var profile = embeddings.profile();
         requireStoredDimension(profile);
         requireExternalEmbedding(actor, workspaceId, profile);
-        var build = getIndexBuild(actor, workspaceId, documentId, buildId);
         if ("READY".equals(build.status())) return build;
         var now = Instant.now(clock);
         // FAILED 可以立即重试；疑似进程中断的 INDEXING 仅在调用截止时间后原子接管，防止并发重复付费。
@@ -504,6 +1221,11 @@ public class JdbcKnowledgeService implements KnowledgeService {
                 access.tenantId(), workspaceId, documentId, build.assetVersion()).orElseThrow(() -> EafException.conflict("VERSION_NOT_FOUND", "目标知识版本不存在。"));
         if (expectedContentHash != null && !expectedContentHash.equals(version.contentHash()))
             throw EafException.conflict("CONTENT_HASH_CONFLICT", "候选正文摘要与待发布 Knowledge 版本不一致。");
+        if (isManagedSourceDocument(access, documentId)) {
+            if (candidateId != null)
+                throw EafException.conflict("MANAGED_SOURCE_CANDIDATE_CONFLICT", "受管来源文档不能通过 Learning 候选发布改写。");
+            requireCurrentManagedSourceVersion(actor, access, documentId, build.assetVersion());
+        }
         if (!List.of("DRAFT", "PUBLISHED").contains(version.status()))
             throw EafException.conflict("VERSION_STATE_CONFLICT", "已撤回的知识版本不能重新发布。");
         var now = Timestamp.from(Instant.now(clock));
@@ -696,9 +1418,64 @@ public class JdbcKnowledgeService implements KnowledgeService {
     public boolean isUsable(ActorContext actor, UUID workspaceId, UUID documentId, int documentVersion,
                             UUID chunkId, UUID buildId, String contentHash) {
         var access = workspaces.require(actor, workspaceId, "knowledge:read");
-        var count = jdbc.queryForObject("select count(*) from knowledge.document d join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id and v.asset_version = ? and v.status = 'PUBLISHED' join knowledge.chunk c on c.tenant_id = v.tenant_id and c.workspace_id = v.workspace_id and c.document_id = v.document_id and c.asset_version = v.asset_version and c.id = ? and c.content_hash = ? join knowledge.index_build b on b.id = ? and b.tenant_id = d.tenant_id and b.workspace_id = d.workspace_id and b.document_id = d.id and b.asset_version = v.asset_version and b.status = 'READY' where d.tenant_id = ? and d.workspace_id = ? and d.id = ? and d.status = 'PUBLISHED' and exists (select 1 from knowledge.document_permission dp where dp.tenant_id = d.tenant_id and dp.workspace_id = d.workspace_id and dp.document_id = d.id and dp.actor_id = ? and dp.action = 'knowledge:read' and dp.status = 'ACTIVE')",
-                Integer.class, documentVersion, chunkId, contentHash, buildId, access.tenantId(), access.workspaceId(), documentId, actor.actorId());
+        var delegatedScope = mcpDocumentScope(actor, workspaceId);
+        if (delegatedScope != null && (!delegatedScope.knowledgeDocumentIds().contains(documentId)
+                || !hasDocumentReadPermission(actor.principalId(), access.tenantId(), workspaceId, documentId))) return false;
+        var sql = "select count(*) from knowledge.document d join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id and v.asset_version = ? and v.status = 'PUBLISHED' join knowledge.chunk c on c.tenant_id = v.tenant_id and c.workspace_id = v.workspace_id and c.document_id = v.document_id and c.asset_version = v.asset_version and c.id = ? and c.content_hash = ? join knowledge.index_build b on b.id = ? and b.tenant_id = d.tenant_id and b.workspace_id = d.workspace_id and b.document_id = d.id and b.asset_version = v.asset_version and b.status = 'READY' where d.tenant_id = ? and d.workspace_id = ? and d.id = ? and d.status = 'PUBLISHED' and exists (select 1 from knowledge.document_permission dp where dp.tenant_id = d.tenant_id and dp.workspace_id = d.workspace_id and dp.document_id = d.id and dp.actor_id = ? and dp.action = 'knowledge:read' and dp.status = 'ACTIVE')"
+                + managedSourceReadGuard();
+        var parameters = new ArrayList<Object>();
+        parameters.add(documentVersion);
+        parameters.add(chunkId);
+        parameters.add(contentHash);
+        parameters.add(buildId);
+        parameters.add(access.tenantId());
+        parameters.add(access.workspaceId());
+        parameters.add(documentId);
+        parameters.add(actor.actorId());
+        parameters.add(actor.actorId());
+        if (delegatedScope != null) {
+            sql += managedSourceReadGuard();
+            parameters.add(delegatedScope.ownerId());
+        }
+        var count = jdbc.queryForObject(sql, Integer.class, parameters.toArray());
         return count != null && count == 1;
+    }
+
+    @Override
+    public List<PublishedKnowledgeChunk> readPublishedChunks(ActorContext actor, UUID workspaceId,
+            List<PublishedKnowledgeChunk.Ref> refs) {
+        requireDirectHuman(actor, "已选 Knowledge Chunk 读取");
+        var access = workspaces.require(actor, workspaceId, "knowledge:read");
+        if (!identities.isActiveHuman(actor.tenantId(), actor.actorId())) throw EafException.notFound();
+        if (refs == null || refs.isEmpty() || refs.size() > 10 || refs.stream().anyMatch(ref -> ref == null
+                || ref.documentId() == null || ref.documentVersion() < 1 || ref.chunkId() == null || ref.buildId() == null
+                || ref.contentHash() == null || !ref.contentHash().matches("[0-9a-f]{64}"))
+                || refs.stream().map(PublishedKnowledgeChunk.Ref::chunkId).distinct().count() != refs.size())
+            throw EafException.invalid("精确 Knowledge 引用必须为 1-10 个且不得重复。");
+        return refs.stream().map(ref -> jdbc.query(
+                "select c.id, c.tenant_id, c.workspace_id, c.document_id, c.asset_version, c.source_ref, "
+                        + "c.chunking_version, c.chunk_order, c.start_offset, c.end_offset, c.offset_unit, "
+                        + "c.content, c.content_hash, c.heading_path::text, d.title "
+                        + "from knowledge.chunk c join knowledge.document d on d.tenant_id = c.tenant_id "
+                        + "and d.workspace_id = c.workspace_id and d.id = c.document_id "
+                        + "join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id "
+                        + "and v.document_id = d.id and v.asset_version = c.asset_version "
+                        + "join knowledge.index_build b on b.id = ? and b.tenant_id = c.tenant_id "
+                        + "and b.workspace_id = c.workspace_id and b.document_id = c.document_id "
+                        + "and b.asset_version = c.asset_version and b.chunking_version = c.chunking_version and b.status = 'READY' "
+                        + "join knowledge.document_publication p on p.tenant_id = b.tenant_id and p.workspace_id = b.workspace_id "
+                        + "and p.document_id = b.document_id and p.asset_version = b.asset_version and p.build_id = b.id and p.status = 'ACTIVE' "
+                        + "where c.id = ? and c.document_id = ? and c.asset_version = ? and c.content_hash = ? "
+                        + "and d.tenant_id = ? and d.workspace_id = ? and d.status = 'PUBLISHED' and v.status = 'PUBLISHED' "
+                        + "and exists (select 1 from knowledge.document_permission dp where dp.tenant_id = d.tenant_id "
+                        + "and dp.workspace_id = d.workspace_id and dp.document_id = d.id and dp.actor_id = ? "
+                        + "and dp.action = 'knowledge:read' and dp.status = 'ACTIVE')" + managedSourceReadGuard(),
+                (org.springframework.jdbc.core.ResultSetExtractor<Optional<PublishedKnowledgeChunk>>) rs -> rs.next()
+                        ? Optional.of(new PublishedKnowledgeChunk(ref, rs.getString("title"), rs.getString("content"),
+                        stringList(rs.getString("heading_path")))) : Optional.empty(),
+                ref.buildId(), ref.chunkId(), ref.documentId(), ref.documentVersion(), ref.contentHash(),
+                access.tenantId(), workspaceId, actor.actorId(), actor.actorId())
+                .orElseThrow(EafException::notFound)).toList();
     }
 
     @Override
@@ -830,16 +1607,18 @@ public class JdbcKnowledgeService implements KnowledgeService {
         var access = workspaces.require(actor, workspaceId, "knowledge:read");
         String accessPath = scopedHit.accessPath();
         if ("DIRECT".equals(accessPath)) {
-            var count = jdbc.queryForObject("select count(*) from knowledge.document d join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id and v.asset_version = ? and v.status = 'PUBLISHED' join knowledge.chunk c on c.tenant_id = v.tenant_id and c.workspace_id = v.workspace_id and c.document_id = v.document_id and c.asset_version = v.asset_version and c.id = ? and c.content_hash = ? join knowledge.index_build b on b.id = ? and b.tenant_id = d.tenant_id and b.workspace_id = d.workspace_id and b.document_id = d.id and b.asset_version = v.asset_version and b.status = 'READY' join knowledge.document_publication p on p.tenant_id = b.tenant_id and p.workspace_id = b.workspace_id and p.document_id = b.document_id and p.asset_version = b.asset_version and p.build_id = b.id and p.status = 'ACTIVE' where d.tenant_id = ? and d.workspace_id = ? and d.id = ? and exists (select 1 from knowledge.document_permission dp where dp.tenant_id = d.tenant_id and dp.workspace_id = d.workspace_id and dp.document_id = d.id and dp.actor_id = ? and dp.action = 'knowledge:read' and dp.status = 'ACTIVE')",
+            var count = jdbc.queryForObject("select count(*) from knowledge.document d join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id and v.asset_version = ? and v.status = 'PUBLISHED' join knowledge.chunk c on c.tenant_id = v.tenant_id and c.workspace_id = v.workspace_id and c.document_id = v.document_id and c.asset_version = v.asset_version and c.id = ? and c.content_hash = ? join knowledge.index_build b on b.id = ? and b.tenant_id = d.tenant_id and b.workspace_id = d.workspace_id and b.document_id = d.id and b.asset_version = v.asset_version and b.status = 'READY' join knowledge.document_publication p on p.tenant_id = b.tenant_id and p.workspace_id = b.workspace_id and p.document_id = b.document_id and p.asset_version = b.asset_version and p.build_id = b.id and p.status = 'ACTIVE' where d.tenant_id = ? and d.workspace_id = ? and d.id = ? and exists (select 1 from knowledge.document_permission dp where dp.tenant_id = d.tenant_id and dp.workspace_id = d.workspace_id and dp.document_id = d.id and dp.actor_id = ? and dp.action = 'knowledge:read' and dp.status = 'ACTIVE')"
+                            + managedSourceReadGuard(),
                     Integer.class, hit.documentVersion(), hit.chunkId(), hit.contentHash(), hit.buildId(), access.tenantId(), workspaceId,
-                    hit.documentId(), actor.actorId());
+                    hit.documentId(), actor.actorId(), actor.actorId());
             return count != null && count == 1 && scopedHit.shareId() == null && scopedHit.shareVersion() == null;
         }
         if (!"SHARE".equals(accessPath) || scopedHit.shareId() == null || scopedHit.shareVersion() == null) return false;
         // 正式上下文共享本身就是第二条授权路径；这里核验精确共享记录，不要求接收者另有文档直读权。
-        var count = jdbc.queryForObject("select count(*) from knowledge.context_share s join knowledge.document d on d.tenant_id = s.tenant_id and d.workspace_id = s.workspace_id and d.id = s.document_id and d.status = 'PUBLISHED' join knowledge.document_version v on v.tenant_id = s.tenant_id and v.workspace_id = s.workspace_id and v.document_id = s.document_id and v.asset_version = s.document_version and v.status = 'PUBLISHED' join knowledge.document_publication p on p.tenant_id = s.tenant_id and p.workspace_id = s.workspace_id and p.document_id = s.document_id and p.asset_version = s.document_version and p.build_id = s.build_id and p.status = 'ACTIVE' join knowledge.index_build b on b.id = s.build_id and b.tenant_id = s.tenant_id and b.workspace_id = s.workspace_id and b.document_id = s.document_id and b.asset_version = s.document_version and b.status = 'READY' join knowledge.chunk c on c.tenant_id = b.tenant_id and c.workspace_id = b.workspace_id and c.document_id = b.document_id and c.asset_version = b.asset_version and c.id = ? and c.content_hash = ? where s.id = ? and s.row_version = ? and s.status = 'ACTIVE' and s.tenant_id = ? and s.workspace_id = ? and s.document_id = ? and s.recipient_id = ? and s.document_version = ? and s.build_id = ? and s.content_hash = v.content_hash",
+        var count = jdbc.queryForObject("select count(*) from knowledge.context_share s join knowledge.document d on d.tenant_id = s.tenant_id and d.workspace_id = s.workspace_id and d.id = s.document_id and d.status = 'PUBLISHED' join knowledge.document_version v on v.tenant_id = s.tenant_id and v.workspace_id = s.workspace_id and v.document_id = s.document_id and v.asset_version = s.document_version and v.status = 'PUBLISHED' join knowledge.document_publication p on p.tenant_id = s.tenant_id and p.workspace_id = s.workspace_id and p.document_id = s.document_id and p.asset_version = s.document_version and p.build_id = s.build_id and p.status = 'ACTIVE' join knowledge.index_build b on b.id = s.build_id and b.tenant_id = s.tenant_id and b.workspace_id = s.workspace_id and b.document_id = s.document_id and b.asset_version = s.document_version and b.status = 'READY' join knowledge.chunk c on c.tenant_id = b.tenant_id and c.workspace_id = b.workspace_id and c.document_id = b.document_id and c.asset_version = b.asset_version and c.id = ? and c.content_hash = ? where s.id = ? and s.row_version = ? and s.status = 'ACTIVE' and s.tenant_id = ? and s.workspace_id = ? and s.document_id = ? and s.recipient_id = ? and s.document_version = ? and s.build_id = ? and s.content_hash = v.content_hash"
+                        + managedSourceReadGuard(),
                 Integer.class, hit.chunkId(), hit.contentHash(), scopedHit.shareId(), scopedHit.shareVersion(), access.tenantId(), workspaceId,
-                hit.documentId(), actor.actorId(), hit.documentVersion(), hit.buildId());
+                hit.documentId(), actor.actorId(), hit.documentVersion(), hit.buildId(), actor.actorId());
         return count != null && count == 1;
     }
 
@@ -862,6 +1641,7 @@ public class JdbcKnowledgeService implements KnowledgeService {
         if (topK < 1 || topK > SEARCH_TOP_K_MAX) throw EafException.invalid("topK 必须在 1-10 之间。");
         if (!List.of("VECTOR", "HYBRID").contains(mode)) throw EafException.invalid("检索 mode 必须为 VECTOR 或 HYBRID。");
         var access = workspaces.require(actor, workspaceId, "knowledge:read");
+        var delegatedScope = mcpDocumentScope(actor, workspaceId);
         var profile = embeddings.profile();
         requireStoredDimension(profile);
         if (query.codePointCount(0, query.length()) > profile.maxTextCodePoints())
@@ -874,7 +1654,8 @@ public class JdbcKnowledgeService implements KnowledgeService {
                 Instant.now(clock).plusSeconds(30), attribution));
         validateQueryEmbedding(result, profile);
         var vector = vectorLiteral(result.vectors().get(0));
-        var vectorHits = vectorCandidates(vector, access, actor, profile, "VECTOR".equals(mode) ? topK : 20);
+        var vectorHits = vectorCandidates(vector, access, actor, profile, "VECTOR".equals(mode) ? topK : 20,
+                delegatedScope);
         if ("VECTOR".equals(mode)) {
             var hits = new ArrayList<KnowledgeSearchHit>();
             for (var i = 0; i < vectorHits.size(); i++) hits.add(withRetrieval(vectorHits.get(i), List.of("VECTOR"), i + 1,
@@ -884,7 +1665,7 @@ public class JdbcKnowledgeService implements KnowledgeService {
         var tokens = lexicalTokens(query);
         var tsQuery = tokens.isEmpty() ? null : String.join(" | ", tokens);
         var lexicalHits = tsQuery == null ? List.<KnowledgeSearchHit>of()
-                : lexicalCandidates(tsQuery, vector, access, actor, profile);
+                : lexicalCandidates(tsQuery, vector, access, actor, profile, delegatedScope);
         var merged = new java.util.LinkedHashMap<SearchKey, SearchMerge>();
         for (var i = 0; i < vectorHits.size(); i++) {
             var hit = vectorHits.get(i);
@@ -926,13 +1707,13 @@ public class JdbcKnowledgeService implements KnowledgeService {
                         + "join knowledge.document_publication p on p.tenant_id = e.tenant_id and p.workspace_id = e.workspace_id and p.document_id = e.document_id and p.asset_version = e.asset_version and p.build_id = e.build_id and p.status = 'ACTIVE' "
                         + "join knowledge.index_build b on b.id = e.build_id and b.tenant_id = e.tenant_id and b.workspace_id = e.workspace_id and b.document_id = e.document_id and b.dimension = e.dimension and b.configuration_signature = e.configuration_signature and b.status = 'READY' "
                         + "left join lateral (select cs.id, cs.row_version from knowledge.context_share cs where cs.tenant_id = d.tenant_id and cs.workspace_id = d.workspace_id and cs.document_id = d.id and cs.recipient_id = ? and cs.status = 'ACTIVE' and cs.document_version = v.asset_version and cs.build_id = p.build_id and cs.content_hash = v.content_hash order by cs.id limit 1) s on true "
-                        + "where e.tenant_id = ? and e.workspace_id = ? and b.provider = ? and b.model = ? and b.model_revision = ? and b.dimension = ? and b.distance_metric = 'COSINE' and d.status = 'PUBLISHED' and v.status = 'PUBLISHED' and (s.id is not null or exists (select 1 from knowledge.document_permission dp where dp.tenant_id = d.tenant_id and dp.workspace_id = d.workspace_id and dp.document_id = d.id and dp.actor_id = ? and dp.action = 'knowledge:read' and dp.status = 'ACTIVE')) "
-                        + "order by distance, c.document_id, c.chunk_order, c.id limit ?",
+                        + "where e.tenant_id = ? and e.workspace_id = ? and b.provider = ? and b.model = ? and b.model_revision = ? and b.dimension = ? and b.distance_metric = 'COSINE' and d.status = 'PUBLISHED' and v.status = 'PUBLISHED' and (s.id is not null or exists (select 1 from knowledge.document_permission dp where dp.tenant_id = d.tenant_id and dp.workspace_id = d.workspace_id and dp.document_id = d.id and dp.actor_id = ? and dp.action = 'knowledge:read' and dp.status = 'ACTIVE'))"
+                        + managedSourceReadGuard() + " order by distance, c.document_id, c.chunk_order, c.id limit ?",
                 (rs, rowNum) -> new ScopedKnowledgeSearchHit(mapSearchHit(rs), rs.getString("access_path"),
                         rs.getObject("share_id", UUID.class), (Long) rs.getObject("share_version")),
                 vector, actor.actorId(), actor.actorId(), actor.actorId(), actor.actorId(),
                 access.tenantId(), access.workspaceId(), profile.provider(), profile.model(), profile.revision(),
-                profile.dimension(), actor.actorId(), limit);
+                profile.dimension(), actor.actorId(), actor.actorId(), limit);
     }
 
     private void requireHumanContextShareActor(ActorContext actor, UUID workspaceId) {
@@ -1003,18 +1784,63 @@ public class JdbcKnowledgeService implements KnowledgeService {
     private record PublicationBinding(int assetVersion, UUID buildId, String contentHash) { }
 
     private List<KnowledgeSearchHit> vectorCandidates(String vector, WorkspaceAccess access, ActorContext actor,
-                                                      EmbeddingProfile profile, int limit) {
+                                                      EmbeddingProfile profile, int limit,
+                                                      McpReadonlyDelegationScope delegatedScope) {
         // build、向量维度和配置签名必须完全相同；不同向量空间绝不参与同一排序。
-        return jdbc.query("select c.tenant_id, c.workspace_id, c.document_id, c.asset_version, c.id chunk_id, c.source_ref, c.chunking_version, c.chunk_order, c.start_offset, c.end_offset, c.offset_unit, c.content, c.content_hash, c.heading_path::text, e.build_id, e.configuration_signature, e.distance_metric, e.embedding <=> ?::public.vector as distance from knowledge.embedding e join knowledge.chunk c on c.tenant_id = e.tenant_id and c.workspace_id = e.workspace_id and c.document_id = e.document_id and c.asset_version = e.asset_version and c.id = e.chunk_id join knowledge.document d on d.tenant_id = c.tenant_id and d.workspace_id = c.workspace_id and d.id = c.document_id join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id and v.asset_version = c.asset_version join knowledge.document_publication p on p.tenant_id = e.tenant_id and p.workspace_id = e.workspace_id and p.document_id = e.document_id and p.asset_version = e.asset_version and p.build_id = e.build_id join knowledge.index_build b on b.id = e.build_id and b.tenant_id = e.tenant_id and b.workspace_id = e.workspace_id and b.document_id = e.document_id and b.dimension = e.dimension and b.configuration_signature = e.configuration_signature and b.status = 'READY' where e.tenant_id = ? and e.workspace_id = ? and b.provider = ? and b.model = ? and b.model_revision = ? and b.dimension = ? and b.distance_metric = 'COSINE' and p.status = 'ACTIVE' and d.status = 'PUBLISHED' and v.status = 'PUBLISHED' and exists (select 1 from knowledge.document_permission dp where dp.tenant_id = d.tenant_id and dp.workspace_id = d.workspace_id and dp.document_id = d.id and dp.actor_id = ? and dp.action = 'knowledge:read' and dp.status = 'ACTIVE') order by distance, c.document_id, c.chunk_order, c.id limit ?",
-                (rs, rowNum) -> mapSearchHit(rs), vector, access.tenantId(), access.workspaceId(), profile.provider(),
-                profile.model(), profile.revision(), profile.dimension(), actor.actorId(), limit);
+        var parameters = new ArrayList<Object>(List.of(vector, access.tenantId(), access.workspaceId(), profile.provider(),
+                profile.model(), profile.revision(), profile.dimension(), actor.actorId()));
+        var sql = "select c.tenant_id, c.workspace_id, c.document_id, c.asset_version, c.id chunk_id, c.source_ref, c.chunking_version, c.chunk_order, c.start_offset, c.end_offset, c.offset_unit, c.content, c.content_hash, c.heading_path::text, e.build_id, e.configuration_signature, e.distance_metric, e.embedding <=> ?::public.vector as distance from knowledge.embedding e join knowledge.chunk c on c.tenant_id = e.tenant_id and c.workspace_id = e.workspace_id and c.document_id = e.document_id and c.asset_version = e.asset_version and c.id = e.chunk_id join knowledge.document d on d.tenant_id = c.tenant_id and d.workspace_id = c.workspace_id and d.id = c.document_id join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id and v.asset_version = c.asset_version join knowledge.document_publication p on p.tenant_id = e.tenant_id and p.workspace_id = e.workspace_id and p.document_id = e.document_id and p.asset_version = e.asset_version and p.build_id = e.build_id join knowledge.index_build b on b.id = e.build_id and b.tenant_id = e.tenant_id and b.workspace_id = e.workspace_id and b.document_id = e.document_id and b.dimension = e.dimension and b.configuration_signature = e.configuration_signature and b.status = 'READY' where e.tenant_id = ? and e.workspace_id = ? and b.provider = ? and b.model = ? and b.model_revision = ? and b.dimension = ? and b.distance_metric = 'COSINE' and p.status = 'ACTIVE' and d.status = 'PUBLISHED' and v.status = 'PUBLISHED' and exists (select 1 from knowledge.document_permission dp where dp.tenant_id = d.tenant_id and dp.workspace_id = d.workspace_id and dp.document_id = d.id and dp.actor_id = ? and dp.action = 'knowledge:read' and dp.status = 'ACTIVE')"
+                + delegatedKnowledgeFilter(delegatedScope, parameters) + managedSourceReadGuard();
+        parameters.add(actor.actorId());
+        if (delegatedScope != null) {
+            sql += managedSourceReadGuard();
+            parameters.add(delegatedScope.ownerId());
+        }
+        sql += " order by distance, c.document_id, c.chunk_order, c.id limit ?";
+        parameters.add(limit);
+        return jdbc.query(sql, (rs, rowNum) -> mapSearchHit(rs), parameters.toArray());
     }
 
     private List<KnowledgeSearchHit> lexicalCandidates(String tsQuery, String vector, WorkspaceAccess access,
-                                                       ActorContext actor, EmbeddingProfile profile) {
-        return jdbc.query("select c.tenant_id, c.workspace_id, c.document_id, c.asset_version, c.id chunk_id, c.source_ref, c.chunking_version, c.chunk_order, c.start_offset, c.end_offset, c.offset_unit, c.content, c.content_hash, c.heading_path::text, e.build_id, e.configuration_signature, e.distance_metric, e.embedding <=> ?::public.vector as distance, ts_rank_cd(le.search_vector, ?::tsquery) as lexical_score from knowledge.lexical_entry le join knowledge.embedding e on e.tenant_id = le.tenant_id and e.workspace_id = le.workspace_id and e.document_id = le.document_id and e.asset_version = le.asset_version and e.build_id = le.build_id and e.chunk_id = le.chunk_id join knowledge.chunk c on c.tenant_id = e.tenant_id and c.workspace_id = e.workspace_id and c.document_id = e.document_id and c.asset_version = e.asset_version and c.id = e.chunk_id join knowledge.document d on d.tenant_id = c.tenant_id and d.workspace_id = c.workspace_id and d.id = c.document_id join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id and v.asset_version = c.asset_version join knowledge.document_publication p on p.tenant_id = e.tenant_id and p.workspace_id = e.workspace_id and p.document_id = e.document_id and p.asset_version = e.asset_version and p.build_id = e.build_id join knowledge.index_build b on b.id = e.build_id and b.tenant_id = e.tenant_id and b.workspace_id = e.workspace_id and b.document_id = e.document_id and b.dimension = e.dimension and b.configuration_signature = e.configuration_signature and b.status = 'READY' where le.tenant_id = ? and le.workspace_id = ? and le.normalization_version = 'p9-lexical-1' and le.search_vector @@ ?::tsquery and b.provider = ? and b.model = ? and b.model_revision = ? and b.dimension = ? and b.distance_metric = 'COSINE' and p.status = 'ACTIVE' and d.status = 'PUBLISHED' and v.status = 'PUBLISHED' and exists (select 1 from knowledge.document_permission dp where dp.tenant_id = d.tenant_id and dp.workspace_id = d.workspace_id and dp.document_id = d.id and dp.actor_id = ? and dp.action = 'knowledge:read' and dp.status = 'ACTIVE') order by lexical_score desc, c.document_id, c.chunk_order, c.id limit 20",
-                (rs, rowNum) -> mapSearchHit(rs), vector, tsQuery, access.tenantId(), access.workspaceId(), tsQuery,
-                profile.provider(), profile.model(), profile.revision(), profile.dimension(), actor.actorId());
+                                                       ActorContext actor, EmbeddingProfile profile,
+                                                       McpReadonlyDelegationScope delegatedScope) {
+        var parameters = new ArrayList<Object>(List.of(vector, tsQuery, access.tenantId(), access.workspaceId(), tsQuery,
+                profile.provider(), profile.model(), profile.revision(), profile.dimension(), actor.actorId()));
+        var sql = "select c.tenant_id, c.workspace_id, c.document_id, c.asset_version, c.id chunk_id, c.source_ref, c.chunking_version, c.chunk_order, c.start_offset, c.end_offset, c.offset_unit, c.content, c.content_hash, c.heading_path::text, e.build_id, e.configuration_signature, e.distance_metric, e.embedding <=> ?::public.vector as distance, ts_rank_cd(le.search_vector, ?::tsquery) as lexical_score from knowledge.lexical_entry le join knowledge.embedding e on e.tenant_id = le.tenant_id and e.workspace_id = le.workspace_id and e.document_id = le.document_id and e.asset_version = le.asset_version and e.build_id = le.build_id and e.chunk_id = le.chunk_id join knowledge.chunk c on c.tenant_id = e.tenant_id and c.workspace_id = e.workspace_id and c.document_id = e.document_id and c.asset_version = e.asset_version and c.id = e.chunk_id join knowledge.document d on d.tenant_id = c.tenant_id and d.workspace_id = c.workspace_id and d.id = c.document_id join knowledge.document_version v on v.tenant_id = d.tenant_id and v.workspace_id = d.workspace_id and v.document_id = d.id and v.asset_version = c.asset_version join knowledge.document_publication p on p.tenant_id = e.tenant_id and p.workspace_id = e.workspace_id and p.document_id = e.document_id and p.asset_version = e.asset_version and p.build_id = e.build_id join knowledge.index_build b on b.id = e.build_id and b.tenant_id = e.tenant_id and b.workspace_id = e.workspace_id and b.document_id = e.document_id and b.dimension = e.dimension and b.configuration_signature = e.configuration_signature and b.status = 'READY' where le.tenant_id = ? and le.workspace_id = ? and le.normalization_version = 'p9-lexical-1' and le.search_vector @@ ?::tsquery and b.provider = ? and b.model = ? and b.model_revision = ? and b.dimension = ? and b.distance_metric = 'COSINE' and p.status = 'ACTIVE' and d.status = 'PUBLISHED' and v.status = 'PUBLISHED' and exists (select 1 from knowledge.document_permission dp where dp.tenant_id = d.tenant_id and dp.workspace_id = d.workspace_id and dp.document_id = d.id and dp.actor_id = ? and dp.action = 'knowledge:read' and dp.status = 'ACTIVE')"
+                + delegatedKnowledgeFilter(delegatedScope, parameters) + managedSourceReadGuard();
+        parameters.add(actor.actorId());
+        if (delegatedScope != null) {
+            sql += managedSourceReadGuard();
+            parameters.add(delegatedScope.ownerId());
+        }
+        sql += " order by lexical_score desc, c.document_id, c.chunk_order, c.id limit 20";
+        return jdbc.query(sql, (rs, rowNum) -> mapSearchHit(rs), parameters.toArray());
+    }
+
+    private String delegatedKnowledgeFilter(McpReadonlyDelegationScope scope, List<Object> parameters) {
+        if (scope == null) return "";
+        var documents = scope.knowledgeDocumentIds().stream().sorted().toList();
+        if (documents.isEmpty()) return " and false";
+        parameters.addAll(documents);
+        parameters.add(scope.ownerId());
+        return " and d.id in (" + String.join(",", java.util.Collections.nCopies(documents.size(), "?")) + ")"
+                + " and exists (select 1 from knowledge.document_permission dp_owner where dp_owner.tenant_id = d.tenant_id "
+                + "and dp_owner.workspace_id = d.workspace_id and dp_owner.document_id = d.id and dp_owner.actor_id = ? "
+                + "and dp_owner.action = 'knowledge:read' and dp_owner.status = 'ACTIVE')";
+    }
+
+    private McpReadonlyDelegationScope mcpDocumentScope(ActorContext actor, UUID workspaceId) {
+        if (actor == null || !IdentityService.MCP_AUDIENCE.equals(actor.delegationAudience())) return null;
+        if (delegationIdentities == null) throw EafException.forbidden("MCP 委托知识范围无法复核。");
+        return delegationIdentities.mcpReadonlyScope(actor)
+                .filter(scope -> scope.workspaceId().equals(workspaceId))
+                .orElseThrow(() -> EafException.forbidden("MCP 委托知识范围已失效。"));
+    }
+
+    private boolean hasDocumentReadPermission(UUID actorId, UUID tenantId, UUID workspaceId, UUID documentId) {
+        var count = jdbc.queryForObject("select count(*) from knowledge.document_permission where tenant_id = ? and workspace_id = ? and document_id = ? and actor_id = ? and action = 'knowledge:read' and status = 'ACTIVE'",
+                Integer.class, tenantId, workspaceId, documentId, actorId);
+        return count != null && count > 0;
     }
 
     private KnowledgeSearchHit mapSearchHit(java.sql.ResultSet rs) throws java.sql.SQLException {

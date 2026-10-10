@@ -117,6 +117,7 @@ class P6McpContractTest {
         McpSyncClient client = McpClient.sync(transport).build();
         try {
             assertThat(client.initialize().protocolVersion()).isEqualTo(ProtocolVersions.MCP_2025_11_25);
+            assertThat(client.getServerCapabilities().resources()).isNull();
             var tools = client.listTools().tools();
             assertThat(tools).extracting(Tool::name).containsExactlyInAnyOrder(
                     "eaf.capabilities.list", "eaf.tasks.create", "eaf.tasks.get", "eaf.tasks.cancel",

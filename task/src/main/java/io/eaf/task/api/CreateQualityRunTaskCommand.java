@@ -1,6 +1,7 @@
 package io.eaf.task.api;
 
 import io.eaf.shared.ActorContext;
+import io.eaf.model.api.ModelProfileSelection;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -9,12 +10,21 @@ public record CreateQualityRunTaskCommand(ActorContext actor, UUID workspaceId, 
                                           UUID agentId, String agentVersion, String input,
                                           String businessEntityType, String businessEntityId,
                                           String idempotencyKey, String traceId, String source,
-                                          UUID scenarioSampleId, TaskAssetBinding assetBinding, Instant deadlineAt) {
+                                          UUID scenarioSampleId, TaskAssetBinding assetBinding, Instant deadlineAt,
+                                          ModelProfileSelection modelSelection) {
+    public CreateQualityRunTaskCommand(ActorContext actor, UUID workspaceId, UUID qualityRunId,
+                                       UUID agentId, String agentVersion, String input,
+                                       String businessEntityType, String businessEntityId,
+                                       String idempotencyKey, String traceId, String source,
+                                       UUID scenarioSampleId, TaskAssetBinding assetBinding, Instant deadlineAt) {
+        this(actor, workspaceId, qualityRunId, agentId, agentVersion, input, businessEntityType, businessEntityId,
+                idempotencyKey, traceId, source, scenarioSampleId, assetBinding, deadlineAt, null);
+    }
     public CreateQualityRunTaskCommand(ActorContext actor, UUID workspaceId, UUID qualityRunId,
                                        UUID agentId, String agentVersion, String input,
                                        String businessEntityType, String businessEntityId,
                                        String idempotencyKey, String traceId, String source) {
         this(actor, workspaceId, qualityRunId, agentId, agentVersion, input, businessEntityType,
-                businessEntityId, idempotencyKey, traceId, source, null, null, null);
+                businessEntityId, idempotencyKey, traceId, source, null, null, null, null);
     }
 }

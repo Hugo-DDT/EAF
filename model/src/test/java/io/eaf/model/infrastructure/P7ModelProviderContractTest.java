@@ -3,6 +3,7 @@ package io.eaf.model.infrastructure;
 import com.sun.net.httpserver.HttpServer;
 import io.eaf.model.api.ModelFailure;
 import io.eaf.model.api.ModelMessage;
+import io.eaf.model.api.ModelProfileSnapshot;
 import io.eaf.model.api.ModelRequest;
 import io.eaf.model.api.ModelToolCall;
 import io.eaf.model.api.ModelToolDefinition;
@@ -109,6 +110,17 @@ class P7ModelProviderContractTest {
             var roundTripBody = requestBodies.getLast();
             assertThat(roundTripBody).contains("\"role\":\"assistant\"", "\"tool_calls\"", "call-request-7", "\"role\":\"tool\"",
                     "\"tool_call_id\":\"call-request-7\"", "\"name\":\"" + TOOL_NAME + "\"", "\"tools\"", TOOL_SCHEMA);
+
+            current.set(new FixtureResponse(200, FINAL_RESPONSE, 0));
+            var profile = new ModelProfileSnapshot(UUID.randomUUID(), "1.0.0", "a".repeat(64), 1, "bounded",
+                    "LIVE", "dashscope", "qwen-plus", "spring-ai-alibaba", "1.1.2.2", "b".repeat(64),
+                    0.0d, 8_000, 37, "JSON_OBJECT", false, "NONE", "dashscope", "qwen-plus", "CHAT", "CURRENT_AT_CALL");
+            var selectedRequest = new ModelRequest(UUID.randomUUID(), List.of(new ModelMessage("user", "profile fixture")),
+                    Instant.now().plusSeconds(5), 1_000, UUID.randomUUID(), "p32-profile-fixture", List.of(), 1, profile);
+            gateway.call(selectedRequest);
+            assertThat(requestBodies.getLast()).contains("\"max_tokens\":37", "\"model\":\"qwen-plus\"",
+                    "\"response_format\":{\"type\":\"json_object\"}");
+
             current.set(new FixtureResponse(500, "{\"message\":\"fixture failure\"}", 0));
             var beforeFailure = requestCount.get();
             assertThatThrownBy(() -> gateway.call(request)).isInstanceOf(ModelFailure.class)

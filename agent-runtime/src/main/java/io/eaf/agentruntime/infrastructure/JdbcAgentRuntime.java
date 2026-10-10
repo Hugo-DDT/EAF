@@ -24,6 +24,8 @@ import io.eaf.identity.api.IdentityService;
 import io.eaf.model.api.ModelFailure;
 import io.eaf.model.api.ModelBillingProfile;
 import io.eaf.model.api.ModelGateway;
+import io.eaf.model.api.ModelProfileCatalog;
+import io.eaf.model.api.ModelProfileSnapshot;
 import io.eaf.model.api.ModelMessage;
 import io.eaf.model.api.ModelRequest;
 import io.eaf.model.api.ModelResult;
@@ -39,6 +41,7 @@ import io.eaf.model.api.EvidencePassage;
 import io.eaf.observability.api.TraceObservation;
 import io.eaf.observability.api.TraceRecorder;
 import io.eaf.prompt.api.PromptCatalog;
+import io.eaf.prompt.api.PromptOwnerService;
 import io.eaf.shared.ActorContext;
 import io.eaf.shared.ActorType;
 import io.eaf.shared.EafException;
@@ -60,6 +63,9 @@ import io.eaf.usage.api.UsageRecorder;
 import io.eaf.usage.api.ReserveSpendCommand;
 import io.eaf.usage.api.SpendReservation;
 import io.eaf.workflow.api.WorkflowService;
+import io.eaf.workflow.api.ProjectBriefTaskSource;
+import io.eaf.workflow.api.AutomationTaskSource;
+import io.eaf.workflow.api.WorkflowAutomationService;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
@@ -89,9 +95,18 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
     private static final String SERVICE_REQUEST_SUMMARY_PROFILE = "SERVICE_REQUEST_SUMMARY_V1";
     private static final String SERVICE_REQUEST_BATCH_KNOWLEDGE_PROFILE = "SERVICE_REQUEST_BATCH_KNOWLEDGE_V1";
     private static final String SERVICE_REQUEST_BATCH_EXPERIENCE_PROFILE = "SERVICE_REQUEST_BATCH_EXPERIENCE_V1";
+    private static final String P27_BUSINESS_TOOL_PROFILE = "P27_BUSINESS_TOOL_V1";
+    private static final String PROJECT_BRIEF_PREPARE_PROFILE = "PROJECT_BRIEF_PREPARE_V1";
+    private static final String P30_AUTOMATION_DIGEST_PROFILE = "MY_P16_WORK_DIGEST_RESPONSE_V1";
     private static final UUID P21_BATCH_KNOWLEDGE_CAPABILITY_ID = UUID.fromString("54000000-0000-4000-8000-000000000016");
     private static final UUID P21_BATCH_EXPERIENCE_CAPABILITY_ID = UUID.fromString("54000000-0000-4000-8000-000000000017");
     private static final UUID P21_BATCH_EXPERIENCE_AGENT_ID = UUID.fromString("20000000-0000-4000-8000-000000000019");
+    private static final UUID P27_BUSINESS_TOOL_CAPABILITY_ID = UUID.fromString("54000000-0000-4000-8000-000000000022");
+    private static final UUID P27_BUSINESS_TOOL_AGENT_ID = UUID.fromString("20000000-0000-4000-8000-000000000021");
+    private static final UUID PROJECT_BRIEF_AGENT_ID = UUID.fromString("20000000-0000-4000-8000-000000000023");
+    private static final UUID PROJECT_BRIEF_CAPABILITY_ID = UUID.fromString("54000000-0000-4000-8000-000000000023");
+    private static final UUID P30_AUTOMATION_AGENT_ID = UUID.fromString("20000000-0000-4000-8000-000000000024");
+    private static final UUID P30_AUTOMATION_CAPABILITY_ID = UUID.fromString("54000000-0000-4000-8000-000000000024");
     private static final UUID SERVICE_REQUEST_PLAN_CAPABILITY_ID = UUID.fromString("54000000-0000-4000-8000-000000000012");
     private static final UUID SERVICE_REQUEST_PLAN_AGENT_ID = UUID.fromString("20000000-0000-4000-8000-000000000010");
     private static final UUID SERVICE_REQUEST_PREPARE_CAPABILITY_ID = UUID.fromString("54000000-0000-4000-8000-000000000014");
@@ -122,6 +137,9 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
     private IdentityService identities;
     private CustomerFollowupService customerFollowups;
     private WorkflowService workflows;
+    private WorkflowAutomationService automations;
+    private PromptOwnerService promptOwners;
+    private ModelProfileCatalog modelProfiles;
     private String modelFeeCap = "";
     private String modelFeeCurrency = "";
 
@@ -164,6 +182,15 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
 
     @Autowired
     void workflowService(WorkflowService service) { this.workflows = service; }
+
+    @Autowired
+    void workflowAutomationService(WorkflowAutomationService service) { this.automations = service; }
+
+    @Autowired
+    void promptOwnerService(@org.springframework.context.annotation.Lazy PromptOwnerService service) { this.promptOwners = service; }
+
+    @Autowired
+    void modelProfileCatalog(@org.springframework.context.annotation.Lazy ModelProfileCatalog catalog) { this.modelProfiles = catalog; }
 
     @Autowired
     void typedDecisionGateway(TypedDecisionGateway gateway) { this.typedDecisions = gateway; }
@@ -217,6 +244,9 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
             var serviceRequestSummary = SERVICE_REQUEST_SUMMARY_PROFILE.equals(agent.responseProfile());
             var p21BatchKnowledge = SERVICE_REQUEST_BATCH_KNOWLEDGE_PROFILE.equals(agent.responseProfile());
             var p21BatchExperience = SERVICE_REQUEST_BATCH_EXPERIENCE_PROFILE.equals(agent.responseProfile());
+            var p27BusinessTool = P27_BUSINESS_TOOL_PROFILE.equals(agent.responseProfile());
+            var projectBrief = PROJECT_BRIEF_PREPARE_PROFILE.equals(agent.responseProfile());
+            var automationDigest = P30_AUTOMATION_DIGEST_PROFILE.equals(agent.responseProfile());
             var teamImprovementGeneration = TEAM_IMPROVEMENT_PROFILE.equals(agent.responseProfile());
             if (!List.of("CUSTOMER_RISK_V1", "CUSTOMER_FOLLOWUP_V1", "KNOWLEDGE_QA_V1",
                     "CONVERSATIONAL_KNOWLEDGE_QA_V1", "CONVERSATIONAL_CUSTOMER_FOLLOWUP_V1",
@@ -225,7 +255,8 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                     SERVICE_REQUEST_REGISTER_PROFILE, SERVICE_REQUEST_PREPARE_PROFILE,
                     SERVICE_REQUEST_PREPARE_V2_PROFILE,
                     SERVICE_REQUEST_SUMMARY_PROFILE, SERVICE_REQUEST_BATCH_KNOWLEDGE_PROFILE,
-                    SERVICE_REQUEST_BATCH_EXPERIENCE_PROFILE, TEAM_IMPROVEMENT_PROFILE).contains(agent.responseProfile())
+                    SERVICE_REQUEST_BATCH_EXPERIENCE_PROFILE, TEAM_IMPROVEMENT_PROFILE,
+                    P27_BUSINESS_TOOL_PROFILE, PROJECT_BRIEF_PREPARE_PROFILE, P30_AUTOMATION_DIGEST_PROFILE).contains(agent.responseProfile())
                     || !List.of("VECTOR", "HYBRID").contains(agent.retrievalMode())
                     || !List.of("NONE", "PASSAGE_CHOICE_V1").contains(agent.evidencePolicy()))
                 return fail(runId, work, "AGENT_RESPONSE_CONFIGURATION_INVALID", "Agent 发布版本的结果处理或检索配置无效。", false,
@@ -239,6 +270,25 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                             null, null, modelCalls, toolCalls, toolExecutions);
             }
             var capability = requireTaskCapability(work);
+            if (automationDigest && (!P30_AUTOMATION_AGENT_ID.equals(agent.id()) || !"1.0.0".equals(agent.version())
+                    || !P30_AUTOMATION_CAPABILITY_ID.equals(capability == null ? null : capability.id())
+                    || !"1.0.0".equals(capability == null ? null : capability.version()) || capability == null
+                    || !capability.toolDependencies().isEmpty()
+                    || !agents.tools(work.tenantId(), work.workspaceId(), agent.id(), agent.version()).isEmpty()
+                    || agent.ragEnabled() || !"NONE".equals(agent.evidencePolicy()) || work.qualityRunId() != null
+                    || !"USER".equals(work.source()) || !"AGENT".equals(work.runKind()) || work.attempt() != 1 || automations == null))
+                return fail(runId, work, "AUTOMATION_DIGEST_CONFIGURATION_INVALID",
+                        "本人待办摘要只能运行固定、无检索、无工具的 USER 根 Task。", false, false,
+                        null, null, modelCalls, toolCalls, toolExecutions);
+            if (p27BusinessTool && (!P27_BUSINESS_TOOL_AGENT_ID.equals(agent.id())
+                    || !"1.0.0".equals(agent.version()) || !P27_BUSINESS_TOOL_CAPABILITY_ID.equals(capability == null ? null : capability.id())
+                    || !"1.0.0".equals(capability == null ? null : capability.version())
+                    || agent.ragEnabled() || !"NONE".equals(agent.evidencePolicy())
+                    || work.qualityRunId() != null || !"USER".equals(work.source())
+                    || !"TOOL_EXECUTION".equals(work.runKind())))
+                return fail(runId, work, "P27_BUSINESS_TOOL_CONFIGURATION_INVALID",
+                        "P27 Tool 只能运行固定 USER Workflow 的无检索 Tool Task。", false, false,
+                        null, null, modelCalls, toolCalls, toolExecutions);
             if (teamImprovementGeneration) {
                 if (!TEAM_IMPROVEMENT_AGENT_ID.equals(agent.id()) || !"1.0.0".equals(agent.version())
                         || !TEAM_IMPROVEMENT_CAPABILITY_ID.equals(capability == null ? null : capability.id())
@@ -263,6 +313,15 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                 return fail(runId, work, "SERVICE_REQUEST_REGISTRATION_REQUIRES_WORKFLOW",
                         "登记 Agent 只能由固定 Workflow 的工具步骤调用。", false, false, null, null,
                         modelCalls, toolCalls, toolExecutions);
+            if (projectBrief && (!PROJECT_BRIEF_AGENT_ID.equals(agent.id()) || !"1.0.0".equals(agent.version())
+                    || !PROJECT_BRIEF_CAPABILITY_ID.equals(capability == null ? null : capability.id())
+                    || !"1.0.0".equals(capability == null ? null : capability.version())
+                    || !capability.toolDependencies().isEmpty() || !agents.tools(work.tenantId(), work.workspaceId(),
+                    agent.id(), agent.version()).isEmpty() || agent.ragEnabled() || !"NONE".equals(agent.evidencePolicy())
+                    || work.qualityRunId() != null || !"USER".equals(work.source()) || !"AGENT".equals(work.runKind())))
+                return fail(runId, work, "PROJECT_BRIEF_CONFIGURATION_INVALID",
+                        "项目简报只能运行固定 USER Workflow 的无检索、无工具准备能力。", false, false,
+                        null, null, modelCalls, toolCalls, toolExecutions);
             if (serviceRequestPlan)
                 return runServiceRequestPlan(work, runId, agent, capability, step, modelCalls, toolCalls, toolExecutions);
             io.eaf.workflow.api.WorkflowService.TeamExperienceTaskSelection p21ExperienceSelection = null;
@@ -326,7 +385,13 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
             var teamExperienceSelection = serviceRequestPrepareV2 && !teamPreparationScenario
                     ? requireTeamExperienceSelection(work) : null;
             var p21Input = p21BatchKnowledge || p21BatchExperience ? p21BranchInput(work) : null;
-            var promptInput = serviceRequestPrepareV2 ? requireServiceRequestPrepareBrief(work)
+            ProjectBriefTaskSource projectBriefSource = projectBrief
+                    ? workflows.requireProjectBriefTaskSource(actor(work), work.workspaceId(), work.id()) : null;
+            AutomationTaskSource automationSource = automationDigest
+                    ? automations.requireTaskSource(actor(work), work.workspaceId(), work.id(), work.attempt()) : null;
+            var promptInput = automationDigest ? automationDigestPromptInput(automationSource)
+                    : projectBrief ? projectBriefPromptInput(projectBriefSource)
+                    : serviceRequestPrepareV2 ? requireServiceRequestPrepareBrief(work)
                     : p21Input == null ? work.inputText() : p21Input.path("requestText").asText();
             var p21Refs = p21Input == null ? List.<io.eaf.workflow.api.TeamExperienceRef>of()
                     : parseP21ExperienceRefs(p21Input.path("experienceRefsJson").asText("[]"));
@@ -340,7 +405,7 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                 return new TaskRunner.RunOutcome(TaskStatus.SUCCEEDED, content, null, null,
                         false, 0, 0, modelCalls, toolCalls, toolExecutions);
             }
-            var prompt = prompts.render(work.tenantId(), work.workspaceId(), work.promptId(), work.promptVersion(), promptInput);
+            var prompt = renderPrompt(work, promptInput);
             var history = new ArrayList<ModelMessage>();
             for (var message : prompt.messages()) history.add(new ModelMessage(message.role(), message.content()));
             storeStep(runId, work, step++, "PROMPT_RENDERED", null, json.writeValueAsString(prompt.messages()), "VALID");
@@ -545,12 +610,85 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
             }
             if (typedDecision != null) attachDecision(history, typedDecision);
             // 合成保留集不执行任何业务工具；模型只能给出结构化分析，不能触发外部副作用。
-            var toolDefinitions = "P3_HELD_OUT".equals(work.businessEntityType())
+            var toolDefinitions = automationDigest || "P3_HELD_OUT".equals(work.businessEntityType())
                     ? List.<ToolDefinition>of() : toolDefinitions(work, agent, capability);
             if (experienceDraft && !toolDefinitions.isEmpty())
                 return fail(runId, work, "EXPERIENCE_DRAFT_TOOLS_DENIED", "经验整理能力不能绑定业务工具。", false,
                         modelCalls > 0, null, null, modelCalls, toolCalls, toolExecutions);
             var baseHistory = List.copyOf(history);
+            if (automationDigest) {
+                if (automationSource.resultJson() != null) {
+                    storeStep(runId, work, step++, "STRUCTURED_RESULT", null, automationSource.resultJson(), "VALID");
+                    finishRun(runId, work, "SUCCEEDED", null);
+                    return new TaskRunner.RunOutcome(TaskStatus.SUCCEEDED, automationSource.resultJson(), null, null,
+                            false, 0, 0, modelCalls, toolCalls, toolExecutions);
+                }
+                if (automationSource.generationAttempted()) {
+                    var marker = latestStep(runId, "AUTOMATION_DIGEST_CALL_STARTED");
+                    var response = latestStep(runId, "MODEL_RESPONSE");
+                    if (marker != null && response != null && "RECEIVED".equals(response.validation())) {
+                        try {
+                            var normalized = validate(response.content(), null, null, agent, work, runId, null, null);
+                            normalized = automations.recordGenerationResult(actor(work), work.workspaceId(), work.id(),
+                                    work.attempt(), normalized);
+                            storeStep(runId, work, step++, "STRUCTURED_RESULT", null, normalized, "VALID",
+                                    response.callNo(), null);
+                            finishRun(runId, work, "SUCCEEDED", null);
+                            return new TaskRunner.RunOutcome(TaskStatus.SUCCEEDED, normalized, null, null,
+                                    true, 0, 0, modelCalls, toolCalls, toolExecutions);
+                        } catch (Exception invalid) {
+                            return fail(runId, work, "AUTOMATION_DIGEST_RESULT_INVALID",
+                                    "已保存的摘要结果无法复核；为避免重复生成，已停止。", false,
+                                    true, null, null, modelCalls, toolCalls, toolExecutions);
+                        }
+                    }
+                    return fail(runId, work, "AUTOMATION_DIGEST_RESULT_UNKNOWN",
+                            "本次摘要已登记一次生成请求但没有可恢复结果；为避免重复调用，已停止。", false,
+                            true, null, null, modelCalls, toolCalls, toolExecutions);
+                }
+                if (automationSource.items().isEmpty()) {
+                    var empty = json.createObjectNode().put("overview", "当前无匹配待办");
+                    empty.putArray("attentionItems");
+                    var normalized = automations.recordGenerationResult(actor(work), work.workspaceId(), work.id(),
+                            work.attempt(), json.writeValueAsString(empty));
+                    storeStep(runId, work, step++, "STRUCTURED_RESULT", null, normalized, "VALID");
+                    finishRun(runId, work, "SUCCEEDED", null);
+                    return new TaskRunner.RunOutcome(TaskStatus.SUCCEEDED, normalized, null, null,
+                            false, 0, 0, modelCalls, toolCalls, toolExecutions);
+                }
+            }
+            if (projectBrief) {
+                if (projectBriefSource.preparedResultJson() != null) {
+                    var content = projectBriefSource.preparedResultJson();
+                    storeStep(runId, work, step++, "STRUCTURED_RESULT", null, content, "VALID");
+                    finishRun(runId, work, "SUCCEEDED", null);
+                    return new TaskRunner.RunOutcome(TaskStatus.SUCCEEDED, content, null, null,
+                            false, 0, 0, modelCalls, toolCalls, toolExecutions);
+                }
+                if (projectBriefSource.generationAttempted()) {
+                    var marker = latestStep(runId, "PROJECT_BRIEF_CALL_STARTED");
+                    var response = latestStep(runId, "MODEL_RESPONSE");
+                    if (marker != null && response != null && "RECEIVED".equals(response.validation())) {
+                        try {
+                            var normalized = validate(response.content(), null, null, agent, work, runId, null, null);
+                            normalized = workflows.recordProjectBriefGenerationResult(actor(work), work.workspaceId(),
+                                    work.id(), work.attempt(), normalized);
+                            storeStep(runId, work, step++, "STRUCTURED_RESULT", null, normalized, "VALID",
+                                    response.callNo(), null);
+                            finishRun(runId, work, "SUCCEEDED", null);
+                            return new TaskRunner.RunOutcome(TaskStatus.SUCCEEDED, normalized, null, null,
+                                    true, 0, 0, modelCalls, toolCalls, toolExecutions);
+                        } catch (Exception invalid) {
+                            return fail(runId, work, "PROJECT_BRIEF_RESULT_INVALID",
+                                    "已保存的简报结果无法复核；为避免重复生成，已停止。", false,
+                                    true, null, null, modelCalls, toolCalls, toolExecutions);
+                        }
+                    }
+                    return fail(runId, work, "PROJECT_BRIEF_RESULT_UNKNOWN",
+                            "本简报已登记一次生成请求但没有可恢复结果；为避免重复调用，已停止。", false,
+                            true, null, null, modelCalls, toolCalls, toolExecutions);
+                }
+            }
             if (experienceDraft) {
                 var savedResult = latestStep(runId, "STRUCTURED_RESULT");
                 if (savedResult != null && "VALID".equals(savedResult.validation())) {
@@ -595,10 +733,20 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                 if (!currentContext(work, contextSnapshot) || !conversationSourcesCurrent(work, conversation, true))
                     return fail(runId, work, "CONTEXT_SNAPSHOT_UNAVAILABLE", "本次运行使用的上下文版本已撤回、过期或失去读取权限。", false,
                             modelCalls > 0, null, null, modelCalls, toolCalls, toolExecutions);
+                if (projectBrief) workflows.requireProjectBriefTaskSource(actor(work), work.workspaceId(), work.id());
+                if (automationDigest) automations.requireTaskExecutionCurrent(actor(work), work.workspaceId(), work.id(), work.attempt());
                 var permission = tasks.checkExecution(actor(work), work.workspaceId(), work.id(), work.attempt());
                 if (!permission.allowed()) {
                     stopSpendForTask(work, "HUMAN_STOP");
                     return fail(runId, work, permission.code(), permission.detail(), false, modelCalls > 0, null, null, modelCalls, toolCalls, toolExecutions);
+                }
+                ModelProfileSnapshot frozenProfile = null;
+                if (work.modelSelection() != null) try {
+                    if (modelProfiles == null) throw EafException.conflict("MODEL_PROFILE_CONFIGURATION_UNAVAILABLE", "模型档位目录未就绪。");
+                    frozenProfile = modelProfiles.requireCurrent(work.modelSelection().effectiveProfile());
+                } catch (EafException unavailable) {
+                    return fail(runId, work, unavailable.code(), "冻结模型档位已禁用、漂移或不可用；本次没有出站。",
+                            false, modelCalls > 0, null, null, modelCalls, toolCalls, toolExecutions);
                 }
                 var callNo = modelCalls + 1;
                 var modelReservationKey = "model:" + work.id() + ":" + work.attempt() + ":" + callNo;
@@ -609,16 +757,38 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                     return fail(runId, work, reservation.code(), "模型调用预算不足。", false, modelCalls > 0, null, null, modelCalls, toolCalls, toolExecutions);
                 }
                 // Task Token 先固定上界；金额预留失败时以已知零用量结算，不发出模型请求。
-                var spend = reserveSpend(work, callKey, reservation.tokenBudget());
+                var spend = frozenProfile == null ? reserveSpend(work, callKey, reservation.tokenBudget())
+                        : reserveSpend(work, callKey, reservation.tokenBudget(), modelProfiles.billingIdentity(frozenProfile));
                 if (spend != null && !spend.allowed()) {
                     recordPhase(work, runId, "budget-model-" + callNo, "DENIED", 0);
                     tasks.settleModel(work.id(), work.attempt(), modelReservationKey, 0, 0);
                     return fail(runId, work, spend.code(), "金额预算或价格上界不允许本次模型调用。", false, modelCalls > 0, null, null, modelCalls, toolCalls, toolExecutions);
                 }
+                if (projectBrief) {
+                    if (!workflows.beginProjectBriefGeneration(actor(work), work.workspaceId(), work.id(), work.attempt())) {
+                        tasks.settleModel(work.id(), work.attempt(), modelReservationKey, 0, 0);
+                        if (spend != null) usage.releaseSpend(callKey);
+                        return fail(runId, work, "PROJECT_BRIEF_GENERATION_ALREADY_ATTEMPTED",
+                                "本次简报只允许一次模型生成请求。", false, false,
+                                null, null, modelCalls, toolCalls, toolExecutions);
+                    }
+                    storeStep(runId, work, step++, "PROJECT_BRIEF_CALL_STARTED", "system", "{}", "PENDING", callNo, null);
+                }
+                if (automationDigest) {
+                    if (!automations.beginGeneration(actor(work), work.workspaceId(), work.id(), work.attempt())) {
+                        tasks.settleModel(work.id(), work.attempt(), modelReservationKey, 0, 0);
+                        if (spend != null) usage.releaseSpend(callKey);
+                        return fail(runId, work, "AUTOMATION_DIGEST_GENERATION_ALREADY_ATTEMPTED",
+                                "本人待办摘要只允许一次模型生成请求。", false, false,
+                                null, null, modelCalls, toolCalls, toolExecutions);
+                    }
+                    storeStep(runId, work, step++, "AUTOMATION_DIGEST_CALL_STARTED", "system", "{}", "PENDING", callNo, null);
+                }
                 var deadline = Instant.now(clock).plusSeconds(20);
                 if (work.activeDeadline().isBefore(deadline)) deadline = work.activeDeadline();
                 if (work.deadline().isBefore(deadline)) deadline = work.deadline();
-                var request = new ModelRequest(work.modelProfileId(), List.copyOf(history), deadline, reservation.tokenBudget(), work.id(), work.traceId(), modelTools(toolDefinitions), callNo);
+                var request = new ModelRequest(work.modelProfileId(), List.copyOf(history), deadline,
+                        reservation.tokenBudget(), work.id(), work.traceId(), modelTools(toolDefinitions), callNo, frozenProfile);
                 if (teamExperiencePresentation != null)
                     storeTeamExperiencePresentation(runId, work, step++, teamExperiencePresentation, request);
                 if (experienceDraft)
@@ -628,24 +798,29 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                 ModelResult result;
                 try {
                     result = model.call(request);
-                    recordPhase(work, runId, "model-" + callNo, "SUCCEEDED", java.time.Duration.between(callStarted, Instant.now(clock)).toMillis());
+                    var modelOperationMillis = java.time.Duration.between(callStarted, Instant.now(clock)).toMillis();
+                    recordPhase(work, runId, "model-" + callNo, "SUCCEEDED", modelOperationMillis);
                     modelCalls = callNo;
                     tasks.settleModel(work.id(), work.attempt(), modelReservationKey, result.inputTokens(), result.outputTokens());
-                    recordUsage(work, runId, callNo, callKey, result, reservation.tokenBudget(), "SUCCEEDED", null, callStarted);
+                    recordUsage(work, runId, callNo, callKey, result, reservation.tokenBudget(), "SUCCEEDED", null,
+                            callStarted, request, modelOperationMillis);
                     if (SERVICE_REQUEST_PREPARE_V2_PROFILE.equals(agent.responseProfile()) && contextSnapshot != null)
                         storeStep(runId, work, step++, "TEAM_EXPERIENCE_USAGE", "system",
                                 json.writeValueAsString(contextSnapshot.teamExperienceUsage()), "USED", callNo, null);
                     if (!currentContext(work, contextSnapshot) || !conversationSourcesCurrent(work, conversation, true))
                         return fail(runId, work, "CONTEXT_SNAPSHOT_UNAVAILABLE", "模型返回后上下文版本已撤回、过期或失去读取权限。", false,
                                 true, result.inputTokens(), result.outputTokens(), modelCalls, toolCalls, toolExecutions);
+                    if (projectBrief) workflows.requireProjectBriefTaskSource(actor(work), work.workspaceId(), work.id());
+                    if (automationDigest) automations.requireTaskExecutionCurrent(actor(work), work.workspaceId(), work.id(), work.attempt());
                 } catch (ModelFailure failure) {
-                    recordPhase(work, runId, "model-" + callNo, failure.timeout() ? "TIMED_OUT" : "FAILED",
-                            java.time.Duration.between(callStarted, Instant.now(clock)).toMillis());
+                    var modelOperationMillis = java.time.Duration.between(callStarted, Instant.now(clock)).toMillis();
+                    recordPhase(work, runId, "model-" + callNo, failure.timeout() ? "TIMED_OUT" : "FAILED", modelOperationMillis);
                     if (failure.called()) modelCalls = callNo;
                     tasks.settleModel(work.id(), work.attempt(), modelReservationKey,
                             failure.called() ? null : 0, failure.called() ? null : 0);
                     if (!failure.called() && spend != null) usage.releaseSpend(callKey);
-                    recordUsage(work, runId, callNo, callKey, null, reservation.tokenBudget(), failure.timeout() ? "TIMED_OUT" : "FAILED", failure.code(), callStarted);
+                    recordUsage(work, runId, callNo, callKey, null, reservation.tokenBudget(),
+                            failure.timeout() ? "TIMED_OUT" : "FAILED", failure.code(), callStarted, request, modelOperationMillis);
                     if (failure.called() && SERVICE_REQUEST_PREPARE_V2_PROFILE.equals(agent.responseProfile())
                             && contextSnapshot != null)
                         storeStep(runId, work, step++, "TEAM_EXPERIENCE_USAGE", "system",
@@ -683,6 +858,12 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                 try { normalized = validate(result.publicOutput(), contextSnapshot, typedDecision, agent, work, runId,
                         conversation, retrievalQuery); }
                 catch (Exception invalid) { return invalidModelOutput(work, runId, callNo, result, invalid.getMessage(), modelCalls, toolCalls, toolExecutions); }
+                if (projectBrief)
+                    normalized = workflows.recordProjectBriefGenerationResult(actor(work), work.workspaceId(), work.id(),
+                            work.attempt(), normalized);
+                if (automationDigest)
+                    normalized = automations.recordGenerationResult(actor(work), work.workspaceId(), work.id(),
+                            work.attempt(), normalized);
                 storeStep(runId, work, step++, "STRUCTURED_RESULT", null, normalized, "VALID", callNo, null);
                 finishRun(runId, work, "SUCCEEDED", null);
                 audit.append(new AuditFact("model-result:" + work.id() + ":" + work.attempt(), work.tenantId(), work.workspaceId(), work.actorId(), work.id(), "MODEL_RESULT_VALIDATED", "SUCCEEDED", "{}", work.traceId()));
@@ -1014,12 +1195,24 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
         return capability;
     }
 
+    private io.eaf.prompt.api.RenderedPrompt renderPrompt(TaskWorkItem work, String input) {
+        if (!"EVALUATION".equals(work.source()) || work.qualityRunId() == null || evaluationContexts == null)
+            return prompts.render(work.tenantId(), work.workspaceId(), work.promptId(), work.promptVersion(), input);
+        var candidate = evaluationContexts.promptCandidateForTask(actor(work), work.workspaceId(), work.id());
+        if (candidate.isEmpty())
+            return prompts.render(work.tenantId(), work.workspaceId(), work.promptId(), work.promptVersion(), input);
+        if (promptOwners == null) throw EafException.conflict("PROMPT_OWNER_UNAVAILABLE", "隔离评测 Prompt Owner 尚未就绪。");
+        return promptOwners.renderEvaluationCandidate(actor(work), work.workspaceId(), candidate.get().candidateId(),
+                candidate.get().candidateRevision(), input);
+    }
+
     private TaskRunner.RunOutcome runServiceRequestPlan(TaskWorkItem work, UUID runId,
             io.eaf.agent.api.AgentDefinition agent, CapabilityDefinition capability, int step,
             int modelCalls, int toolCalls, int toolExecutions) throws Exception {
         boolean scenarioEvaluation = "EVALUATION".equals(work.source()) && work.qualityRunId() != null;
+        boolean delegatedReadOnly = work.delegationId() != null && "MCP".equals(work.entryProtocol());
         boolean fixedUserAsset = "USER".equals(work.source()) && work.qualityRunId() == null
-                && serviceRequestAnalysisAsset(agent, capability);
+                && serviceRequestAnalysisAsset(work, agent, capability);
         boolean validScenario = scenarioEvaluation && scenarioCurrent(work);
         if (!(fixedUserAsset || validScenario) || capability == null
                 || !agent.ragEnabled() || !"HYBRID".equals(agent.retrievalMode())
@@ -1035,7 +1228,7 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                     modelCalls > 0, 0, 0, modelCalls, toolCalls, toolExecutions);
         }
 
-        var prompt = prompts.render(work.tenantId(), work.workspaceId(), work.promptId(), work.promptVersion(), work.inputText());
+        var prompt = renderPrompt(work, work.inputText());
         if (latestStep(runId, "PROMPT_RENDERED") == null)
             storeStep(runId, work, step++, "PROMPT_RENDERED", null, json.writeValueAsString(prompt.messages()), "VALID");
         var scope = new ContextTaskScope(work.tenantId(), work.workspaceId(), work.actorId(), work.id(),
@@ -1093,9 +1286,10 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
             }
         } else stopReason = "FINAL";
 
-        var plan = scenarioEvaluation ? null : serviceRequestPlan(work, capability);
-        var ready = !scenarioEvaluation && "READY".equals(decision.outcome()) && plan != null;
-        if (!scenarioEvaluation && "READY".equals(decision.outcome()) && !ready) stopReason = "REGISTRATION_ASSETS_UNAVAILABLE";
+        var plan = scenarioEvaluation || delegatedReadOnly ? null : serviceRequestPlan(work, capability);
+        var ready = !scenarioEvaluation && !delegatedReadOnly && "READY".equals(decision.outcome()) && plan != null;
+        if (delegatedReadOnly && "READY".equals(decision.outcome())) stopReason = "DELEGATED_READ_ONLY";
+        else if (!scenarioEvaluation && "READY".equals(decision.outcome()) && !ready) stopReason = "REGISTRATION_ASSETS_UNAVAILABLE";
         var contextRefs = serviceRequestContextRefs(usedContexts);
         var result = json.createObjectNode();
         result.put("outcome", decision.outcome());
@@ -1170,6 +1364,7 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
         var marker = json.createObjectNode(); marker.put("round", round); marker.put("query", query);
         storeStep(runId, work, nextStep(runId), "SERVICE_REQUEST_RETRIEVAL_STARTED", "system",
                 json.writeValueAsString(marker), "PENDING");
+        long retrievalStarted = System.nanoTime();
         try {
             var candidates = context.prepare(actor(work), work.workspaceId(),
                     new ContextQuery(query, 5, 2_000, null, null, "HYBRID", "LEGACY"), scope);
@@ -1183,8 +1378,12 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
             saved.set("context", json.valueToTree(candidates));
             storeStep(runId, work, nextStep(runId), "SERVICE_REQUEST_RETRIEVAL_RESULT", "system",
                     json.writeValueAsString(saved), candidates.status());
+            storeStep(runId, work, nextStep(runId), "SERVICE_REQUEST_RETRIEVAL_TIMING", "system",
+                    phaseTiming(retrievalStarted), "RECORDED");
             return new ServiceRequestRetrieval(candidates, null);
         } catch (RuntimeException failure) {
+            storeStep(runId, work, nextStep(runId), "SERVICE_REQUEST_RETRIEVAL_TIMING", "system",
+                    phaseTiming(retrievalStarted), "FAILED");
             return new ServiceRequestRetrieval(null, fail(runId, work, failure instanceof EafException e ? e.code() : "SERVICE_REQUEST_RETRIEVAL_FAILED",
                     "服务请求知识检索未能完成；本次 attempt 不会重复未知检索。", false,
                     modelCalls > 0, null, null, modelCalls, toolCalls, toolExecutions));
@@ -1214,6 +1413,15 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
             modelCalls = Math.max(modelCalls, callNo);
         } else {
             callNo = modelCalls + 1;
+            ModelProfileSnapshot frozenProfile = null;
+            if (work.modelSelection() != null) try {
+                if (modelProfiles == null) throw EafException.conflict("MODEL_PROFILE_CONFIGURATION_UNAVAILABLE", "模型档位目录未就绪。");
+                frozenProfile = modelProfiles.requireCurrent(work.modelSelection().effectiveProfile());
+            } catch (EafException unavailable) {
+                return new ServiceRequestGeneration(null, null, null, callNo,
+                        fail(runId, work, unavailable.code(), "冻结模型档位已禁用、漂移或不可用；本次没有出站。", false,
+                                modelCalls > 0, null, null, modelCalls, toolCalls, toolExecutions));
+            }
             var permission = tasks.checkExecution(actor(work), work.workspaceId(), work.id(), work.attempt());
             if (!permission.allowed()) return new ServiceRequestGeneration(null, null, null, callNo,
                     fail(runId, work, permission.code(), permission.detail(), false, modelCalls > 0,
@@ -1234,6 +1442,7 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                         fail(runId, work, spend.code(), "金额预算或价格上界不允许本次模型调用。", false,
                                 modelCalls > 0, null, null, modelCalls, toolCalls, toolExecutions));
             }
+            long preparationStarted = System.nanoTime();
             var compact = compactServiceRequestPresentation(work);
             var actualKnowledge = compact ? ServiceRequestPresentation.compactKnowledge(json, contextSnapshot)
                     : json.valueToTree(contextSnapshot);
@@ -1243,30 +1452,36 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                     : history;
             saveServiceRequestPresentation(work, runId, round, callNo, callKey, query, contextSnapshot,
                     actualKnowledge, history, fullHistory, compact ? "KNOWLEDGE_COMPACT_V1" : "FULL_CONTEXT_V1");
+            storeStep(runId, work, nextStep(runId), "SERVICE_REQUEST_PREPARATION_TIMING", "system",
+                    phaseTiming(preparationStarted), "RECORDED");
             var marker = json.createObjectNode(); marker.put("round", round); marker.put("query", query);
             storeStep(runId, work, nextStep(runId), "SERVICE_REQUEST_GENERATION_STARTED", "system",
                     json.writeValueAsString(marker), "PENDING", callNo, null);
             var deadline = Instant.now(clock).plusSeconds(20);
             if (work.activeDeadline().isBefore(deadline)) deadline = work.activeDeadline();
             if (work.deadline().isBefore(deadline)) deadline = work.deadline();
-            var startedAt = Instant.now(clock);
             var request = new ModelRequest(work.modelProfileId(), List.copyOf(history), deadline,
-                    reservation.tokenBudget(), work.id(), work.traceId(), List.of(), callNo);
+                    reservation.tokenBudget(), work.id(), work.traceId(), List.of(), callNo, frozenProfile);
             audit.append(new AuditFact("model-request:" + work.id() + ":" + work.attempt() + ":" + callNo,
                     work.tenantId(), work.workspaceId(), work.actorId(), work.id(), "MODEL_CALL_REQUESTED", "ACCEPTED", "{}", work.traceId()));
+            var startedAt = Instant.now(clock);
+            long modelStartedNanos = System.nanoTime();
             ModelResult result;
             try {
                 result = model.call(request);
+                var modelOperationMillis = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - modelStartedNanos);
                 modelCalls = callNo;
                 tasks.settleModel(work.id(), work.attempt(), reservationKey, result.inputTokens(), result.outputTokens());
-                recordUsage(work, runId, callNo, callKey, result, reservation.tokenBudget(), "SUCCEEDED", null, startedAt);
+                recordUsage(work, runId, callNo, callKey, result, reservation.tokenBudget(), "SUCCEEDED", null,
+                        startedAt, request, modelOperationMillis);
             } catch (ModelFailure failure) {
+                var modelOperationMillis = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - modelStartedNanos);
                 if (failure.called()) modelCalls = callNo;
                 tasks.settleModel(work.id(), work.attempt(), reservationKey,
                         failure.called() ? null : 0, failure.called() ? null : 0);
                 if (!failure.called() && spend != null) usage.releaseSpend(callKey);
                 recordUsage(work, runId, callNo, callKey, null, reservation.tokenBudget(),
-                        failure.timeout() ? "TIMED_OUT" : "FAILED", failure.code(), startedAt);
+                        failure.timeout() ? "TIMED_OUT" : "FAILED", failure.code(), startedAt, request, modelOperationMillis);
                 return new ServiceRequestGeneration(null, null, null, callNo,
                         fail(runId, work, failure.code(), failure.getMessage(), failure.timeout(),
                                 modelCalls > 0, null, null, modelCalls, toolCalls, toolExecutions));
@@ -1295,10 +1510,18 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                 initialStep, modelCalls, toolCalls, toolExecutions, null);
     }
 
-    private boolean serviceRequestAnalysisAsset(io.eaf.agent.api.AgentDefinition agent, CapabilityDefinition capability) {
-        if (capability == null || !SERVICE_REQUEST_PLAN_CAPABILITY_ID.equals(capability.id())
-                || !SERVICE_REQUEST_PLAN_AGENT_ID.equals(agent.id()) || !agent.version().equals(capability.version())) return false;
-        return "1.0.0".equals(agent.version()) || "1.1.0".equals(agent.version());
+    private boolean serviceRequestAnalysisAsset(TaskWorkItem work, io.eaf.agent.api.AgentDefinition agent,
+            CapabilityDefinition capability) {
+        if (capability == null || !agent.id().equals(capability.agentId()) || !agent.version().equals(capability.agentVersion())
+                || !"SERVICE_REQUEST_PLAN_V1".equals(agent.responseProfile()) || !agent.ragEnabled()
+                || !"HYBRID".equals(agent.retrievalMode()) || !"NONE".equals(agent.evidencePolicy())
+                || !capability.toolDependencies().isEmpty()
+                || !agents.tools(work.tenantId(), work.workspaceId(), agent.id(), agent.version()).isEmpty()) return false;
+        if (SERVICE_REQUEST_PLAN_CAPABILITY_ID.equals(capability.id())
+                && SERVICE_REQUEST_PLAN_AGENT_ID.equals(agent.id()))
+            return "1.0.0".equals(agent.version()) || "1.1.0".equals(agent.version());
+        return capabilities != null && "p15-service-request-plan-v1".equals(capability.evaluationRef())
+                && capabilities.isPromptAnalysisVariant(actor(work), work.workspaceId(), capability.id(), capability.version());
     }
 
     private boolean compactServiceRequestPresentation(TaskWorkItem work) {
@@ -1584,7 +1807,9 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
 
     // 金额账本 Scope 沿用 Task 根 ID，重试和子 Task 因而不能重置累计预算。
     private SpendReservation reserveSpend(TaskWorkItem work, String callKey, int maxTokens) {
-        return reserveSpend(work, callKey, maxTokens, model.billingProfile());
+        var profile = work.modelSelection() == null || modelProfiles == null
+                ? model.billingProfile() : modelProfiles.billingIdentity(work.modelSelection().effectiveProfile());
+        return reserveSpend(work, callKey, maxTokens, profile);
     }
 
     private SpendReservation reserveSpend(TaskWorkItem work, String callKey, int maxTokens, ModelBillingProfile profile) {
@@ -1728,14 +1953,35 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
 
     private void recordUsage(TaskWorkItem work, UUID runId, int callNo, String callKey, ModelResult result,
                              int reserved, String status, String error, Instant started) {
-        var profile = model.billingProfile();
+        recordUsage(work, runId, callNo, callKey, result, reserved, status, error, started, null);
+    }
+
+    private void recordUsage(TaskWorkItem work, UUID runId, int callNo, String callKey, ModelResult result,
+                             int reserved, String status, String error, Instant started, ModelRequest request) {
+        var elapsed = request == null ? null : Math.max(0L, java.time.Duration.between(started, Instant.now(clock)).toMillis());
+        recordUsage(work, runId, callNo, callKey, result, reserved, status, error, started, request, elapsed);
+    }
+
+    private void recordUsage(TaskWorkItem work, UUID runId, int callNo, String callKey, ModelResult result,
+                             int reserved, String status, String error, Instant started, ModelRequest request,
+                             Long modelOperationMillis) {
+        var profile = work.modelSelection() == null || modelProfiles == null
+                ? model.billingProfile() : modelProfiles.billingIdentity(work.modelSelection().effectiveProfile());
         var provider = profile != null ? profile.provider() : result == null ? "unknown" : result.provider();
         var modelName = profile != null ? profile.model() : result == null ? "unknown" : result.model();
+        var snapshot = request == null ? null : request.profileSnapshot();
+        var operationMillis = request == null ? null : modelOperationMillis;
         usage.record(new UsageRecord(work.tenantId(), work.workspaceId(), work.id(), runId, work.source(),
                 provider, modelName,
                 result == null ? null : result.inputTokens(), result == null ? null : result.outputTokens(),
-                result == null ? "UNKNOWN" : usageStatus(result), reserved, status, error, started,
-                Instant.now(clock), callNo, callKey, "CHAT", spendScopeType(work), spendScopeId(work)));
+                result == null ? "UNKNOWN" : usageStatus(result), null, null, null, null, reserved, status, error, started,
+                Instant.now(clock), callNo, callKey, "CHAT", spendScopeType(work), spendScopeId(work),
+                null, null, null, null, null, null, null, null, null, null,
+                snapshot == null ? null : snapshot.profileId(), snapshot == null ? null : snapshot.version(),
+                snapshot == null ? null : snapshot.configurationHash(), snapshot == null ? null : snapshot.requestedModel(),
+                request == null || snapshot == null ? null : request.effectiveOutputTokenLimit(),
+                result == null ? null : result.reportedResponseModel(), result == null ? null : result.finishReason(),
+                operationMillis));
     }
 
     private TaskRunner.RunOutcome invalidModelOutput(TaskWorkItem work, UUID runId, int callNo, ModelResult result,
@@ -1758,6 +2004,12 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
         try {
             traces.record(new TraceObservation(work.traceId(), work.id(), runId, phase, Math.max(0, elapsedMs), outcome, null, Instant.now(clock)));
         } catch (RuntimeException ignored) { }
+    }
+
+    private String phaseTiming(long startedNanos) {
+        var metadata = json.createObjectNode();
+        metadata.put("elapsedMillis", Math.max(0L, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)));
+        return metadata.toString();
     }
 
     @Override
@@ -1953,8 +2205,14 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
         if (work.delegationId() != null) {
             if (identities == null || work.principalId() == null || work.authorizationHash() == null)
                 throw EafException.forbidden("Task 委托身份无法重新验证。");
+            var audience = switch (work.entryProtocol()) {
+                case "MCP" -> IdentityService.MCP_AUDIENCE;
+                case "REST", "A2A" -> IdentityService.REST_AUDIENCE;
+                default -> null;
+            };
+            if (audience == null) throw EafException.forbidden("Task 委托入口与授权受众不匹配。");
             return identities.resolveDelegation(work.tenantId(), work.principalId(), work.actorId(), work.delegationId(),
-                            work.workspaceId(), IdentityService.REST_AUDIENCE)
+                            work.workspaceId(), audience)
                     .filter(current -> current.authorizationHash().equals(work.authorizationHash()))
                     .orElseThrow(() -> EafException.forbidden("Task 委托已撤销、过期或授权已变化。"));
         }
@@ -2441,6 +2699,8 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
             case TEAM_IMPROVEMENT_PROFILE -> validateTeamImprovementDraft(root);
             case "SERVICE_REQUEST_PREPARE_V1" -> validateServiceRequestPrepare(root);
             case "SERVICE_REQUEST_PREPARE_V2" -> validateServiceRequestPrepare(root);
+            case PROJECT_BRIEF_PREPARE_PROFILE -> validateProjectBrief(root, work);
+            case P30_AUTOMATION_DIGEST_PROFILE -> validateAutomationDigest(root, work);
             case "SERVICE_REQUEST_SUMMARY_V1" -> validateServiceRequestSummary(root);
             case SERVICE_REQUEST_BATCH_KNOWLEDGE_PROFILE -> validateP21Knowledge(root, contextSnapshot);
             case SERVICE_REQUEST_BATCH_EXPERIENCE_PROFILE -> validateP21Experience(root, contextSnapshot);
@@ -2458,6 +2718,91 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
         if (SERVICE_REQUEST_PREPARE_V2_PROFILE.equals(agent.responseProfile()))
             normalized = attachTeamExperienceUsage(normalized, contextSnapshot);
         return isP12Conversation(agent) ? attachFollowupUsage(normalized, conversation) : normalized;
+    }
+
+    private String projectBriefPromptInput(ProjectBriefTaskSource source) throws com.fasterxml.jackson.core.JsonProcessingException {
+        var input = json.createObjectNode().put("evidenceBundleHash", source.evidenceBundleHash());
+        input.set("evidenceBundle", json.readTree(source.evidenceBundleJson()));
+        return json.writeValueAsString(input);
+    }
+
+    private String automationDigestPromptInput(AutomationTaskSource source) throws Exception {
+        var taskInput = json.readTree(source.inputSnapshotJson());
+        var snapshotJson = taskInput.path("snapshotJson").asText(null);
+        var snapshotHash = taskInput.path("snapshotHash").asText(null);
+        if (snapshotJson == null || snapshotHash == null || !snapshotHash.matches("[0-9a-f]{64}")
+                || !snapshotHash.equals(io.eaf.shared.Hashing.sha256(snapshotJson))
+                || source.inputHash() == null || !source.inputHash().matches("[0-9a-f]{64}"))
+            throw new IllegalArgumentException("本人待办摘要输入快照绑定无效。");
+        return json.writeValueAsString(json.readTree(snapshotJson));
+    }
+
+    private String validateAutomationDigest(JsonNode root, TaskWorkItem work) throws Exception {
+        if (!fields(root).equals(Set.of("overview", "attentionItems"))
+                || !validText(root.path("overview"), 1, 1_000) || !root.path("attentionItems").isArray()
+                || root.path("attentionItems").size() > 5)
+            throw new IllegalArgumentException("本人待办摘要输出字段或长度无效。");
+        var source = automations.requireTaskSource(actor(work), work.workspaceId(), work.id(), work.attempt());
+        var known = new HashSet<String>();
+        source.items().forEach(item -> known.add(item.evidenceId()));
+        var unique = new HashSet<String>();
+        for (var item : root.path("attentionItems")) {
+            var ids = item.path("evidenceIds");
+            if (!fields(item).equals(Set.of("text", "evidenceIds")) || !validText(item.path("text"), 1, 300)
+                    || !ids.isArray() || ids.isEmpty() || ids.size() > 20)
+                throw new IllegalArgumentException("本人待办关注事项必须有界且引用证据。");
+            var local = new HashSet<String>();
+            for (var id : ids) {
+                if (!id.isTextual() || !known.contains(id.asText()) || !local.add(id.asText()))
+                    throw new IllegalArgumentException("本人待办关注事项引用了未知或重复证据。");
+            }
+            if (!unique.add(item.path("text").asText().strip()))
+                throw new IllegalArgumentException("本人待办关注事项不能重复。");
+        }
+        if (source.items().isEmpty() && (!"当前无匹配待办".equals(root.path("overview").asText())
+                || !root.path("attentionItems").isEmpty()))
+            throw new IllegalArgumentException("没有匹配待办时只能返回固定空摘要。");
+        return json.writeValueAsString(root);
+    }
+
+    private String validateProjectBrief(JsonNode root, TaskWorkItem work) throws Exception {
+        if (!fields(root).equals(Set.of("overview", "attentionItems", "citations"))
+                || !validText(root.path("overview"), 1, 1_500))
+            throw new IllegalArgumentException("项目简报概述或字段无效。");
+        var source = workflows.requireProjectBriefTaskSource(actor(work), work.workspaceId(), work.id());
+        var bundle = json.readTree(source.evidenceBundleJson());
+        var known = new HashSet<String>();
+        var evidence = bundle.path("evidence");
+        if (!evidence.isArray()) throw new IllegalArgumentException("项目简报证据包无效。");
+        evidence.forEach(item -> { if (item.path("evidenceId").isTextual()) known.add(item.path("evidenceId").asText()); });
+        var attention = root.path("attentionItems");
+        if (!attention.isArray() || attention.size() > 8) throw new IllegalArgumentException("项目简报关注事项数量无效。");
+        var used = new HashSet<String>();
+        for (var item : attention) {
+            var ids = item.path("evidenceIds");
+            if (!fields(item).equals(Set.of("text", "evidenceIds")) || !validText(item.path("text"), 1, 500)
+                    || !ids.isArray() || ids.isEmpty() || ids.size() > 10)
+                throw new IllegalArgumentException("项目简报关注事项无效。");
+            var local = new HashSet<String>();
+            for (var id : ids) {
+                if (!id.isTextual() || !known.contains(id.asText()) || !local.add(id.asText()))
+                    throw new IllegalArgumentException("项目简报包含未知或重复的证据引用。");
+                used.add(id.asText());
+            }
+        }
+        var citations = root.path("citations");
+        if (!citations.isArray() || citations.size() > 40)
+            throw new IllegalArgumentException("项目简报引用数量无效。");
+        var cited = new HashSet<String>();
+        for (var citation : citations) {
+            var id = citation.path("evidenceId");
+            if (!fields(citation).equals(Set.of("evidenceId", "reason")) || !id.isTextual()
+                    || !known.contains(id.asText()) || !cited.add(id.asText())
+                    || !validText(citation.path("reason"), 0, 240))
+                throw new IllegalArgumentException("项目简报包含未知、重复或无效的引用。");
+        }
+        if (!cited.containsAll(used)) throw new IllegalArgumentException("关注事项的证据未列入引用目录。");
+        return json.writeValueAsString(root);
     }
 
     private String validateP21Knowledge(JsonNode root, EnterpriseContext snapshot) throws Exception {
@@ -2989,7 +3334,21 @@ public class JdbcAgentRuntime implements TaskRunner, io.eaf.agentruntime.api.Run
                         + "where s.task_id = ? and r.tenant_id = ? and r.workspace_id = ? and s.type = 'CONTEXT_SNAPSHOT' "
                         + "order by r.attempt desc, s.step_no desc limit 1",
                 rs -> rs.next() ? rs.getString("content") : null, taskId, tenantId, workspaceId);
-        return content == null || snapshotVisible(actor, workspaceId, content);
+        if (content != null && !snapshotVisible(actor, workspaceId, content)) return false;
+        // P15 将检索快照保存在专用步骤中；撤权投影必须复核当前 attempt 实际使用的每份知识。
+        var retrievals = jdbc.queryForList("select s.content from agent_runtime.step s join agent_runtime.run r on r.id = s.run_id "
+                        + "where s.task_id = ? and r.tenant_id = ? and r.workspace_id = ? "
+                        + "and r.attempt = (select max(current_run.attempt) from agent_runtime.run current_run "
+                        + "where current_run.task_id = ? and current_run.tenant_id = ? and current_run.workspace_id = ?) "
+                        + "and s.type = 'SERVICE_REQUEST_RETRIEVAL_RESULT' order by s.step_no",
+                String.class, taskId, tenantId, workspaceId, taskId, tenantId, workspaceId);
+        return retrievals.stream().allMatch(retrieval -> {
+            try {
+                var saved = json.readTree(retrieval);
+                var snapshot = parseContext(json.writeValueAsString(saved.path("context")));
+                return snapshot != null && contextCurrent(actor, workspaceId, snapshot);
+            } catch (Exception invalidEvidence) { return false; }
+        });
     }
 
     private EnterpriseContext parseContext(String content) {

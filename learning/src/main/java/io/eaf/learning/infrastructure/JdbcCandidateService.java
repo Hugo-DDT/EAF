@@ -9,10 +9,15 @@ import io.eaf.context.api.ContextSourceRef;
 import io.eaf.context.api.ContextItem;
 import io.eaf.context.api.EnterpriseContext;
 import io.eaf.context.api.TeamExperienceUsage;
+import io.eaf.agent.api.AgentOwnerService;
+import io.eaf.capability.api.CapabilityService;
+import io.eaf.skill.api.SkillService;
 import io.eaf.agentruntime.api.RuntimeQuery;
 import io.eaf.evaluation.api.CandidateEvaluationReport;
 import io.eaf.evaluation.api.CandidateContextSnapshotCommand;
 import io.eaf.evaluation.api.EvaluationService;
+import io.eaf.evaluation.api.PromptAnalysisEvaluationService;
+import io.eaf.evaluation.api.PromptAnalysisEvaluationService.PromptEvaluationRun;
 import io.eaf.evaluation.api.CandidateContextSnapshotCommand.TeamPreparationSnapshotBinding;
 import io.eaf.learning.api.CandidateApproval;
 import io.eaf.learning.api.CandidateIteration;
@@ -34,6 +39,7 @@ import io.eaf.memory.api.MemoryCandidateReleaseCommand;
 import io.eaf.memory.api.MemoryRelease;
 import io.eaf.memory.api.MemoryService;
 import io.eaf.memory.api.TeamExperienceService;
+import io.eaf.prompt.api.PromptOwnerService;
 import io.eaf.evaluation.api.EvaluationService.TeamImprovementGenerationBinding;
 import io.eaf.shared.ActorContext;
 import io.eaf.shared.ActorType;
@@ -66,6 +72,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 
 @Service
@@ -89,6 +96,11 @@ public class JdbcCandidateService implements CandidateService {
     private final TransactionTemplate transactions;
     private final boolean improvementEnabled;
     private final String modelMode;
+    private PromptOwnerService promptOwners;
+    private PromptAnalysisEvaluationService promptEvaluations;
+    private AgentOwnerService agentOwners;
+    private SkillService skills;
+    private CapabilityService capabilities;
 
     public JdbcCandidateService(JdbcTemplate jdbc, WorkspaceAuthorization workspaces, TaskService tasks,
                                 RuntimeQuery runtime,
@@ -102,6 +114,22 @@ public class JdbcCandidateService implements CandidateService {
         this.evaluations = evaluations; this.usage = usage; this.json = json; this.clock = clock;
         this.transactions = new TransactionTemplate(transactionManager);
         this.improvementEnabled = improvementEnabled; this.modelMode = modelMode;
+    }
+
+    @Autowired
+    void promptP31Services(@org.springframework.context.annotation.Lazy PromptOwnerService owners,
+            @org.springframework.context.annotation.Lazy PromptAnalysisEvaluationService evaluations) {
+        this.promptOwners = owners;
+        this.promptEvaluations = evaluations;
+    }
+
+    @Autowired
+    void promptVariantServices(@org.springframework.context.annotation.Lazy AgentOwnerService agents,
+            @org.springframework.context.annotation.Lazy SkillService skills,
+            @org.springframework.context.annotation.Lazy CapabilityService capabilities) {
+        this.agentOwners = agents;
+        this.skills = skills;
+        this.capabilities = capabilities;
     }
 
     @Override
@@ -307,6 +335,219 @@ public class JdbcCandidateService implements CandidateService {
         return loadImprovementRun(actor, workspaceId, improvementRunId);
     }
 
+    @Override
+    @Transactional
+    public CandidateService.PromptImprovementRunSubmission createPromptImprovementRun(
+            CandidateService.PromptImprovementRunCommand command) {
+        if (command == null || command.actor() == null || command.actor().type() != ActorType.HUMAN
+                || command.actor().delegated() || command.targetId() == null || command.expectedTargetVersion() < 1
+                || blank(command.idempotencyKey()) || command.idempotencyKey().length() > 200 || hasControl(command.idempotencyKey()))
+            throw EafException.invalid("Prompt 改进运行需要直接 HUMAN、目标版本与幂等键。");
+        requireActor(command.actor(), command.workspaceId(), "learning:propose");
+        if (promptOwners == null || promptEvaluations == null)
+            throw EafException.conflict("PROMPT_OWNER_UNAVAILABLE", "Prompt 改进服务尚未就绪。");
+        var appendix = command.instructionAppendix();
+        if (appendix == null || appendix.isBlank() || appendix.trim().length() > 1_000 || hasControl(appendix))
+            throw EafException.invalid("Prompt 补充说明须为 1—1000 字符。");
+        var changeNote = command.changeNote();
+        if (changeNote == null || changeNote.isBlank() || changeNote.trim().length() > 500 || hasControl(changeNote)
+                || isSensitive(changeNote)) throw EafException.invalid("Prompt 改进说明须为 1—500 字符且不能包含凭证。");
+        var feedbackIds = command.sourceFeedbackIds() == null ? List.<UUID>of() : command.sourceFeedbackIds().stream().distinct().toList();
+        if (feedbackIds.size() > 3 || feedbackIds.stream().anyMatch(java.util.Objects::isNull))
+            throw EafException.invalid("Prompt 改进最多引用 3 条不同的 USER 反馈。");
+
+        var idempotencyHash = Hashing.sha256(command.actor().tenantId() + "|" + command.workspaceId() + "|"
+                + command.actor().actorId() + "|" + command.idempotencyKey());
+        var prior = jdbc.query("select id, target_id, expected_target_version, base_hash, request_hash "
+                        + "from learning.prompt_improvement_run where tenant_id = ? and workspace_id = ? "
+                        + "and owner_id = ? and idempotency_key_hash = ?",
+                rs -> rs.next() ? new Object[]{rs.getObject("id", UUID.class), rs.getObject("target_id", UUID.class),
+                        rs.getLong("expected_target_version"), rs.getString("base_hash"), rs.getString("request_hash")} : null,
+                command.actor().tenantId(), command.workspaceId(), command.actor().actorId(), idempotencyHash);
+        if (prior != null) {
+            var target = promptOwners.getTarget(command.actor(), command.workspaceId(), command.targetId());
+            var requestHash = Hashing.sha256(command.targetId() + "|" + command.expectedTargetVersion() + "|" + prior[3] + "|"
+                    + feedbackIds + "|" + changeNote.trim() + "|" + appendix.trim() + "|"
+                    + (command.deadlineAt() == null ? "DEFAULT_30_MINUTES" : command.deadlineAt()));
+            if (!target.ownerId().equals(command.actor().actorId()) || !command.targetId().equals(prior[1])
+                    || command.expectedTargetVersion() != ((Number) prior[2]).longValue()
+                    || !requestHash.equals(prior[4]))
+                throw EafException.conflict("IDEMPOTENCY_CONFLICT", "Prompt 改进幂等键已对应其他请求。");
+            return promptRunSubmission(command.actor(), command.workspaceId(), (UUID) prior[0], false);
+        }
+
+        var target = promptOwners.getTarget(command.actor(), command.workspaceId(), command.targetId());
+        if (!target.ownerId().equals(command.actor().actorId())) throw EafException.notFound();
+        for (var feedbackId : feedbackIds) {
+            var feedback = requireFeedback(command.actor(), command.workspaceId(), feedbackId);
+            var task = tasks.get(command.actor(), command.workspaceId(), feedback.taskId());
+            if (!"SUCCEEDED".equals(task.status().name())
+                    || !UUID.fromString("20000000-0000-4000-8000-000000000010").equals(task.agentId())
+                    || !"1.0.0".equals(task.agentVersion()) || !target.baseVersion().equals(feedback.source().promptVersion())
+                    || task.assetBinding() == null
+                    || !UUID.fromString("54000000-0000-4000-8000-000000000012").equals(task.assetBinding().capabilityId())
+                    || !"1.0.0".equals(task.assetBinding().capabilityVersion()))
+                throw EafException.invalid("反馈必须来自固定 P15 只读分析 USER Task 的成功结果。");
+        }
+        var now = Instant.now(clock);
+        var deadline = command.deadlineAt() == null ? now.plus(Duration.ofMinutes(30)) : command.deadlineAt();
+        if (!deadline.isAfter(now) || deadline.isAfter(now.plus(Duration.ofHours(24))))
+            throw EafException.invalid("Prompt 改进截止时间必须在当前时间之后且不超过 24 小时。");
+        var requestHash = Hashing.sha256(target.id() + "|" + command.expectedTargetVersion() + "|" + target.baseHash() + "|"
+                + feedbackIds + "|" + changeNote.trim()
+                + "|" + appendix.trim()
+                + "|" + (command.deadlineAt() == null ? "DEFAULT_30_MINUTES" : command.deadlineAt()));
+        if (target.rowVersion() != command.expectedTargetVersion() || !"READY".equals(target.status()))
+            throw EafException.conflict("PROMPT_TARGET_CHANGED", "Prompt 目标版本或状态已变化。");
+        var runId = UUID.randomUUID();
+        var candidateId = UUID.randomUUID();
+        var inserted = jdbc.update("insert into learning.prompt_improvement_run(id, tenant_id, workspace_id, owner_id, target_id, "
+                        + "expected_target_version, base_hash, source_feedbacks, change_note, instruction_appendix, request_hash, idempotency_key_hash, "
+                        + "candidate_id, candidate_revision, status, deadline_at) values (?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?, 1, 'AWAITING_REVIEW', ?) "
+                        + "on conflict (tenant_id, workspace_id, owner_id, idempotency_key_hash) do nothing",
+                runId, command.actor().tenantId(), command.workspaceId(), command.actor().actorId(), target.id(),
+                target.rowVersion(), target.baseHash(), writeJson(feedbackIds), changeNote.trim(), appendix.trim(), requestHash, idempotencyHash,
+                candidateId, Timestamp.from(deadline));
+        if (inserted == 0) {
+            var existingId = jdbc.query("select id, request_hash from learning.prompt_improvement_run where tenant_id = ? and workspace_id = ? and owner_id = ? and idempotency_key_hash = ?",
+                    rs -> rs.next() ? new Object[]{rs.getObject("id", UUID.class), rs.getString("request_hash")} : null,
+                    command.actor().tenantId(), command.workspaceId(), command.actor().actorId(), idempotencyHash);
+            if (existingId == null || !requestHash.equals(existingId[1]))
+                throw EafException.conflict("IDEMPOTENCY_CONFLICT", "Prompt 改进幂等键已对应其他请求。");
+            return promptRunSubmission(command.actor(), command.workspaceId(), (UUID) existingId[0], false);
+        }
+        var refs = feedbackIds.stream().map(id -> "feedback:" + id).toList();
+        var baseSnapshot = json.createObjectNode().put("promptId", target.basePromptId().toString())
+                .put("promptVersion", target.baseVersion()).put("baseHash", target.baseHash())
+                .put("changeNote", changeNote.trim()).put("hasSourceFeedback", !feedbackIds.isEmpty());
+        var draft = new CandidateDraft("PROMPT_UPDATE", target.id(), target.baseHash(), target.ownerId(), "WORKSPACE",
+                baseSnapshot, TextNode.valueOf(appendix.trim()), refs, false);
+        promptOwners.stageAnalysisCandidate(new PromptOwnerService.StageAnalysisCandidate(command.actor(), command.workspaceId(),
+                target.id(), target.rowVersion(), candidateId, 1, appendix.trim()));
+        var candidate = insertCandidate(command.actor(), command.workspaceId(), feedbackIds.isEmpty() ? null : feedbackIds.getFirst(),
+                "p31-prompt-run:" + runId, candidateId, draft).candidate();
+        return new CandidateService.PromptImprovementRunSubmission(loadPromptImprovementRun(command.actor(), command.workspaceId(), runId), candidate, true);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public CandidateService.PromptImprovementRun getPromptImprovementRun(ActorContext actor, UUID workspaceId, UUID runId) {
+        requireActor(actor, workspaceId, "learning:read");
+        return loadPromptImprovementRun(actor, workspaceId, runId);
+    }
+
+    @Override
+    @Transactional
+    public CandidateService.PromptImprovementRun stopPromptImprovementRun(ActorContext actor, UUID workspaceId,
+            UUID runId, long expectedVersion) {
+        if (actor == null || actor.type() != ActorType.HUMAN || actor.delegated() || expectedVersion < 1)
+            throw EafException.invalid("停止 Prompt 改进运行需要直接 HUMAN 和有效版本。");
+        requireActor(actor, workspaceId, "learning:propose");
+        var run = jdbc.query("select owner_id, candidate_id, dev_report_id, held_out_report_id, status, row_version "
+                        + "from learning.prompt_improvement_run where id = ? and tenant_id = ? and workspace_id = ? for update",
+                rs -> rs.next() ? new PromptRunStop(rs.getObject("owner_id", UUID.class), rs.getObject("candidate_id", UUID.class),
+                        rs.getObject("dev_report_id", UUID.class), rs.getObject("held_out_report_id", UUID.class),
+                        rs.getString("status"), rs.getLong("row_version")) : null,
+                runId, actor.tenantId(), workspaceId);
+        if (run == null || !actor.actorId().equals(run.ownerId())) throw EafException.notFound();
+        if (run.rowVersion() != expectedVersion) throw EafException.conflict("VERSION_CONFLICT", "Prompt 改进运行版本已变化。");
+        if (List.of("READY", "NOT_SELECTED", "REJECTED", "STOPPED", "TIMED_OUT", "STALE", "PUBLISHED", "FAILED").contains(run.status()))
+            return loadPromptImprovementRun(actor, workspaceId, runId);
+        var owner = internalHuman(actor.tenantId(), run.ownerId(), workspaceId);
+        for (var reportId : java.util.Arrays.stream(new UUID[]{run.devReportId(), run.heldOutReportId()})
+                .filter(java.util.Objects::nonNull).toList()) {
+            try { promptEvaluations.stop(owner, workspaceId, reportId); } catch (RuntimeException ignored) { }
+        }
+        jdbc.update("update learning.prompt_improvement_run set status = 'STOPPED', reason_code = 'HUMAN_STOP', "
+                        + "row_version = row_version + 1, updated_at = now() where id = ? and row_version = ?",
+                runId, expectedVersion);
+        if (run.candidateId() != null)
+            jdbc.update("update learning.candidate set status = 'REJECTED', row_version = row_version + 1, updated_at = now() "
+                            + "where id = ? and status in ('PROPOSED','IN_REVIEW')", run.candidateId());
+        return loadPromptImprovementRun(actor, workspaceId, runId);
+    }
+
+    @Override
+    @Transactional
+    public CandidateService.PromptAdoption adoptPromptImprovementRun(CandidateService.PromptAdoptionCommand command) {
+        if (command == null || command.actor() == null || command.actor().type() != ActorType.HUMAN
+                || command.actor().delegated() || command.candidateId() == null || blank(command.idempotencyKey())
+                || command.idempotencyKey().length() > 200 || hasControl(command.idempotencyKey()))
+            throw EafException.invalid("Prompt 采用需要直接 HUMAN Owner、候选和幂等键。");
+        var actor = command.actor();
+        var workspaceId = command.workspaceId();
+        requireActor(actor, workspaceId, "learning:read");
+        requireActor(actor, workspaceId, "learning:publish");
+        if (agentOwners == null || skills == null || capabilities == null || promptOwners == null || promptEvaluations == null)
+            throw EafException.conflict("PROMPT_OWNER_UNAVAILABLE", "Prompt 采用服务尚未就绪。");
+        var candidate = load(actor.tenantId(), workspaceId, command.candidateId());
+        if (!candidate.ownerId().equals(actor.actorId()) || !"PROMPT_UPDATE".equals(candidate.targetType())
+                || !"PUBLISHED".equals(candidate.status()))
+            throw EafException.conflict("PROMPT_ADOPTION_NOT_READY", "只有已发布 Prompt 候选的 Owner 可以显式采用。");
+        var run = promptRunByCandidate(actor.tenantId(), workspaceId, candidate.id(), candidate.revision());
+        if (run == null || !"PUBLISHED".equals(run.status()))
+            throw EafException.conflict("PROMPT_ADOPTION_NOT_READY", "Prompt 改进运行尚未发布。");
+        var release = releaseByCandidate(actor.tenantId(), workspaceId, candidate.id(), candidate.revision())
+                .filter(item -> "RELEASED".equals(item.status()))
+                .orElseThrow(() -> EafException.conflict("RELEASE_NOT_FOUND", "Prompt 发布回执不存在。"));
+        var approval = approvalById(actor.tenantId(), workspaceId, release.approvalId());
+        validateReleaseAuthorization(actor, workspaceId, candidate, approval, release);
+        var promptRelease = promptOwners.findReleaseByOrigin(actor, workspaceId, candidate.id(), candidate.revision())
+                .filter(item -> "RELEASED".equals(item.status()))
+                .orElseThrow(() -> EafException.conflict("PROMPT_RELEASE_MISSING", "Prompt Owner 发布回执不存在。"));
+        if (!promptRelease.id().equals(release.targetReleaseId()) || !promptRelease.contentHash().equals(release.targetContentHash())
+                || !promptRelease.approvalId().equals(approval.id()) || !promptRelease.reportId().equals(approval.evaluationReportId())
+                || !promptRelease.reportHash().equals(approval.evaluationReportHash())
+                || !promptRelease.promptId().equals(candidate.targetId())
+                || !promptRelease.promptVersion().equals("1.0.0") || !promptRelease.reportId().equals(run.heldOutReportId()))
+            throw EafException.conflict("PROMPT_RELEASE_MISMATCH", "Prompt Owner 回执与候选批准快照不匹配。");
+
+        var idempotencyHash = Hashing.sha256(actor.tenantId() + "|" + workspaceId + "|" + actor.actorId() + "|"
+                + command.idempotencyKey());
+        var adoptionId = UUID.randomUUID();
+        var inserted = jdbc.update("insert into learning.prompt_adoption(id, tenant_id, workspace_id, candidate_id, candidate_revision, "
+                        + "owner_id, idempotency_key_hash, prompt_id, prompt_version, prompt_hash, approval_id, report_id, report_hash, status) "
+                        + "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ADOPTING') on conflict do nothing",
+                adoptionId, actor.tenantId(), workspaceId, candidate.id(), candidate.revision(), actor.actorId(), idempotencyHash,
+                promptRelease.promptId(), promptRelease.promptVersion(), promptRelease.contentHash(), approval.id(),
+                approval.evaluationReportId(), approval.evaluationReportHash());
+        var adoption = promptAdoptionByCandidate(actor.tenantId(), workspaceId, candidate.id(), candidate.revision());
+        if (adoption == null) throw EafException.conflict("IDEMPOTENCY_CONFLICT", "采用幂等键已对应其他候选。");
+        var storedKeyHash = jdbc.queryForObject("select idempotency_key_hash from learning.prompt_adoption where id = ?",
+                String.class, adoption.id());
+        if (!idempotencyHash.equals(storedKeyHash))
+            throw EafException.conflict("IDEMPOTENCY_CONFLICT", "该候选修订已使用其他采用请求键。");
+        if (inserted == 0 && "ADOPTED".equals(adoption.status())) return adoption;
+        if ("WITHDRAWN".equals(adoption.status()))
+            throw EafException.conflict("PROMPT_ADOPTION_WITHDRAWN", "已撤回的 Prompt 采用不能重用。");
+
+        var agent = agentOwners.publishPromptAnalysisVariant(actor, workspaceId, candidate.id(), candidate.revision(), adoption.id(),
+                promptRelease.promptId(), promptRelease.promptVersion(), promptRelease.contentHash(), approval.id(),
+                approval.evaluationReportId(), approval.evaluationReportHash());
+        var skill = skills.publishPromptAnalysisVariant(actor, workspaceId, candidate.id(), candidate.revision(), adoption.id(),
+                promptRelease.promptId(), promptRelease.promptVersion(), promptRelease.contentHash(), approval.id(),
+                approval.evaluationReportId(), approval.evaluationReportHash());
+        var capability = capabilities.publishPromptAnalysisVariant(actor, workspaceId, candidate.id(), candidate.revision(), adoption.id(),
+                agent.id(), agent.version(), skill.id(), skill.version(), promptRelease.promptId(), promptRelease.promptVersion(),
+                promptRelease.contentHash(), approval.id(), approval.evaluationReportId(), approval.evaluationReportHash());
+        jdbc.update("update learning.prompt_adoption set agent_id = ?, agent_version = ?, agent_hash = ?, skill_id = ?, skill_version = ?, "
+                        + "skill_hash = ?, capability_id = ?, capability_version = ?, capability_hash = ?, status = 'ADOPTED', updated_at = ? "
+                        + "where id = ? and status = 'ADOPTING'",
+                agent.id(), agent.version(), agent.contentHash(), skill.id(), skill.version(), skill.contentHash(), capability.id(),
+                capability.version(), capability.contentHash(), Timestamp.from(Instant.now(clock)), adoption.id());
+        return promptAdoptionByCandidate(actor.tenantId(), workspaceId, candidate.id(), candidate.revision());
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public CandidateService.PromptAdoption getPromptAdoption(ActorContext actor, UUID workspaceId, UUID candidateId) {
+        requireActor(actor, workspaceId, "learning:read");
+        var candidate = load(actor.tenantId(), workspaceId, candidateId);
+        if (!candidate.ownerId().equals(actor.actorId()) || !"PROMPT_UPDATE".equals(candidate.targetType()))
+            throw EafException.notFound();
+        return promptAdoptionByCandidate(actor.tenantId(), workspaceId, candidate.id(), candidate.revision());
+    }
+
     /** 每 tick 只读取一个已登记生成 Task；不等待模型，Task 的租约仍由 Task/Runtime Owner 管理。 */
     @Scheduled(fixedDelayString = "${eaf.learning.improvement.poll-delay-ms:1000}")
     public void dispatchNextImprovementGeneration() {
@@ -406,6 +647,104 @@ public class JdbcCandidateService implements CandidateService {
         }
     }
 
+    @Scheduled(fixedDelayString = "${eaf.learning.prompt-improvement-poll-delay-ms:1000}")
+    public void dispatchNextPromptImprovementEvaluation() {
+        try {
+            transactions.executeWithoutResult(status -> {
+                var run = jdbc.query("select id, tenant_id, workspace_id, owner_id, target_id, base_hash, candidate_id, candidate_revision, "
+                                + "dev_report_id, held_out_report_id, status, deadline_at from learning.prompt_improvement_run "
+                                + "where status in ('DEV_EVALUATING','HELD_OUT_EVALUATING') and next_poll_at <= now() "
+                                + "order by next_poll_at, created_at for update skip locked limit 1",
+                        rs -> rs.next() ? new PromptRunPoll(rs.getObject("id", UUID.class), rs.getObject("tenant_id", UUID.class),
+                                rs.getObject("workspace_id", UUID.class), rs.getObject("owner_id", UUID.class),
+                                rs.getObject("target_id", UUID.class), rs.getString("base_hash"), rs.getObject("candidate_id", UUID.class),
+                                rs.getInt("candidate_revision"), rs.getObject("dev_report_id", UUID.class),
+                                rs.getObject("held_out_report_id", UUID.class), rs.getString("status"),
+                                rs.getTimestamp("deadline_at").toInstant()) : null);
+                if (run != null) advancePromptImprovementEvaluation(run);
+            });
+        } catch (RuntimeException ignored) {
+            // 同一 report ID 在后续 tick 对账，不重建候选或评测运行。
+        }
+    }
+
+    private void advancePromptImprovementEvaluation(PromptRunPoll run) {
+        var owner = internalHuman(run.tenantId(), run.ownerId(), run.workspaceId());
+        if (!run.deadlineAt().isAfter(Instant.now(clock))) {
+            stopPromptReports(owner, run);
+            updatePromptRun(run.id(), run.status(), "TIMED_OUT", "DEADLINE_EXCEEDED");
+            return;
+        }
+        try {
+            promptOwners.requireEvaluationCandidate(owner, run.workspaceId(), run.candidateId(), run.candidateRevision());
+            if ("DEV_EVALUATING".equals(run.status())) {
+                if (run.devReportId() == null) throw EafException.conflict("DEV_REPORT_MISSING", "Prompt DEV 报告 ID 缺失。");
+                var dev = promptEvaluations.get(owner, run.workspaceId(), run.devReportId());
+                if (!terminalPreparation(dev.status())) { deferPromptRun(run.id()); return; }
+                if (!completePromptReport(dev)) {
+                    updatePromptRun(run.id(), run.status(), "NOT_SELECTED", "DEV_EVALUATION_FAILED"); return;
+                }
+                var heldOut = promptEvaluations.start(owner, run.workspaceId(), run.targetId(), run.candidateId(),
+                        run.candidateRevision(), "HELD_OUT", run.deadlineAt(), "p31:" + run.id() + ":HELD_OUT");
+                jdbc.update("update learning.prompt_improvement_run set status = 'HELD_OUT_EVALUATING', held_out_report_id = ?, "
+                                + "row_version = row_version + 1, next_poll_at = now(), updated_at = now() "
+                                + "where id = ? and status = 'DEV_EVALUATING' and dev_report_id = ?",
+                        heldOut.reportId(), run.id(), run.devReportId());
+                return;
+            }
+            if (run.heldOutReportId() == null) throw EafException.conflict("HELD_OUT_REPORT_MISSING", "Prompt HELD_OUT 报告 ID 缺失。");
+            var heldOut = promptEvaluations.get(owner, run.workspaceId(), run.heldOutReportId());
+            if (!terminalPreparation(heldOut.status())) { deferPromptRun(run.id()); return; }
+            if (!completePromptReport(heldOut)) {
+                updatePromptRun(run.id(), run.status(), "NOT_SELECTED", "HELD_OUT_EVALUATION_FAILED"); return;
+            }
+            var evidence = promptEvaluations.releaseEvidence(owner, run.workspaceId(), run.candidateId(),
+                    run.candidateRevision(), run.devReportId(), run.heldOutReportId());
+            updatePromptRun(run.id(), run.status(), "ELIGIBLE".equals(evidence.eligibility()) ? "READY" : "NOT_SELECTED",
+                    evidence.reasonCode());
+        } catch (EafException failure) {
+            stopPromptReports(owner, run);
+            var terminal = failure.status() == 403 || failure.status() == 404 || failure.status() == 409 ? "STALE" : "FAILED";
+            updatePromptRun(run.id(), run.status(), terminal, failure.code());
+        }
+    }
+
+    private boolean completePromptReport(PromptEvaluationRun report) {
+        return "COMPLETED".equals(report.status()) && report.plannedSamples() > 0
+                && report.completedSamples() == report.plannedSamples() && report.failedSamples() == 0 && report.notRunSamples() == 0;
+    }
+
+    private void stopPromptReports(ActorContext owner, PromptRunPoll run) {
+        for (var reportId : java.util.Arrays.stream(new UUID[]{run.devReportId(), run.heldOutReportId()})
+                .filter(java.util.Objects::nonNull).toList()) {
+            try { promptEvaluations.stop(owner, run.workspaceId(), reportId); } catch (RuntimeException ignored) { }
+        }
+    }
+
+    private void deferPromptRun(UUID runId) {
+        jdbc.update("update learning.prompt_improvement_run set next_poll_at = now() + interval '3 seconds', updated_at = now() "
+                + "where id = ? and status in ('DEV_EVALUATING','HELD_OUT_EVALUATING')", runId);
+    }
+
+    private void updatePromptRun(UUID runId, String expected, String next, String reason) {
+        jdbc.update("update learning.prompt_improvement_run set status = ?, reason_code = ?, row_version = row_version + 1, "
+                        + "next_poll_at = now() + interval '1 day', updated_at = now() where id = ? and status = ?",
+                next, reason == null ? next : reason.substring(0, Math.min(80, reason.length())), runId, expected);
+    }
+
+    private PromptRunPoll promptRunByCandidate(UUID tenantId, UUID workspaceId, UUID candidateId, int revision) {
+        return jdbc.query("select id, tenant_id, workspace_id, owner_id, target_id, base_hash, candidate_id, candidate_revision, "
+                        + "dev_report_id, held_out_report_id, status, deadline_at from learning.prompt_improvement_run "
+                        + "where tenant_id = ? and workspace_id = ? and candidate_id = ? and candidate_revision = ?",
+                rs -> rs.next() ? new PromptRunPoll(rs.getObject("id", UUID.class), rs.getObject("tenant_id", UUID.class),
+                        rs.getObject("workspace_id", UUID.class), rs.getObject("owner_id", UUID.class),
+                        rs.getObject("target_id", UUID.class), rs.getString("base_hash"), rs.getObject("candidate_id", UUID.class),
+                        rs.getInt("candidate_revision"), rs.getObject("dev_report_id", UUID.class),
+                        rs.getObject("held_out_report_id", UUID.class), rs.getString("status"),
+                        rs.getTimestamp("deadline_at").toInstant()) : null,
+                tenantId, workspaceId, candidateId, revision);
+    }
+
     private void advanceImprovementEvaluation(ImprovementEvaluationPoll run) {
         var owner = internalHuman(run.tenantId(), run.ownerId(), run.workspaceId());
         var now = Instant.now(clock);
@@ -434,9 +773,10 @@ public class JdbcCandidateService implements CandidateService {
                         || report.completedPairs() != report.plannedPairs()) {
                     closeImprovementRun(run.id(), "NOT_SELECTED", "DEV_EVALUATION_FAILED"); return;
                 }
-                var snapshotId = teamCandidateSnapshotId(owner, run.workspaceId(), get(owner, run.workspaceId(), run.candidateId()));
+                var snapshot = requireTeamPreparationSnapshot(owner, run.workspaceId(), run.candidateId(),
+                        run.candidateRevision());
                 var heldOut = evaluations.startTeamPreparationEvaluation(owner, run.workspaceId(), run.candidateId(),
-                        run.candidateRevision(), snapshotId, run.id(), run.qualityRunId(), "HELD_OUT", run.deadlineAt());
+                        run.candidateRevision(), snapshot.id(), run.id(), run.qualityRunId(), "HELD_OUT", run.deadlineAt());
                 jdbc.update("update learning.improvement_run set status = 'HELD_OUT_EVALUATING', held_out_report_id = ?, "
                                 + "row_version = row_version + 1, next_poll_at = now(), updated_at = now() "
                                 + "where id = ? and status = 'DEV_EVALUATING' and dev_report_id = ?",
@@ -735,17 +1075,34 @@ public class JdbcCandidateService implements CandidateService {
                 if (binding == null || binding.qualityRunId() == null)
                     throw EafException.conflict("IMPROVEMENT_RUN_CHANGED", "候选已失去对应运行绑定。");
                 var owner = internalHuman(current.tenantId(), current.ownerId(), command.workspaceId());
-                evaluations.captureCandidateContext(teamCandidateContextCommand(owner, command.workspaceId(), current));
+                var snapshot = evaluations.captureCandidateContext(
+                        teamCandidateContextCommand(owner, command.workspaceId(), current));
                 var report = evaluations.startTeamPreparationEvaluation(owner, command.workspaceId(),
-                        current.id(), current.revision(), teamCandidateSnapshotId(owner, command.workspaceId(), current),
+                        current.id(), current.revision(), snapshot.id(),
                         binding.improvementRunId(), binding.qualityRunId(), "DEV", binding.deadlineAt());
                 jdbc.update("update learning.improvement_run set status = 'DEV_EVALUATING', dev_report_id = ?, "
                                 + "row_version = row_version + 1, next_poll_at = now(), updated_at = now() "
                                 + "where id = ? and status = 'AWAITING_REVIEW'",
                         report.reportId(), binding.improvementRunId());
+            } else if ("PROMPT_UPDATE".equals(current.targetType())) {
+                var binding = promptRunByCandidate(command.actor().tenantId(), command.workspaceId(), current.id(), current.revision());
+                if (binding == null || !"AWAITING_REVIEW".equals(binding.status())
+                        || !binding.ownerId().equals(current.ownerId()) || !binding.baseHash().equals(current.baseVersion()))
+                    throw EafException.conflict("PROMPT_RUN_CHANGED", "候选已失去当前 Prompt 改进运行绑定。");
+                var owner = internalHuman(current.tenantId(), current.ownerId(), command.workspaceId());
+                var report = promptEvaluations.start(owner, command.workspaceId(), current.targetId(), current.id(),
+                        current.revision(), "DEV", binding.deadlineAt(), "p31:" + binding.id() + ":DEV");
+                jdbc.update("update learning.prompt_improvement_run set status = 'DEV_EVALUATING', dev_report_id = ?, "
+                                + "row_version = row_version + 1, next_poll_at = now(), updated_at = now() "
+                                + "where id = ? and status = 'AWAITING_REVIEW'",
+                        report.reportId(), binding.id());
             } else evaluations.captureCandidateContext(candidateContextCommand(command.actor(), command.workspaceId(), current));
         } else if ("TEAM_EXPERIENCE_UPDATE".equals(current.targetType())) {
             jdbc.update("update learning.improvement_run set status = 'REJECTED', stop_reason = 'FACT_REVIEW_REJECTED', "
+                            + "row_version = row_version + 1, updated_at = now() where candidate_id = ? and status = 'AWAITING_REVIEW'",
+                    current.id());
+        } else if ("PROMPT_UPDATE".equals(current.targetType())) {
+            jdbc.update("update learning.prompt_improvement_run set status = 'REJECTED', reason_code = 'FACT_REVIEW_REJECTED', "
                             + "row_version = row_version + 1, updated_at = now() where candidate_id = ? and status = 'AWAITING_REVIEW'",
                     current.id());
         }
@@ -775,8 +1132,8 @@ public class JdbcCandidateService implements CandidateService {
         var approvalId = UUID.randomUUID();
         var now = Instant.now(clock);
         UUID reportId = null;
-        String reportKind = "TEAM_EXPERIENCE_UPDATE".equals(current.targetType())
-                ? "TEAM_PREPARATION_HELD_OUT" : "LEGACY_CANDIDATE_RISK";
+        String reportKind = "TEAM_EXPERIENCE_UPDATE".equals(current.targetType()) ? "TEAM_PREPARATION_HELD_OUT"
+                : "PROMPT_UPDATE".equals(current.targetType()) ? "PROMPT_ANALYSIS_HELD_OUT" : "LEGACY_CANDIDATE_RISK";
         String reportJson = null, reportHash = null, reportConfigHash = null, datasetHash = null;
         String summaryJson = null;
         Instant validUntil = null;
@@ -803,6 +1160,24 @@ public class JdbcCandidateService implements CandidateService {
                 datasetHash = evidence.datasetHash();
                 summary.put("status", evidence.eligibility());
                 summary.set("teamPreparationEvidence", json.valueToTree(evidence));
+            } else if ("PROMPT_UPDATE".equals(current.targetType())) {
+                var run = promptRunByCandidate(command.actor().tenantId(), command.workspaceId(), current.id(), current.revision());
+                if (run == null || !"READY".equals(run.status()) || run.devReportId() == null || run.heldOutReportId() == null)
+                    throw EafException.conflict("PROMPT_EVALUATION_NOT_READY", "Prompt 候选尚未完成 DEV/HELD_OUT 对照。");
+                var owner = internalHuman(current.tenantId(), current.ownerId(), command.workspaceId());
+                var evidence = promptEvaluations.releaseEvidence(owner, command.workspaceId(), current.id(),
+                        current.revision(), run.devReportId(), run.heldOutReportId());
+                if (!command.evaluationReportId().equals(evidence.reportId())
+                        || !"PROMPT_ANALYSIS_HELD_OUT".equals(evidence.reportKind())
+                        || !current.id().equals(evidence.candidateId()) || evidence.candidateRevision() != current.revision()
+                        || !current.targetId().equals(evidence.targetId()) || !current.baseVersion().equals(evidence.baseHash())
+                        || !"ELIGIBLE".equals(evidence.eligibility()) || !evidence.current())
+                    throw EafException.conflict("PROMPT_EVALUATION_NOT_ELIGIBLE", "只有当前、可比且 DEV/HELD_OUT 均改善的 Prompt 证据可以批准。");
+                requireCurrentTarget(owner, command.workspaceId(), current);
+                reportId = evidence.reportId(); reportKind = evidence.reportKind(); reportHash = evidence.reportHash();
+                reportConfigHash = evidence.configurationHash(); datasetHash = evidence.datasetHash();
+                summary.put("status", evidence.eligibility());
+                summary.set("promptAnalysisEvidence", json.valueToTree(evidence));
             } else {
                 var report = evaluations.getCandidateEvaluation(command.actor(), command.workspaceId(), command.evaluationReportId());
                 if (!"PASSED".equals(report.status()) || !report.candidateId().equals(current.id())
@@ -943,7 +1318,7 @@ public class JdbcCandidateService implements CandidateService {
                                                                          UUID candidateId, UUID followupTaskId) {
         requireActor(actor, workspaceId, "learning:read");
         var candidate = get(actor, workspaceId, candidateId);
-        if (candidate.sourceFeedbackId() == null)
+        if (candidate.sourceFeedbackId() == null && !"PROMPT_UPDATE".equals(candidate.targetType()))
             throw EafException.conflict("ITERATION_SOURCE_MISSING", "后续使用证据必须关联原始反馈。" );
         var release = releaseByCandidate(actor.tenantId(), workspaceId, candidate.id(), candidate.revision())
                 .filter(item -> "RELEASED".equals(item.status()))
@@ -961,36 +1336,69 @@ public class JdbcCandidateService implements CandidateService {
                     .path("teamPreparationEvidence").path("candidateId").asText())
                     && candidate.revision() == approval.evaluationSummary().path("teamPreparationEvidence")
                     .path("candidateRevision").asInt()
-                : "PASSED".equals(approval.evaluationSummary().path("status").asText()));
+                : "PROMPT_UPDATE".equals(candidate.targetType())
+                    ? "ELIGIBLE".equals(approval.evaluationSummary().path("status").asText())
+                        && "PROMPT_ANALYSIS_HELD_OUT".equals(approval.evaluationReportKind())
+                        && approval.evaluationReportId() != null
+                        && approval.evaluationReportId().toString().equals(approval.evaluationSummary()
+                            .path("promptAnalysisEvidence").path("reportId").asText())
+                    : "PASSED".equals(approval.evaluationSummary().path("status").asText()));
         if (approval == null || !"APPROVED".equals(approval.decision()) || approval.evaluationReportId() == null
                 || !approvedEvidence)
             throw EafException.conflict("ITERATION_EVALUATION_MISSING", "发布缺少通过的离线评测证据。" );
 
-        var sourceTaskId = jdbc.query("select task_id from learning.feedback where id = ? and tenant_id = ? and workspace_id = ?",
-                rs -> rs.next() ? rs.getObject("task_id", UUID.class) : null,
-                candidate.sourceFeedbackId(), actor.tenantId(), workspaceId);
-        if (sourceTaskId == null) throw EafException.conflict("ITERATION_SOURCE_MISSING", "原始反馈来源已不可用。" );
-        var sourceTask = tasks.get(actor, workspaceId, sourceTaskId);
+        var sourceTaskId = candidate.sourceFeedbackId() == null ? null
+                : jdbc.query("select task_id from learning.feedback where id = ? and tenant_id = ? and workspace_id = ?",
+                    rs -> rs.next() ? rs.getObject("task_id", UUID.class) : null,
+                    candidate.sourceFeedbackId(), actor.tenantId(), workspaceId);
+        if (candidate.sourceFeedbackId() != null && sourceTaskId == null)
+            throw EafException.conflict("ITERATION_SOURCE_MISSING", "原始反馈来源已不可用。" );
+        var sourceTask = sourceTaskId == null ? null : tasks.get(actor, workspaceId, sourceTaskId);
         var followupTask = tasks.get(actor, workspaceId, followupTaskId);
         if (!"USER".equals(followupTask.source()) || !terminal(followupTask.status()))
             throw EafException.forbidden("后续使用证据只接受终态 USER Task。" );
-        if (followupTask.id().equals(sourceTask.id()) || !differentInput(sourceTask, followupTask))
+        if (sourceTask != null && (followupTask.id().equals(sourceTask.id()) || !differentInput(sourceTask, followupTask)))
             throw EafException.invalid("后续 Task 必须使用不同于原反馈任务的新输入。" );
-        if (followupTask.createdAt().isBefore(release.updatedAt()))
+        var adoption = "PROMPT_UPDATE".equals(candidate.targetType())
+                ? promptAdoptionByCandidate(actor.tenantId(), workspaceId, candidate.id(), candidate.revision()) : null;
+        if ("PROMPT_UPDATE".equals(candidate.targetType())) {
+            if (adoption == null || !"ADOPTED".equals(adoption.status()) || capabilities == null)
+                throw EafException.conflict("PROMPT_ADOPTION_REQUIRED", "Prompt 变体必须先由 Owner 显式采用。" );
+            if (followupTask.createdAt().isBefore(adoption.createdAt()))
+                throw EafException.conflict("ITERATION_TASK_PRECEDES_ADOPTION", "后续 Task 必须在显式采用后创建。" );
+            var binding = followupTask.assetBinding();
+            if (!followupTask.agentId().equals(adoption.agentId()) || !adoption.agentVersion().equals(followupTask.agentVersion())
+                    || !adoption.promptVersion().equals(followupTask.promptVersion()) || binding == null
+                    || !adoption.capabilityId().equals(binding.capabilityId())
+                    || !adoption.capabilityVersion().equals(binding.capabilityVersion())
+                    || !adoption.capabilityHash().equals(binding.capabilityHash())
+                    || !adoption.skillId().equals(binding.skillId()) || !adoption.skillVersion().equals(binding.skillVersion())
+                    || !adoption.skillHash().equals(binding.skillHash()))
+                throw EafException.conflict("PROMPT_VARIANT_TASK_MISMATCH", "后续 Task 未绑定已采用的只读 Agent、Skill 和 Capability。" );
+            var capability = capabilities.requirePublished(actor, workspaceId, adoption.capabilityId(), adoption.capabilityVersion());
+            if (!capability.contentHash().equals(adoption.capabilityHash())
+                    || !capability.skillContentHash().equals(adoption.skillHash())
+                    || !capability.promptId().equals(adoption.promptId())
+                    || !capability.promptVersion().equals(adoption.promptVersion())
+                    || !capabilities.isPromptAnalysisVariant(actor, workspaceId, adoption.capabilityId(), adoption.capabilityVersion()))
+                throw EafException.conflict("PROMPT_VARIANT_STALE", "已采用的 Prompt 变体当前不可用。" );
+        } else if (followupTask.createdAt().isBefore(release.updatedAt()))
             throw EafException.conflict("ITERATION_TASK_PRECEDES_RELEASE", "后续 Task 必须在目标版本发布后创建。" );
 
-        var sources = runtime.contextSources(actor, workspaceId, followupTask.id());
-        var targetSource = sources.stream().filter(source -> matchesReleasedSource(actor, workspaceId, source, release))
-                .findFirst().orElse(null);
+        var sources = "PROMPT_UPDATE".equals(candidate.targetType()) ? List.<ContextSourceRef>of()
+                : runtime.contextSources(actor, workspaceId, followupTask.id());
+        var targetSource = "PROMPT_UPDATE".equals(candidate.targetType()) ? null : sources.stream()
+                .filter(source -> matchesReleasedSource(actor, workspaceId, source, release)).findFirst().orElse(null);
         var reportedRisk = reportedRisk(followupTask);
         var citations = citations(followupTask);
         var usageStatus = followupTask.status() != io.eaf.task.api.TaskStatus.SUCCEEDED ? "TASK_NOT_SUCCEEDED"
+                : "PROMPT_UPDATE".equals(candidate.targetType()) ? "VARIANT_USED"
                 : targetSource == null ? "NOT_AVAILABLE"
                 : citations.contains(targetSource.citationId()) ? "CITED" : "AVAILABLE_NOT_CITED";
         var inputHash = Hashing.sha256(normalizeInput(followupTask.inputText()));
         var resultHash = followupTask.resultJson() == null ? null : Hashing.sha256(followupTask.resultJson());
         var requestHash = Hashing.sha256(writeJson(new IterationRequest(candidate.id(), candidate.revision(),
-                candidate.sourceFeedbackId(), sourceTask.id(), approval.evaluationReportId(), approval.id(), release.id(),
+                candidate.sourceFeedbackId(), sourceTaskId, approval.evaluationReportId(), approval.id(), release.id(),
                 release.targetReleaseId(), release.targetType(), release.targetId(), release.targetVersion(),
                 followupTask.id(), followupTask.attempt(), followupTask.status().name(), usageStatus, targetSource,
                 inputHash, resultHash, reportedRisk, followupTask.createdAt())));
@@ -1011,7 +1419,7 @@ public class JdbcCandidateService implements CandidateService {
                         + "target_source, input_hash, result_hash, reported_risk_level, fact_outcome, request_hash, task_created_at, recorded_at) "
                         + "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, 'UNVERIFIED', ?, ?, ?)",
                 id, actor.tenantId(), workspaceId, candidate.id(), candidate.revision(), candidate.sourceFeedbackId(),
-                sourceTask.id(), approval.evaluationReportId(), approval.id(), release.id(), release.targetReleaseId(),
+                sourceTaskId, approval.evaluationReportId(), approval.id(), release.id(), release.targetReleaseId(),
                 release.targetType(), release.targetId(), release.targetVersion(), followupTask.id(), followupTask.attempt(),
                 followupTask.status().name(), usageStatus, targetSource == null ? null : writeJson(targetSource), inputHash,
                 resultHash, reportedRisk, requestHash, Timestamp.from(followupTask.createdAt()), now);
@@ -1200,6 +1608,18 @@ public class JdbcCandidateService implements CandidateService {
                 throw EafException.conflict("TARGET_ALREADY_WITHDRAWN", "TEAM 候选版本已不可用。");
             return new WithdrawalTargetSnapshot(candidate.targetId(), release.targetVersion(), memory.rowVersion());
         }
+        if ("PROMPT_UPDATE".equals(candidate.targetType())) {
+            var origin = promptOwners.findReleaseByOrigin(actor, workspaceId, candidate.id(), candidate.revision())
+                    .filter(item -> "RELEASED".equals(item.status()))
+                    .orElseThrow(() -> EafException.conflict("RELEASE_MISMATCH", "Prompt Owner 发布回执不存在。"));
+            var target = promptOwners.getTarget(actor, workspaceId, candidate.targetId());
+            if (!origin.id().equals(release.targetReleaseId()) || !origin.targetId().equals(candidate.targetId())
+                    || !origin.promptVersion().equals(release.targetVersion())
+                    || !origin.contentHash().equals(release.targetContentHash())
+                    || !candidate.ownerId().equals(target.ownerId()) || !"PUBLISHED".equals(target.status()))
+                throw EafException.conflict("RELEASE_MISMATCH", "Prompt 发布回执与当前 Owner 目标不匹配。");
+            return new WithdrawalTargetSnapshot(candidate.targetId(), release.targetVersion(), target.rowVersion());
+        }
         var origin = memories.findReleaseByOrigin(actor, workspaceId, candidate.id(), candidate.revision());
         if (!"PUBLISHED".equals(origin.action()) || !origin.releaseId().equals(release.targetReleaseId())
                 || !origin.contentHash().equals(release.targetContentHash()))
@@ -1271,6 +1691,15 @@ public class JdbcCandidateService implements CandidateService {
                 return new TargetWithdrawalReceipt(teamWithdrawalReceiptId(candidate.id(), job.candidateRevision()),
                         job.targetVersion(), memory.contentHash());
             }
+            if ("PROMPT_UPDATE".equals(job.targetType())) {
+                var event = promptOwners.findWithdrawalByOrigin(actor, workspaceId, candidate.id(), job.candidateRevision()).orElse(null);
+                if (event == null) return null;
+                if (!"REVOKED".equals(event.status()) || !candidate.targetId().equals(event.promptId())
+                        || !job.targetVersion().equals(event.promptVersion())
+                        || !event.contentHash().equals(jobTargetHash(job)))
+                    throw EafException.conflict("WITHDRAWAL_MISMATCH", "Prompt 撤回事实与候选版本不匹配。");
+                return new TargetWithdrawalReceipt(event.id(), event.promptVersion(), event.contentHash());
+            }
             var release = memories.findWithdrawalByOrigin(actor, workspaceId, candidate.id(), job.candidateRevision());
             if (!"REVOKED".equals(release.action()) || !job.targetId().equals(release.memoryId())
                     || !job.targetVersion().equals(release.memoryVersion())
@@ -1308,6 +1737,11 @@ public class JdbcCandidateService implements CandidateService {
             return new TargetWithdrawalReceipt(teamWithdrawalReceiptId(candidate.id(), candidate.revision()),
                     event.memoryVersion(), memory.contentHash());
         }
+        if ("PROMPT_UPDATE".equals(candidate.targetType())) {
+            var event = promptOwners.revokeAnalysisCandidate(new PromptOwnerService.RevokeAnalysisCandidate(
+                    actor, workspaceId, candidate.id(), candidate.revision()));
+            return new TargetWithdrawalReceipt(event.id(), event.promptVersion(), event.contentHash());
+        }
         var release = memories.revokeCandidate(actor, workspaceId, job.targetId(), job.targetVersion(),
                 jobExpectedVersion(job), candidate.id(), job.candidateRevision());
         return new TargetWithdrawalReceipt(release.releaseId(), release.memoryVersion(), release.contentHash());
@@ -1323,6 +1757,9 @@ public class JdbcCandidateService implements CandidateService {
             workspaces.require(actor, workspaceId, "knowledge:read");
             workspaces.require(actor, workspaceId, "knowledge:write");
             workspaces.require(actor, workspaceId, "knowledge:publish");
+        } else if ("PROMPT_UPDATE".equals(candidate.targetType())) {
+            workspaces.require(actor, workspaceId, "prompt:read");
+            workspaces.require(actor, workspaceId, "prompt:publish");
         } else {
             workspaces.require(actor, workspaceId, "memory:read");
             workspaces.require(actor, workspaceId, "memory:write");
@@ -1346,10 +1783,25 @@ public class JdbcCandidateService implements CandidateService {
 
     private CandidateWithdrawal finishWithdrawal(ActorContext actor, UUID workspaceId, CandidateWithdrawal job,
                                                  TargetWithdrawalReceipt receipt) {
+        if ("PROMPT_UPDATE".equals(job.targetType())) {
+            var adoption = promptAdoptionByCandidate(actor.tenantId(), workspaceId, job.candidateId(), job.candidateRevision());
+            if (adoption != null && "ADOPTED".equals(adoption.status())) {
+                capabilities.revokePromptAnalysisVariant(actor, workspaceId, job.candidateId(), job.candidateRevision(), adoption.id());
+                skills.revokePromptAnalysisVariant(actor, workspaceId, job.candidateId(), job.candidateRevision(), adoption.id());
+                agentOwners.revokePromptAnalysisVariant(actor, workspaceId, job.candidateId(), job.candidateRevision(), adoption.id());
+            }
+        }
         var result = transactions.execute(status -> {
             jdbc.update("update learning.candidate_withdrawal set status = 'WITHDRAWN', target_withdrawal_id = ?, "
                             + "failure_code = null, updated_at = ? where id = ? and status = 'WITHDRAWING'",
                     receipt.withdrawalId(), Timestamp.from(Instant.now(clock)), job.id());
+            if ("PROMPT_UPDATE".equals(job.targetType()))
+                jdbc.update("update learning.prompt_improvement_run set status = 'WITHDRAWN', row_version = row_version + 1, "
+                                + "updated_at = now() where candidate_id = ? and candidate_revision = ? and status = 'PUBLISHED'",
+                        job.candidateId(), job.candidateRevision());
+            if ("PROMPT_UPDATE".equals(job.targetType()))
+                jdbc.update("update learning.prompt_adoption set status = 'WITHDRAWN', updated_at = now() where candidate_id = ? "
+                                + "and candidate_revision = ? and status = 'ADOPTED'", job.candidateId(), job.candidateRevision());
             return withdrawalById(actor.tenantId(), workspaceId, job.id()).orElseThrow(EafException::notFound);
         });
         return result == null ? withdrawalById(actor.tenantId(), workspaceId, job.id()).orElseThrow(EafException::notFound) : result;
@@ -1392,6 +1844,9 @@ public class JdbcCandidateService implements CandidateService {
             workspaces.require(actor, command.workspaceId(), "knowledge:write");
             workspaces.require(actor, command.workspaceId(), "knowledge:publish");
             workspaces.require(actor, command.workspaceId(), "knowledge:read");
+        } else if ("PROMPT_UPDATE".equals(candidate.targetType())) {
+            workspaces.require(actor, command.workspaceId(), "prompt:read");
+            workspaces.require(actor, command.workspaceId(), "prompt:publish");
         } else {
             workspaces.require(actor, command.workspaceId(), "memory:write");
             workspaces.require(actor, command.workspaceId(), "memory:publish");
@@ -1443,6 +1898,27 @@ public class JdbcCandidateService implements CandidateService {
                     || !approval.evaluationConfigurationHash().equals(evidence.configurationHash())
                     || !approval.datasetHash().equals(evidence.datasetHash()))
                 throw EafException.conflict("TEAM_APPROVAL_EVIDENCE_STALE", "TEAM 批准绑定的报告、数据集或人工语义复核已失效。");
+        } else if ("PROMPT_UPDATE".equals(candidate.targetType())) {
+            var run = promptRunByCandidate(actor.tenantId(), workspaceId, candidate.id(), candidate.revision());
+            if (run == null || !List.of("READY", "PUBLISHED").contains(run.status())
+                    || !"PROMPT_ANALYSIS_HELD_OUT".equals(approval.evaluationReportKind()))
+                throw EafException.conflict("PROMPT_APPROVAL_EVIDENCE_MISMATCH", "Prompt 发布必须绑定当前专用 HELD_OUT 报告。");
+            if (job != null && "RELEASED".equals(job.status())) {
+                if (!job.approvalId().equals(approval.id()) || !job.candidateId().equals(candidate.id())
+                        || job.candidateRevision() != candidate.revision() || !job.targetId().equals(candidate.targetId())
+                        || !job.baseVersion().equals(candidate.baseVersion())
+                        || !approval.evaluationReportId().equals(run.heldOutReportId()))
+                    throw EafException.conflict("PROMPT_RELEASE_MISMATCH", "已发布 Prompt 回执与批准快照不匹配。");
+            } else {
+                var evidence = promptEvaluations.releaseEvidence(actor, workspaceId, candidate.id(), candidate.revision(),
+                        run.devReportId(), run.heldOutReportId());
+                if (!evidence.current() || !"ELIGIBLE".equals(evidence.eligibility())
+                        || !approval.evaluationReportId().equals(evidence.reportId())
+                        || !approval.evaluationReportHash().equals(evidence.reportHash())
+                        || !approval.evaluationConfigurationHash().equals(evidence.configurationHash())
+                        || !approval.datasetHash().equals(evidence.datasetHash()))
+                    throw EafException.conflict("PROMPT_APPROVAL_EVIDENCE_STALE", "Prompt 批准所绑定的模板或报告已失效。");
+            }
         } else if (!"LEGACY_CANDIDATE_RISK".equals(approval.evaluationReportKind())) {
             throw EafException.conflict("CANDIDATE_EVALUATION_KIND_MISMATCH", "该候选目标不能使用 TEAM 专用评测证据。");
         }
@@ -1470,6 +1946,15 @@ public class JdbcCandidateService implements CandidateService {
         }
         if ("TEAM_EXPERIENCE_UPDATE".equals(candidate.targetType()))
             return findTeamTargetReceipt(actor, workspaceId, candidate);
+        if ("PROMPT_UPDATE".equals(candidate.targetType())) {
+            var release = promptOwners.findReleaseByOrigin(actor, workspaceId, candidate.id(), candidate.revision()).orElse(null);
+            if (release == null) return null;
+            if (!"RELEASED".equals(release.status()) || !candidate.targetId().equals(release.targetId())
+                    || !candidate.id().equals(release.candidateId()) || candidate.revision() != release.candidateRevision()
+                    || !release.promptId().equals(candidate.targetId()) || !"1.0.0".equals(release.promptVersion()))
+                throw EafException.conflict("RELEASE_MISMATCH", "Prompt Owner 发布回执与候选快照不匹配。");
+            return new TargetReceipt(release.id(), release.promptVersion(), release.contentHash(), release.promptId());
+        }
         MemoryRelease release;
         try { release = memories.findReleaseByOrigin(actor, workspaceId, candidate.id(), candidate.revision()); }
         catch (EafException missing) { if (missing.status() == 404) return null; throw missing; }
@@ -1564,6 +2049,16 @@ public class JdbcCandidateService implements CandidateService {
             return new TargetReceipt(teamReleaseReceiptId(candidate.id(), candidate.revision()),
                     receipt.memoryVersion(), memory.contentHash(), receipt.cardId());
         }
+        if ("PROMPT_UPDATE".equals(candidate.targetType())) {
+            var target = promptOwners.getTarget(actor, workspaceId, candidate.targetId());
+            var approval = candidate.approvals().stream().filter(item -> item.candidateRevision() == candidate.revision()
+                    && "APPROVED".equals(item.decision())).reduce((first, second) -> second).orElseThrow(EafException::notFound);
+            var reportHash = approval.evaluationReportHash();
+            var release = promptOwners.publishAnalysisCandidate(new PromptOwnerService.PublishAnalysisCandidate(actor,
+                    workspaceId, candidate.targetId(), target.rowVersion(), candidate.id(), candidate.revision(),
+                    approval.id(), approval.evaluationReportId(), reportHash));
+            return new TargetReceipt(release.id(), release.promptVersion(), release.contentHash(), release.promptId());
+        }
         workspaces.require(actor, workspaceId, "memory:write");
         workspaces.require(actor, workspaceId, "memory:publish");
         var release = memories.publishCandidate(new MemoryCandidateReleaseCommand(actor, workspaceId, candidate.id(),
@@ -1613,6 +2108,10 @@ public class JdbcCandidateService implements CandidateService {
                                 + "updated_at = now(), next_poll_at = now() where candidate_id = ? and candidate_revision = ? "
                                 + "and status in ('READY','APPROVED','PUBLISHING')",
                         job.candidateId(), job.candidateRevision());
+            if (changed == 1 && "PROMPT_UPDATE".equals(job.targetType()))
+                jdbc.update("update learning.prompt_improvement_run set status = 'PUBLISHED', row_version = row_version + 1, "
+                                + "updated_at = now(), next_poll_at = now() where candidate_id = ? and candidate_revision = ? and status = 'READY'",
+                        job.candidateId(), job.candidateRevision());
             return releaseById(job.tenantId(), job.workspaceId(), job.id()).orElseThrow(EafException::notFound);
         });
         return result == null ? releaseById(job.tenantId(), job.workspaceId(), job.id()).orElseThrow(EafException::notFound) : result;
@@ -1653,6 +2152,14 @@ public class JdbcCandidateService implements CandidateService {
                 var memory = memories.requireUsable(actor, workspaceId, candidate.targetId(), candidate.baseVersion());
                 if (!"PUBLISHED".equals(memory.status()) || !"TEAM".equals(memory.scope()))
                     throw EafException.conflict("TARGET_BASE_CHANGED", "TEAM 基线不再是有效发布版本。");
+            } else if ("PROMPT_UPDATE".equals(candidate.targetType())) {
+                var target = promptOwners.getTarget(actor, workspaceId, candidate.targetId());
+                if (!candidate.ownerId().equals(target.ownerId()) || !candidate.baseVersion().equals(target.baseHash())
+                        || !"STAGED".equals(target.status()))
+                    throw EafException.conflict("TARGET_BASE_CHANGED", "Prompt 目标或固定基线已变化。");
+                var staged = promptOwners.requireEvaluationCandidate(actor, workspaceId, candidate.id(), candidate.revision());
+                if (!staged.targetId().equals(candidate.targetId()) || !staged.baseHash().equals(candidate.baseVersion()))
+                    throw EafException.conflict("TARGET_BASE_CHANGED", "Prompt 候选修订已变化。");
             } else if (candidate.targetId() != null) {
                 var memory = memories.requireUsable(actor, workspaceId, candidate.targetId(), candidate.baseVersion());
                 if (!"PUBLISHED".equals(memory.status()))
@@ -1770,14 +2277,10 @@ public class JdbcCandidateService implements CandidateService {
                 new TeamExperienceUsage(List.of(usage)));
     }
 
-    private UUID teamCandidateSnapshotId(ActorContext actor, UUID workspaceId, LearningCandidate candidate) {
-        var id = jdbc.query("select id from evaluation.candidate_context_snapshot where tenant_id = ? and workspace_id = ? "
-                        + "and candidate_id = ? and candidate_revision = ? and target_type = 'TEAM_EXPERIENCE_UPDATE' "
-                        + "and invalidated_at is null",
-                rs -> rs.next() ? rs.getObject("id", UUID.class) : null,
-                actor.tenantId(), workspaceId, candidate.id(), candidate.revision());
-        if (id == null) throw EafException.conflict("TEAM_SNAPSHOT_MISSING", "候选隔离快照未成功保存。");
-        return id;
+    private io.eaf.evaluation.api.CandidateContextSnapshot requireTeamPreparationSnapshot(
+            ActorContext actor, UUID workspaceId, UUID candidateId, int revision) {
+        return evaluations.findTeamPreparationSnapshot(actor, workspaceId, candidateId, revision)
+                .orElseThrow(() -> EafException.conflict("TEAM_SNAPSHOT_MISSING", "候选隔离快照未成功保存。"));
     }
 
     private ContextItem candidateItem(String citationId, String sourceRef, String contentHash, String content,
@@ -1918,16 +2421,22 @@ public class JdbcCandidateService implements CandidateService {
 
     private CandidateSubmission insertCandidate(ActorContext actor, UUID workspaceId, UUID feedbackId,
                                                 String key, CandidateDraft draft) {
+        return insertCandidate(actor, workspaceId, feedbackId, key, null, draft);
+    }
+
+    private CandidateSubmission insertCandidate(ActorContext actor, UUID workspaceId, UUID feedbackId,
+                                                String key, UUID requestedId, CandidateDraft draft) {
         var now = Timestamp.from(Instant.now(clock));
         var requestHash = Hashing.sha256(writeJson(new CandidateRequestHash(feedbackId, revisionHash(draft))));
-        var id = UUID.randomUUID();
+        var id = requestedId == null ? UUID.randomUUID() : requestedId;
         var inserted = jdbc.update("insert into learning.candidate(id, tenant_id, workspace_id, proposer_id, source_feedback_id, current_revision, status, row_version, idempotency_key, request_hash, created_at, updated_at) values (?, ?, ?, ?, ?, 1, 'PROPOSED', 1, ?, ?, ?, ?) on conflict (tenant_id, workspace_id, proposer_id, idempotency_key) do nothing",
                 id, actor.tenantId(), workspaceId, actor.actorId(), feedbackId, key, requestHash, now, now);
         if (inserted == 0) {
             var existing = jdbc.query("select id, request_hash from learning.candidate where tenant_id = ? and workspace_id = ? and proposer_id = ? and idempotency_key = ?",
                     rs -> rs.next() ? new ExistingCandidate(rs.getObject("id", UUID.class), rs.getString("request_hash")) : null,
                     actor.tenantId(), workspaceId, actor.actorId(), key);
-            if (existing == null || !requestHash.equals(existing.requestHash()))
+            if (existing == null || !requestHash.equals(existing.requestHash())
+                    || requestedId != null && !requestedId.equals(existing.id()))
                 throw EafException.conflict("IDEMPOTENCY_CONFLICT", "候选幂等键已对应不同目标或内容。");
             return new CandidateSubmission(get(actor, workspaceId, existing.id()), false);
         }
@@ -2004,6 +2513,52 @@ public class JdbcCandidateService implements CandidateService {
         } catch (Exception invalidJson) { throw new IllegalStateException("运行来源摘要无法读取。", invalidJson); }
     }
 
+    private CandidateService.PromptImprovementRunSubmission promptRunSubmission(ActorContext actor, UUID workspaceId,
+            UUID runId, boolean created) {
+        var run = loadPromptImprovementRun(actor, workspaceId, runId);
+        var candidate = run.candidateId() == null ? null : load(actor.tenantId(), workspaceId, run.candidateId());
+        return new CandidateService.PromptImprovementRunSubmission(run, candidate, created);
+    }
+
+    private CandidateService.PromptImprovementRun loadPromptImprovementRun(ActorContext actor, UUID workspaceId, UUID runId) {
+        var row = jdbc.query("select id, owner_id, target_id, base_hash, change_note, candidate_id, candidate_revision, dev_report_id, "
+                        + "held_out_report_id, status, reason_code, row_version, created_at, updated_at, deadline_at, source_feedbacks::text "
+                        + "from learning.prompt_improvement_run where id = ? and tenant_id = ? and workspace_id = ?",
+                rs -> rs.next() ? new PromptRunRow(rs.getObject("id", UUID.class), rs.getObject("owner_id", UUID.class),
+                        rs.getObject("target_id", UUID.class), rs.getString("base_hash"), rs.getString("change_note"),
+                        rs.getObject("candidate_id", UUID.class),
+                        rs.getObject("candidate_revision", Integer.class), rs.getObject("dev_report_id", UUID.class),
+                        rs.getObject("held_out_report_id", UUID.class), rs.getString("status"), rs.getString("reason_code"),
+                        rs.getLong("row_version"), rs.getTimestamp("created_at").toInstant(),
+                        rs.getTimestamp("updated_at").toInstant(), rs.getTimestamp("deadline_at").toInstant(), rs.getString("source_feedbacks")) : null,
+                runId, actor.tenantId(), workspaceId);
+        if (row == null || !actor.actorId().equals(row.ownerId())) throw EafException.notFound();
+        try {
+            List<UUID> sources = json.readerForListOf(UUID.class).readValue(row.sourcesJson());
+            return new CandidateService.PromptImprovementRun(row.id(), row.ownerId(), row.targetId(), row.baseHash(), row.changeNote(),
+                    row.candidateId(), row.candidateRevision(), row.devReportId(), row.heldOutReportId(), row.status(),
+                    row.reasonCode(), row.rowVersion(), row.createdAt(), row.updatedAt(), row.deadlineAt(), sources);
+        } catch (Exception invalid) { throw new IllegalStateException("Prompt 改进来源列表无法读取。", invalid); }
+    }
+
+    private CandidateService.PromptAdoption promptAdoptionByCandidate(UUID tenantId, UUID workspaceId,
+            UUID candidateId, int revision) {
+        return jdbc.query("select id, candidate_id, candidate_revision, prompt_id, prompt_version, prompt_hash, agent_id, "
+                        + "agent_version, agent_hash, skill_id, skill_version, skill_hash, capability_id, capability_version, "
+                        + "capability_hash, approval_id, report_id, report_hash, status, created_at, updated_at "
+                        + "from learning.prompt_adoption where tenant_id = ? and workspace_id = ? and candidate_id = ? "
+                        + "and candidate_revision = ?",
+                rs -> rs.next() ? new CandidateService.PromptAdoption(rs.getObject("id", UUID.class),
+                        rs.getObject("candidate_id", UUID.class), rs.getInt("candidate_revision"),
+                        rs.getObject("prompt_id", UUID.class), rs.getString("prompt_version"), rs.getString("prompt_hash"),
+                        rs.getObject("agent_id", UUID.class), rs.getString("agent_version"), rs.getString("agent_hash"),
+                        rs.getObject("skill_id", UUID.class), rs.getString("skill_version"), rs.getString("skill_hash"),
+                        rs.getObject("capability_id", UUID.class), rs.getString("capability_version"), rs.getString("capability_hash"),
+                        rs.getObject("approval_id", UUID.class), rs.getObject("report_id", UUID.class), rs.getString("report_hash"),
+                        rs.getString("status"), rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("updated_at").toInstant()) : null,
+                tenantId, workspaceId, candidateId, revision);
+    }
+
     private boolean isLinked(Feedback feedback, String targetType, UUID targetId) {
         return feedback.source().contextSources().stream().anyMatch(ref -> targetType.equals(sourceType(ref))
                 && targetId.equals(sourceTargetId(ref)));
@@ -2015,6 +2570,11 @@ public class JdbcCandidateService implements CandidateService {
             knowledge.getVersion(actor, workspaceId, candidate.targetId(), Integer.parseInt(candidate.baseVersion()));
         else if ("TEAM_EXPERIENCE_UPDATE".equals(candidate.targetType()))
             teamExperiences.get(actor, workspaceId, candidate.targetId());
+        else if ("PROMPT_UPDATE".equals(candidate.targetType())) {
+            if (promptOwners == null) throw EafException.conflict("PROMPT_OWNER_UNAVAILABLE", "Prompt Owner 尚未就绪。");
+            promptOwners.assertCandidateAccessible(actor, workspaceId, candidate.targetId(), candidate.id(),
+                    candidate.revision(), candidate.baseVersion());
+        }
         else memories.get(actor, workspaceId, candidate.targetId(), candidate.baseVersion());
     }
 
@@ -2242,6 +2802,14 @@ public class JdbcCandidateService implements CandidateService {
             String datasetKey, String datasetVersion, UUID qualityRunId, UUID generationTaskId, UUID candidateId,
             Integer candidateRevision, UUID devReportId, UUID heldOutReportId, String status, String stopReason,
             boolean stopRequested, long rowVersion, Instant createdAt, Instant updatedAt, Instant deadlineAt) { }
+    private record PromptRunRow(UUID id, UUID ownerId, UUID targetId, String baseHash, String changeNote, UUID candidateId,
+            Integer candidateRevision, UUID devReportId, UUID heldOutReportId, String status, String reasonCode,
+            long rowVersion, Instant createdAt, Instant updatedAt, Instant deadlineAt, String sourcesJson) { }
+    private record PromptRunStop(UUID ownerId, UUID candidateId, UUID devReportId, UUID heldOutReportId,
+            String status, long rowVersion) { }
+    private record PromptRunPoll(UUID id, UUID tenantId, UUID workspaceId, UUID ownerId, UUID targetId, String baseHash,
+            UUID candidateId, int candidateRevision, UUID devReportId, UUID heldOutReportId, String status,
+            Instant deadlineAt) { }
     private record ExistingCandidate(UUID id, String requestHash) { }
     private record CandidateRequestHash(UUID sourceFeedbackId, String revisionHash) { }
     private record RevisionHash(String targetType, UUID targetId, String baseVersion, UUID ownerId, String scope,

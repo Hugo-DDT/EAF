@@ -175,7 +175,7 @@ class EafApplicationTest {
         //  在 Alice 的两个 Workspace 发布 RAG Agent； 在主 Workspace 新增版本化 Agent。
                 mvc.perform(get("/api/v1/workspaces/10000000-0000-4000-8000-000000000001/agents")
                         .header("Authorization", "Bearer eaf-local-alice"))
-                .andExpect(status().isOk()).andExpect(jsonPath("$.items.length()").value(27));
+                .andExpect(status().isOk()).andExpect(jsonPath("$.items.length()").value(30));
         mvc.perform(get("/api/v1/workspaces/10000000-0000-4000-8000-000000000002/agents")
                         .header("Authorization", "Bearer eaf-local-alice"))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.items.length()").value(5));

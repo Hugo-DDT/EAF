@@ -15,11 +15,8 @@ import io.eaf.connector.api.ServiceRequestWriteResult;
 import io.eaf.credential.api.CredentialRequest;
 import io.eaf.credential.api.CredentialResolutionPort;
 import io.eaf.shared.EafException;
-import java.io.InputStream;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
@@ -64,7 +61,7 @@ public class TestCrmHttpIntegration implements IntegrationPort, ServiceRequestIn
             var remaining = Math.max(1, Duration.between(Instant.now(), deadline).toMillis());
             var request = HttpRequest.newBuilder(uri).timeout(Duration.ofMillis(Math.min(10_000, remaining)))
                     .header("Authorization", "Bearer " + token).GET().build();
-            var response = sendBounded(request);
+            var response = sendBounded(request, deadline);
             if (response.statusCode() == 401 || response.statusCode() == 403 || response.statusCode() == 404)
                 throw EafException.conflict("CRM_CUSTOMER_UNAVAILABLE", "CRM 未提供所请求客户。");
             if (response.statusCode() == 409) throw EafException.conflict("CRM_CONFLICT", "CRM 拒绝了冲突的客户读取。");
@@ -75,7 +72,7 @@ public class TestCrmHttpIntegration implements IntegrationPort, ServiceRequestIn
                 throw EafException.conflict("INVALID_TOOL_RESULT", "CRM 返回未跟随的重定向响应。");
             if (response.statusCode() != 200) throw EafException.conflict("CRM_REQUEST_REJECTED", "CRM 未接受客户读取请求。");
             if (response.oversized()) throw EafException.conflict("INVALID_TOOL_RESULT", "CRM 响应超出大小上限。");
-            var root = json.readTree(response.body());
+            var root = json.readTree(response.bodyText());
             if (p7ContractFixture && !"EAF-CRM-READ-V1".equals(root.path("contractVersion").asText(null)))
                 throw EafException.conflict("INVALID_TOOL_RESULT", "CRM 响应契约版本不匹配。");
             var result = new CustomerRecord(root.path("customerId").asText(null), root.path("renewalStatus").asText(null),
@@ -127,7 +124,7 @@ public class TestCrmHttpIntegration implements IntegrationPort, ServiceRequestIn
                     .header("Content-Type", "application/json").header("Idempotency-Key", operationId)
                     .header("Authorization", "Bearer " + token)
                     .POST(HttpRequest.BodyPublishers.ofByteArray(requestBody)).build();
-            var response = sendBounded(request);
+            var response = sendBounded(request, deadline);
             if (response.oversized()) return ExternalWriteResult.unknown("CRM_RESPONSE_TOO_LARGE", "测试 CRM 写入响应超出上限，外部事实待核验。");
             if (response.statusCode() == 409) return ExternalWriteResult.rejected("CRM_IDEMPOTENCY_CONFLICT", "测试 CRM 拒绝了不一致的重复操作。");
             if (response.statusCode() == 401 || response.statusCode() == 403) return ExternalWriteResult.rejected("CRM_FORBIDDEN", "测试 CRM 拒绝了写入。");
@@ -138,8 +135,8 @@ public class TestCrmHttpIntegration implements IntegrationPort, ServiceRequestIn
                 return ExternalWriteResult.rejected("CRM_WRITE_REJECTED", "测试 CRM 拒绝了跟进写入。");
             //  写入合同的响应字段全部必需；畸形响应仍可能已提交外部事实，因此不能降级成可重试拒绝。
             return ExternalWriteResult.accepted(p7WriteContract
-                    ? parseP7Followup(response.body(), operationId)
-                    : parseFollowup(response.body(), operationId, customerId, summary, ownerId));
+                    ? parseP7Followup(response.bodyText(), operationId)
+                    : parseFollowup(response.bodyText(), operationId, customerId, summary, ownerId));
         } catch (java.net.http.HttpTimeoutException e) {
             return ExternalWriteResult.unknown("CRM_TIMEOUT", "测试 CRM 写入响应超时，外部事实待核验。");
         } catch (InterruptedException e) {
@@ -160,11 +157,11 @@ public class TestCrmHttpIntegration implements IntegrationPort, ServiceRequestIn
         var token = crmCredential(connector, "followup.verify", "crm.followup.read");
         try {
             var response = sendBounded(HttpRequest.newBuilder(uri).header("Authorization", "Bearer " + token)
-                    .timeout(timeout(deadline)).GET().build());
+                    .timeout(timeout(deadline)).GET().build(), deadline);
             if (response.statusCode() == 404) return java.util.Optional.empty();
             if (response.oversized() || response.statusCode() != 200) throw EafException.conflict("CRM_VERIFY_UNAVAILABLE", "测试 CRM 核验接口不可用或响应过大。");
-            var root = json.readTree(response.body());
-            var record = p7WriteContract ? parseP7Followup(response.body(), operationId)
+            var root = json.readTree(response.bodyText());
+            var record = p7WriteContract ? parseP7Followup(response.bodyText(), operationId)
                     : new FollowupRecord(root.path("operationId").asText(operationId), root.path("externalId").asText(null),
                     root.path("customerId").asText(null), root.path("summary").asText(null), root.path("ownerId").asText(null),
                     root.path("status").asText(null), Instant.parse(root.path("acceptedAt").asText()));
@@ -205,7 +202,7 @@ public class TestCrmHttpIntegration implements IntegrationPort, ServiceRequestIn
                     .header("Content-Type", "application/json").header("Idempotency-Key", operationId)
                     .header("Authorization", "Bearer " + token)
                     .POST(HttpRequest.BodyPublishers.ofByteArray(requestBody)).build();
-            var response = sendBounded(request);
+            var response = sendBounded(request, deadline);
             if (response.oversized()) return ExternalOutcomeWriteResult.unknown("CRM_RESPONSE_TOO_LARGE", "CRM 结果回执超出上限，外部状态待核验。");
             if (response.statusCode() == 409) return ExternalOutcomeWriteResult.rejected("CRM_IDEMPOTENCY_CONFLICT", "CRM 拒绝了不一致的重复结果操作。");
             if (response.statusCode() == 401 || response.statusCode() == 403 || response.statusCode() == 404)
@@ -215,7 +212,7 @@ public class TestCrmHttpIntegration implements IntegrationPort, ServiceRequestIn
                 return ExternalOutcomeWriteResult.rejected("INVALID_TOOL_RESULT", "CRM 返回未跟随的重定向响应。");
             if (response.statusCode() != 200 && response.statusCode() != 201 && response.statusCode() != 202)
                 return ExternalOutcomeWriteResult.rejected("CRM_OUTCOME_REJECTED", "CRM 拒绝了客户结果写入。");
-            return ExternalOutcomeWriteResult.accepted(parseOutcome(response.body(), operationId));
+            return ExternalOutcomeWriteResult.accepted(parseOutcome(response.bodyText(), operationId));
         } catch (java.net.http.HttpTimeoutException timeout) {
             return ExternalOutcomeWriteResult.unknown("CRM_TIMEOUT", "CRM 结果写入响应超时，外部状态待核验。");
         } catch (InterruptedException interrupted) {
@@ -236,11 +233,11 @@ public class TestCrmHttpIntegration implements IntegrationPort, ServiceRequestIn
         var token = crmCredential(connector, "followup.result.verify", "crm.followup.read");
         try {
             var response = sendBounded(HttpRequest.newBuilder(uri).timeout(timeout(deadline))
-                    .header("Authorization", "Bearer " + token).GET().build());
+                    .header("Authorization", "Bearer " + token).GET().build(), deadline);
             if (response.statusCode() == 404) return java.util.Optional.empty();
             if (response.oversized() || response.statusCode() != 200)
                 throw EafException.conflict("CRM_VERIFY_UNAVAILABLE", "CRM 结果核验接口不可用或响应过大。");
-            return java.util.Optional.of(parseOutcome(response.body(), operationId));
+            return java.util.Optional.of(parseOutcome(response.bodyText(), operationId));
         } catch (EafException e) { throw e;
         } catch (java.net.http.HttpTimeoutException e) { throw EafException.conflict("CRM_VERIFY_TIMEOUT", "CRM 结果核验超时。");
         } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw EafException.conflict("CRM_VERIFY_INTERRUPTED", "CRM 结果核验被中断。");
@@ -269,7 +266,7 @@ public class TestCrmHttpIntegration implements IntegrationPort, ServiceRequestIn
             var request = HttpRequest.newBuilder(endpoint).timeout(timeout(deadline))
                     .header("Content-Type", "application/json").header("Idempotency-Key", payload.operationId())
                     .header("Authorization", "Bearer " + token).POST(HttpRequest.BodyPublishers.ofByteArray(body)).build();
-            var response = sendBounded(request);
+            var response = sendBounded(request, deadline);
             if (response.oversized()) return ServiceRequestWriteResult.unknown("SERVICE_REQUEST_RESPONSE_TOO_LARGE", "服务台响应超过上限，外部状态待核验。");
             if (response.statusCode() == 409) return ServiceRequestWriteResult.rejected("SERVICE_REQUEST_IDEMPOTENCY_CONFLICT", "服务台拒绝了内容不一致的重复操作。");
             if (response.statusCode() == 401 || response.statusCode() == 403 || response.statusCode() == 404)
@@ -279,7 +276,7 @@ public class TestCrmHttpIntegration implements IntegrationPort, ServiceRequestIn
                 return ServiceRequestWriteResult.rejected("INVALID_TOOL_RESULT", "服务台返回未跟随的重定向响应。");
             if (response.statusCode() != 200 && response.statusCode() != 201 && response.statusCode() != 202)
                 return ServiceRequestWriteResult.rejected("SERVICE_REQUEST_REJECTED", "服务台未接受登记请求。");
-            try { return ServiceRequestWriteResult.accepted(parseServiceRequest(response.body(), payload.operationId())); }
+            try { return ServiceRequestWriteResult.accepted(parseServiceRequest(response.bodyText(), payload.operationId())); }
             catch (Exception malformed) { return ServiceRequestWriteResult.unknown("SERVICE_REQUEST_RECEIPT_INVALID", "服务台可能已接收请求，但回执无法核验。"); }
         } catch (java.net.http.HttpTimeoutException e) {
             return ServiceRequestWriteResult.unknown("SERVICE_REQUEST_TIMEOUT", "服务台登记超时，外部事实待核验。");
@@ -301,11 +298,11 @@ public class TestCrmHttpIntegration implements IntegrationPort, ServiceRequestIn
         try {
             var request = HttpRequest.newBuilder(endpoint).timeout(timeout(deadline))
                     .header("Authorization", "Bearer " + token).GET().build();
-            var response = sendBounded(request);
+            var response = sendBounded(request, deadline);
             if (response.statusCode() == 404) return java.util.Optional.empty();
             if (response.oversized() || response.statusCode() != 200)
                 throw EafException.conflict("SERVICE_REQUEST_VERIFY_UNAVAILABLE", "服务台核验接口不可用或响应超过上限。");
-            return java.util.Optional.of(parseServiceRequest(response.body(), operationId));
+            return java.util.Optional.of(parseServiceRequest(response.bodyText(), operationId));
         } catch (EafException e) { throw e;
         } catch (java.net.http.HttpTimeoutException e) { throw EafException.conflict("SERVICE_REQUEST_VERIFY_TIMEOUT", "服务台核验超时。");
         } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw EafException.conflict("SERVICE_REQUEST_VERIFY_INTERRUPTED", "服务台核验被中断。");
@@ -436,24 +433,15 @@ public class TestCrmHttpIntegration implements IntegrationPort, ServiceRequestIn
                 && version.chars().noneMatch(Character::isISOControl);
     }
 
-    private BoundedResponse sendBounded(HttpRequest request) throws Exception {
-        // 只读取上限加一个判定字节；超限时关闭响应流，不先把不可信 body 全量载入内存。
+    private BoundedHttpResponse sendBounded(HttpRequest request, Instant deadline) throws Exception {
         if (!outboundPermits.tryAcquire()) throw EafException.conflict("CRM_OUTBOUND_CAPACITY", "测试 CRM 出站并发已满。");
         try {
-            var response = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
-            try (InputStream body = response.body()) {
-                var bytes = body.readNBytes(MAX_RESPONSE_BYTES + 1);
-                var oversized = bytes.length > MAX_RESPONSE_BYTES;
-                var boundedBody = new String(bytes, 0, Math.min(bytes.length, MAX_RESPONSE_BYTES), StandardCharsets.UTF_8);
-                return new BoundedResponse(response.statusCode(), boundedBody, oversized);
-            }
+            return BoundedHttpResponse.send(client, request, MAX_RESPONSE_BYTES, deadline, Duration.ofSeconds(10));
         } finally {
             outboundPermits.release();
         }
     }
 
     private Duration timeout(Instant deadline) { return Duration.ofMillis(Math.min(10_000, Math.max(1, Duration.between(Instant.now(), deadline).toMillis()))); }
-
-    private record BoundedResponse(int statusCode, String body, boolean oversized) { }
 }
 // 本文件负责实现 EAF 的 TestCrmHttpIntegration.java 相关代码。

@@ -247,6 +247,8 @@ public class JdbcConnectorService implements ConnectorService {
             case "p7-crm-write-contract.followup-create" -> "P7_CRM_WRITE_CONTRACT_FIXTURE";
             case "p7-crm-write-contract.followup-result" -> "P12_CRM_OUTCOME_FIXTURE";
             case "p15-service-desk.register" -> "P15_INTERNAL_SERVICE_DESK_FIXTURE";
+            case "p27-oa.todo" -> "P27_OA_TODO_FIXTURE";
+            case "p27-service-desk.result" -> "P27_SERVICE_DESK_RESULT_FIXTURE";
             default -> throw EafException.conflict("CONNECTOR_UNAVAILABLE", "写入 Tool 没有已登记的 CRM 绑定。" );
         };
     }

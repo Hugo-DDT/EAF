@@ -9,6 +9,31 @@ import java.util.UUID;
 public interface KnowledgeService {
     KnowledgeDocument create(CreateKnowledgeDocumentCommand command);
 
+    ManagedKnowledgeSource createManagedSource(ManagedKnowledgeSource.CreateCommand command);
+
+    List<ManagedKnowledgeSource> listManagedSources(ActorContext actor, UUID workspaceId, int limit, int offset);
+
+    ManagedKnowledgeSource getManagedSource(ActorContext actor, UUID workspaceId, UUID sourceId);
+
+    ManagedKnowledgeSource.StateReceipt changeManagedSourceState(ActorContext actor, UUID workspaceId,
+            UUID sourceId, long expectedSourceRevision, String status, String idempotencyKey);
+
+    ManagedKnowledgeSource.SyncReceipt applyManagedSourceSync(ManagedKnowledgeSource.BatchCommand command);
+
+    ManagedKnowledgeSource.SyncReceipt getManagedSourceSync(ActorContext actor, UUID workspaceId,
+            UUID sourceId, UUID syncId);
+
+    List<ManagedKnowledgeSource.ItemSummary> listManagedSourceItems(ActorContext actor, UUID workspaceId,
+            UUID sourceId, int limit, int offset);
+
+    ManagedKnowledgeSource.SourceVersion getManagedSourceVersion(ActorContext actor, UUID workspaceId,
+            UUID documentId, int documentVersion);
+
+    KnowledgeDocument getManagedSourceVersionForOwner(ActorContext actor, UUID workspaceId,
+            UUID sourceId, String itemId, int documentVersion);
+
+    ManagedKnowledgeSource.Neighborhood neighborhood(ManagedKnowledgeSource.NeighborhoodRequest request);
+
     // 追加不可变原文版本；必须用当前文档 rowVersion 防止基线过期。
     KnowledgeDocument createVersion(CreateKnowledgeVersionCommand command);
 
@@ -81,6 +106,9 @@ public interface KnowledgeService {
     // 只验证具体快照的文档、Chunk、哈希和 READY build，供 Context 做实时撤回/权限复核。
     boolean isUsable(ActorContext actor, UUID workspaceId, UUID documentId, int documentVersion,
                      UUID chunkId, UUID buildId, String contentHash);
+
+    List<PublishedKnowledgeChunk> readPublishedChunks(ActorContext actor, UUID workspaceId,
+            List<PublishedKnowledgeChunk.Ref> refs);
 
     ContextShare shareContext(ActorContext actor, UUID workspaceId, UUID documentId, UUID recipientId,
                               int documentVersion, long expectedVersion);

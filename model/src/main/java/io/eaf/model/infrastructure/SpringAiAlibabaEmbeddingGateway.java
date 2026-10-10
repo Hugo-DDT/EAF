@@ -13,8 +13,6 @@ import java.lang.reflect.InvocationTargetException;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -249,11 +247,7 @@ public final class SpringAiAlibabaEmbeddingGateway implements EmbeddingGateway {
             return failure("MODEL_CAPACITY_EXCEEDED", "Embedding 出站并发已满，请稍后重试。", false, false);
         if (ProviderFailureSupport.quotaUnavailable(failure))
             return failure("MODEL_QUOTA_UNAVAILABLE", "Embedding 共享并发协调暂不可用，未发送请求。", false, false);
-        var seen = Collections.newSetFromMap(new IdentityHashMap<Throwable, Boolean>());
-        var text = new StringBuilder();
-        for (var cause = failure; cause != null && seen.add(cause); cause = cause.getCause())
-            text.append(cause.getClass().getName()).append(' ').append(cause.getMessage()).append(' ');
-        var normalized = text.toString().toLowerCase(Locale.ROOT);
+        var normalized = ProviderFailureSupport.describe(failure).toLowerCase(Locale.ROOT);
         if (normalized.contains("timeout") || normalized.contains("timed out"))
             return failure("UPSTREAM_TIMEOUT", "Embedding Provider 调用超时。", true, true);
         if (normalized.contains("401") || normalized.contains("403") || normalized.contains("unauthorized"))

@@ -45,10 +45,13 @@ public class TaskController {
                                          @RequestBody Map<String, Object> raw, Authentication authentication) {
         var actor = ApiSupport.actor(authentication);
         var body = convert(raw, TaskApplicationService.CreateRequest.class,
-                Set.of("agentId", "agentVersion", "capabilityId", "capabilityVersion", "input", "businessEntity"));
+                Set.of("agentId", "agentVersion", "capabilityId", "capabilityVersion", "input", "businessEntity", "modelProfileRef"));
         if (raw.get("businessEntity") instanceof Map<?, ?> entity
                 && entity.keySet().stream().anyMatch(key -> !Set.of("type", "id").contains(key)))
             throw EafException.invalid("businessEntity 包含未允许字段。");
+        if (raw.get("modelProfileRef") instanceof Map<?, ?> profile
+                && profile.keySet().stream().anyMatch(key -> !Set.of("profileId", "version").contains(key)))
+            throw EafException.invalid("modelProfileRef 包含未允许字段。");
         // REST 入口类型与 Task source 均由服务端固定，Task DTO 不能声明或覆盖。
         var response = taskApplication.create(actor, workspaceId, body, idempotencyKey, traceId, "REST");
         return ResponseEntity.accepted().header("Location", "/api/v1/workspaces/%s/tasks/%s".formatted(workspaceId, response.id())).body(response);

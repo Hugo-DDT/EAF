@@ -6,17 +6,23 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.eaf.shared.Ids;
 import io.eaf.shared.ActorContext;
 import io.eaf.shared.ActorType;
+import io.eaf.identity.api.IdentityService;
 import io.eaf.audit.api.AuditPort;
+import io.eaf.shared.EafException;
 import io.eaf.knowledge.api.KnowledgeService;
 import io.eaf.knowledge.api.CreateKnowledgeDocumentCommand;
 import io.eaf.knowledge.infrastructure.KnowledgeOutboxPublisher;
 import io.eaf.task.api.TaskExecutionService;
+import io.eaf.capability.api.CapabilityService;
+import io.eaf.agentprotocol.PlatformAccessApplicationService;
+import io.eaf.skill.api.SkillPackageService;
 import org.springframework.transaction.PlatformTransactionManager;
 import io.modelcontextprotocol.client.McpClient;
 import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.client.transport.HttpClientStreamableHttpTransport;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
+import io.modelcontextprotocol.spec.McpSchema.ReadResourceRequest;
 import io.modelcontextprotocol.spec.McpSchema.Tool;
 import io.modelcontextprotocol.spec.ProtocolVersions;
 import java.io.ByteArrayInputStream;
@@ -53,7 +59,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @Testcontainers
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {"eaf.task.dispatcher-enabled=false", "eaf.execution.outbox-publisher-enabled=false",
-                "eaf.model.mode=deterministic"})
+                "eaf.model.mode=deterministic", "eaf.agent-protocol.declarative-resources-enabled=true"})
 @AutoConfigureMockMvc
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class P25SkillPackageTest {
@@ -84,6 +90,10 @@ class P25SkillPackageTest {
     @Autowired AuditPort audit;
     @Autowired PlatformTransactionManager transactionManager;
     @Autowired TaskExecutionService execution;
+    @Autowired CapabilityService capabilities;
+    @Autowired PlatformAccessApplicationService access;
+    @Autowired IdentityService identities;
+    @Autowired SkillPackageService packages;
 
     @Test
     void exportsValidatesStoresPrivatelyAndUsesExactVersionThroughMcpHttp() throws Exception {
@@ -163,10 +173,10 @@ class P25SkillPackageTest {
         assertThat(archivedReplay.statusCode()).isEqualTo(200);
         assertThat(json.readTree(archivedReplay.body()).path("status").asText()).isEqualTo("ARCHIVED");
 
-        consumePackageThroughMcp(manifest);
+        consumePackageThroughMcp(manifest, files);
     }
 
-    private void consumePackageThroughMcp(JsonNode manifest) throws Exception {
+    private void consumePackageThroughMcp(JsonNode manifest, Map<String, String> packageFiles) throws Exception {
         var owner = new ActorContext(Ids.ALICE, Ids.TENANT_A, ActorType.HUMAN, Set.of());
         var document = knowledge.create(new CreateKnowledgeDocumentCommand(owner, WORKSPACE,
                 "合成设备知识", "manual://p25/device", "办公电脑无法启动时，先记录设备位置和故障现象，再按 IT 设备检修流程处理。",
@@ -188,17 +198,87 @@ class P25SkillPackageTest {
                     "eaf.capabilities.list", "eaf.tasks.create", "eaf.tasks.get", "eaf.tasks.cancel",
                     "eaf.catalog.search", "eaf.skills.get", "eaf.capabilities.get", "eaf.context.query",
                     "eaf.context.sources.list", "eaf.context.scoped-query");
+            assertThat(client.listResources().resources()).extracting(resource -> resource.uri())
+                    .containsExactly("eaf://declarations/index");
+            assertThat(client.listResourceTemplates().resourceTemplates()).hasSize(5);
             var capabilityId = manifest.path("capability").path("id").asText();
             var capabilityVersion = manifest.path("capability").path("version").asText();
             var skillId = manifest.path("skill").path("id").asText();
             var skillVersion = manifest.path("skill").path("version").asText();
             var workspace = manifest.path("sourceWorkspaceId").asText();
+            var expectedPackageHash = manifest.path("packageHash").asText();
+            var authenticatedActor = identities.resolveToken(ALICE).orElseThrow();
             var capability = structured(client.callTool(new CallToolRequest("eaf.capabilities.get", Map.of(
                     "workspaceId", workspace, "capabilityId", capabilityId, "version", capabilityVersion))));
             var skill = structured(client.callTool(new CallToolRequest("eaf.skills.get", Map.of(
                     "workspaceId", workspace, "skillId", skillId, "version", skillVersion))));
             assertThat(capability.get("contentHash")).isEqualTo(manifest.path("capability").path("contentHash").asText());
             assertThat(skill.get("contentHash")).isEqualTo(manifest.path("skill").path("contentHash").asText());
+            var current = capabilities.requirePublished(authenticatedActor, WORKSPACE, UUID.fromString(capabilityId),
+                    capabilityVersion);
+            assertThat(current.contentHash()).isEqualTo(manifest.path("capability").path("contentHash").asText());
+            assertThat(current.skillId().toString()).isEqualTo(skillId);
+            assertThat(current.skillVersion()).isEqualTo(skillVersion);
+            assertThat(current.skillContentHash()).isEqualTo(manifest.path("skill").path("contentHash").asText());
+            assertThat(access.getSkill(authenticatedActor, WORKSPACE, current.skillId(), current.skillVersion())
+                    .contentHash()).isEqualTo(current.skillContentHash());
+            var largeDescription = "x".repeat(262_145);
+            var capabilityProjection = json.readTree(packageFiles.get("references/capability.json"));
+            var largeSkill = (com.fasterxml.jackson.databind.node.ObjectNode)
+                    json.readTree(packageFiles.get("references/skill.json"));
+            largeSkill.put("description", largeDescription);
+            var oversizedSource = new SkillPackageService.ExportSource(WORKSPACE,
+                    new SkillPackageService.AssetProjection(UUID.fromString(capabilityId),
+                            (String) capability.get("name"), (String) capability.get("description"), capabilityVersion,
+                            current.contentHash(), capabilityProjection),
+                    new SkillPackageService.AssetProjection(UUID.fromString(skillId), (String) skill.get("name"),
+                            largeDescription, skillVersion, (String) skill.get("contentHash"), largeSkill));
+            var oversizedError = org.assertj.core.api.Assertions.catchThrowable(() ->
+                    packages.describe(authenticatedActor, WORKSPACE, oversizedSource));
+            assertThat(oversizedError).as("oversized render error: %s",
+                    oversizedError instanceof EafException error ? error.code() + ": " + error.getMessage() : oversizedError)
+                    .isInstanceOfSatisfying(EafException.class,
+                    error -> assertThat(error.code()).isEqualTo("PACKAGE_TOO_LARGE"));
+            var directFileUri = "eaf://declarations/workspaces/" + workspace + "/capabilities/" + capabilityId
+                    + "/versions/" + capabilityVersion + "/packages/" + expectedPackageHash + "/SKILL.md";
+            var directFile = client.readResource(new ReadResourceRequest(directFileUri));
+            assertThat(((io.modelcontextprotocol.spec.McpSchema.TextResourceContents)
+                    directFile.contents().getFirst()).text()).isEqualTo(packageFiles.get("SKILL.md"));
+            var listedCapabilities = structured(client.callTool(new CallToolRequest("eaf.capabilities.list",
+                    Map.of("workspaceId", workspace))));
+            assertThat(listedCapabilities.get("items").toString()).contains(capabilityId);
+            var indexResponse = client.readResource(new ReadResourceRequest("eaf://declarations/index", Map.of(
+                    "io.eaf/declarations", Map.of("workspaceId", workspace,
+                            "query", capability.get("name"), "offset", 0))));
+            var indexText = ((io.modelcontextprotocol.spec.McpSchema.TextResourceContents)
+                    indexResponse.contents().getFirst()).text();
+            var index = json.readTree(indexText);
+            assertThat(index.path("format").asText()).isEqualTo("EAF_DECLARATIVE_RESOURCE_INDEX_V1");
+            JsonNode selected = null;
+            for (var item : index.path("items")) {
+                if (capabilityId.equals(item.path("capability").path("id").asText())
+                        && capabilityVersion.equals(item.path("capability").path("version").asText())) selected = item;
+            }
+            assertThat(selected).as("directory index=%s targetName=%s", index, capability.get("name")).isNotNull();
+            assertThat(selected.path("packageHash").asText()).isEqualTo(expectedPackageHash);
+            assertThat(selected.path("files").size()).isEqualTo(5);
+            var oldSkillUri = selected.path("entryUri").asText();
+            var invalidPath = oldSkillUri.replace("SKILL.md", "../SKILL.md");
+            org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                    client.readResource(new ReadResourceRequest(invalidPath))).isInstanceOf(RuntimeException.class);
+            var packageHash = selected.path("packageHash").asText();
+            var wrongHash = (packageHash.startsWith("0") ? "1" : "0") + packageHash.substring(1);
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> client.readResource(new ReadResourceRequest(
+                    oldSkillUri.replace(packageHash, wrongHash)))).isInstanceOf(RuntimeException.class);
+            for (var fileDescriptor : selected.path("files")) {
+                var response = client.readResource(new ReadResourceRequest(fileDescriptor.path("uri").asText()));
+                var content = ((io.modelcontextprotocol.spec.McpSchema.TextResourceContents)
+                        response.contents().getFirst()).text();
+                var path = fileDescriptor.path("path").asText();
+                assertThat(content).isEqualTo(packageFiles.get(path));
+                assertThat(content.getBytes(StandardCharsets.UTF_8)).hasSize(fileDescriptor.path("sizeBytes").asInt());
+                assertThat(io.eaf.shared.Hashing.sha256(content)).isEqualTo(fileDescriptor.path("sha256").asText());
+            }
             var binding = (Map<String, Object>) capability.get("skill");
             // 现有 MCP Capability 投影只返回 Skill ID/version；精确 Skill.get 提供单独的当前 contentHash。
             assertThat(binding).containsEntry("id", skillId).containsEntry("version", skillVersion);
@@ -236,8 +316,26 @@ class P25SkillPackageTest {
             var cancelled = structured(client.callTool(new CallToolRequest("eaf.tasks.cancel", Map.of(
                     "workspaceId", workspace, "taskId", pending.get("id"), "expectedVersion", pending.get("version")))));
             assertThat(cancelled).containsEntry("status", "CANCELLED");
+            var publishedNow = capabilities.requirePublished(owner, WORKSPACE, CAPABILITY, capabilityVersion);
+            capabilities.revoke(owner, WORKSPACE, CAPABILITY, capabilityVersion, publishedNow.rowVersion());
+            org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                    client.readResource(new ReadResourceRequest(oldSkillUri))).isInstanceOf(RuntimeException.class);
         } finally {
             client.close();
+        }
+
+        var bobTransport = HttpClientStreamableHttpTransport.builder(baseUrl()).endpoint("/mcp")
+                .supportedProtocolVersions(List.of(ProtocolVersions.MCP_2025_11_25))
+                .httpRequestCustomizer((builder, method, uri, sessionId, context) -> builder
+                        .header("Authorization", "Bearer " + BOB).header("Origin", "http://localhost:3000"))
+                .build();
+        try (McpSyncClient bob = McpClient.sync(bobTransport).build()) {
+            bob.initialize();
+            assertThat(bob.listResources().resources()).extracting(resource -> resource.uri())
+                    .containsExactly("eaf://declarations/index");
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> bob.readResource(new ReadResourceRequest(
+                    "eaf://declarations/index", Map.of("io.eaf/declarations",
+                            Map.of("workspaceId", WORKSPACE.toString()))))).isInstanceOf(RuntimeException.class);
         }
     }
 

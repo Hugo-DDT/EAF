@@ -4,12 +4,15 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.eaf.agent.api.AgentCatalog;
+import io.eaf.agent.api.AgentOwnerService;
 import io.eaf.capability.api.CapabilityDefinition;
 import io.eaf.capability.api.CapabilityService;
 import io.eaf.capability.api.CapabilityToolDependency;
 import io.eaf.capability.api.CapabilityToolReference;
 import io.eaf.capability.api.CreateCapabilityCommand;
 import io.eaf.capability.api.CreateCapabilityVersionCommand;
+import io.eaf.identity.api.DelegationResourceAuthorizer;
+import io.eaf.identity.api.McpCapabilityReference;
 import io.eaf.prompt.api.PromptCatalog;
 import io.eaf.shared.ActorContext;
 import io.eaf.shared.EafException;
@@ -30,21 +33,26 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 @Service
-public class JdbcCapabilityService implements CapabilityService {
+public class JdbcCapabilityService implements CapabilityService, DelegationResourceAuthorizer {
     private static final int MAX_REFERENCE_COUNT = 16;
+    private static final UUID MCP_SERVICE_REQUEST_CAPABILITY_ID = UUID.fromString("54000000-0000-4000-8000-000000000012");
+    private static final UUID MCP_SERVICE_REQUEST_AGENT_ID = UUID.fromString("20000000-0000-4000-8000-000000000010");
     private final JdbcTemplate jdbc;
     private final WorkspaceAuthorization workspaces;
     private final AgentCatalog agents;
+    private final AgentOwnerService agentOwners;
     private final SkillService skills;
     private final PromptCatalog prompts;
     private final ToolCatalog tools;
     private final ObjectMapper json;
 
     public JdbcCapabilityService(JdbcTemplate jdbc, WorkspaceAuthorization workspaces, AgentCatalog agents,
-                                 SkillService skills, PromptCatalog prompts, ToolCatalog tools, ObjectMapper json) {
+                                 AgentOwnerService agentOwners, SkillService skills, PromptCatalog prompts,
+                                 ToolCatalog tools, ObjectMapper json) {
         this.jdbc = jdbc;
         this.workspaces = workspaces;
         this.agents = agents;
+        this.agentOwners = agentOwners;
         this.skills = skills;
         this.prompts = prompts;
         this.tools = tools;
@@ -115,6 +123,33 @@ public class JdbcCapabilityService implements CapabilityService {
     }
 
     @Override
+    public java.util.Optional<McpCapabilityReference> resolveMcpReadonlyCapability(UUID tenantId, UUID ownerId,
+            UUID delegateId, UUID workspaceId, UUID capabilityId, String capabilityVersion) {
+        if (!MCP_SERVICE_REQUEST_CAPABILITY_ID.equals(capabilityId) || !"1.0.0".equals(capabilityVersion))
+            return java.util.Optional.empty();
+        try {
+            var owner = new ActorContext(ownerId, tenantId, io.eaf.shared.ActorType.HUMAN,
+                    workspaces.actions(tenantId, ownerId, workspaceId));
+            var delegate = new ActorContext(delegateId, tenantId, io.eaf.shared.ActorType.AGENT,
+                    workspaces.actions(tenantId, delegateId, workspaceId));
+            var ownerCapability = requirePublished(owner, workspaceId, capabilityId, capabilityVersion);
+            var agentCapability = requirePublished(delegate, workspaceId, capabilityId, capabilityVersion);
+            if (!"PUBLISHED".equals(ownerCapability.status()) || !"PUBLISHED".equals(agentCapability.status())
+                    || !MCP_SERVICE_REQUEST_AGENT_ID.equals(ownerCapability.agentId())
+                    || !MCP_SERVICE_REQUEST_AGENT_ID.equals(agentCapability.agentId())
+                    || !ownerCapability.contentHash().equals(agentCapability.contentHash())
+                    || !java.util.Objects.equals(ownerCapability.skillContentHash(), agentCapability.skillContentHash())
+                    || !ownerCapability.toolDependencies().isEmpty()
+                    || !agents.tools(tenantId, workspaceId, MCP_SERVICE_REQUEST_AGENT_ID,
+                            ownerCapability.agentVersion()).isEmpty()) return java.util.Optional.empty();
+            return java.util.Optional.of(new McpCapabilityReference(capabilityId, capabilityVersion,
+                    ownerCapability.contentHash()));
+        } catch (RuntimeException unavailable) {
+            return java.util.Optional.empty();
+        }
+    }
+
+    @Override
     @Transactional
     public CapabilityDefinition publish(ActorContext actor, UUID workspaceId, UUID capabilityId, String version, long expectedVersion) {
         var access = workspaces.require(actor, workspaceId, "capability:publish");
@@ -147,6 +182,143 @@ public class JdbcCapabilityService implements CapabilityService {
                 UUID.randomUUID(), access.tenantId(), workspaceId, capabilityId, version, actor.actorId());
         return load(access.tenantId(), workspaceId, capabilityId, version);
     }
+
+    @Override
+    @Transactional
+    public PromptVariant publishPromptAnalysisVariant(ActorContext actor, UUID workspaceId, UUID candidateId,
+            int revision, UUID adoptionId, UUID agentId, String agentVersion, UUID skillId, String skillVersion,
+            UUID promptId, String promptVersion, String promptHash, UUID approvalId, UUID reportId, String reportHash) {
+        requirePromptOwner(actor, workspaceId, "capability:write");
+        workspaces.require(actor, workspaceId, "capability:publish");
+        if (candidateId == null || revision < 1 || adoptionId == null || agentId == null || skillId == null
+                || promptId == null || !"1.0.0".equals(agentVersion) || !"1.0.0".equals(skillVersion)
+                || !"1.0.0".equals(promptVersion) || !hexHash(promptHash) || approvalId == null || reportId == null
+                || !hexHash(reportHash)) throw EafException.invalid("Capability 派生来源必须绑定精确 Agent、Skill、Prompt、批准和报告。");
+        var prior = findPromptVariant(actor, workspaceId, candidateId, revision, adoptionId);
+        if (prior != null) {
+            if (!prior.agentId().equals(agentId) || !prior.skillId().equals(skillId)
+                    || !prior.promptId().equals(promptId) || !prior.promptVersion().equals(promptVersion)
+                    || !prior.promptHash().equals(promptHash) || !prior.approvalId().equals(approvalId)
+                    || !prior.reportId().equals(reportId) || !prior.reportHash().equals(reportHash))
+                throw EafException.conflict("PROMPT_VARIANT_CONFLICT", "Capability 派生来源已绑定其他资产。");
+            return prior;
+        }
+        var ownedAgent = agentOwners.findPromptAnalysisVariant(actor, workspaceId, candidateId, revision, adoptionId)
+                .orElseThrow(EafException::notFound);
+        var ownedSkill = skills.findPromptAnalysisVariant(actor, workspaceId, candidateId, revision, adoptionId)
+                .orElseThrow(EafException::notFound);
+        if (!ownedAgent.id().equals(agentId) || !ownedAgent.version().equals(agentVersion)
+                || !ownedSkill.id().equals(skillId) || !ownedSkill.version().equals(skillVersion)
+                || !ownedAgent.promptId().equals(promptId) || !ownedSkill.promptId().equals(promptId)
+                || !ownedAgent.promptVersion().equals(promptVersion) || !ownedSkill.promptVersion().equals(promptVersion)
+                || !"PUBLISHED".equals(ownedAgent.status())
+                || !"PUBLISHED".equals(ownedSkill.status()))
+            throw EafException.conflict("PROMPT_VARIANT_DEPENDENCY_CONFLICT", "Capability 只能绑定同一采用记录中的已发布 Agent 和 Skill。");
+        var base = requirePublished(actor, workspaceId, MCP_SERVICE_REQUEST_CAPABILITY_ID, "1.0.0");
+        if (!base.agentId().equals(MCP_SERVICE_REQUEST_AGENT_ID) || !base.toolDependencies().isEmpty()
+                || !"p15-service-request-plan-v1".equals(base.evaluationRef()))
+            throw EafException.conflict("PROMPT_VARIANT_BASE_UNSAFE", "P15 固定基线 Capability 必须是只读分析合同。");
+        var publishedAgent = agents.requirePublished(actor.tenantId(), workspaceId, agentId, agentVersion);
+        var publishedSkill = skills.requirePublished(actor, workspaceId, skillId, skillVersion);
+        if (!publishedAgent.promptId().equals(promptId) || !publishedSkill.promptId().equals(promptId))
+            throw EafException.conflict("PROMPT_VARIANT_DEPENDENCY_CONFLICT", "派生 Agent 与 Skill 必须绑定指定 Prompt。");
+        prompts.requirePublished(actor.tenantId(), workspaceId, promptId, promptVersion);
+        var id = UUID.randomUUID();
+        var version = "1.0.0";
+        var name = "service-request-plan-p31-" + id.toString().substring(0, 8);
+        jdbc.update("insert into capability.definition(id, tenant_id, workspace_id, owner_id, name, description) "
+                        + "values (?, ?, ?, ?, ?, ?)", id, actor.tenantId(), workspaceId, actor.actorId(), name,
+                "P31 显式采用的只读 P15 分析 Capability。");
+        jdbc.update("insert into capability.version(capability_id, tenant_id, workspace_id, asset_version, agent_id, agent_version, "
+                        + "skill_id, skill_version, prompt_id, prompt_version, evaluation_ref, status) "
+                        + "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PUBLISHED')",
+                id, actor.tenantId(), workspaceId, version, agentId, agentVersion, skillId, skillVersion, promptId,
+                promptVersion, base.evaluationRef());
+        jdbc.update("insert into capability.release(release_id, tenant_id, workspace_id, capability_id, capability_version, action, actor_id) "
+                        + "values (?, ?, ?, ?, ?, 'PUBLISHED', ?)", UUID.randomUUID(), actor.tenantId(), workspaceId, id, version, actor.actorId());
+        jdbc.update("insert into capability.prompt_variant_origin(tenant_id, workspace_id, candidate_id, candidate_revision, adoption_id, "
+                        + "owner_id, capability_id, capability_version, base_capability_id, base_capability_version, agent_id, agent_version, "
+                        + "skill_id, skill_version, prompt_id, prompt_version, prompt_hash, approval_id, report_id, report_hash, status) "
+                        + "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PUBLISHED')",
+                actor.tenantId(), workspaceId, candidateId, revision, adoptionId, actor.actorId(), id, version, base.id(), base.version(),
+                agentId, agentVersion, skillId, skillVersion, promptId, promptVersion, promptHash, approvalId, reportId, reportHash);
+        return findPromptVariant(actor, workspaceId, candidateId, revision, adoptionId);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public java.util.Optional<PromptVariant> findPromptAnalysisVariant(ActorContext actor, UUID workspaceId,
+            UUID candidateId, int revision, UUID adoptionId) {
+        requirePromptOwner(actor, workspaceId, "capability:read");
+        return java.util.Optional.ofNullable(findPromptVariant(actor, workspaceId, candidateId, revision, adoptionId));
+    }
+
+    @Override
+    @Transactional
+    public PromptVariant revokePromptAnalysisVariant(ActorContext actor, UUID workspaceId,
+            UUID candidateId, int revision, UUID adoptionId) {
+        requirePromptOwner(actor, workspaceId, "capability:publish");
+        var variant = findPromptVariant(actor, workspaceId, candidateId, revision, adoptionId);
+        if (variant == null) throw EafException.notFound();
+        jdbc.update("update capability.version set status = 'REVOKED', row_version = row_version + 1 where tenant_id = ? "
+                        + "and workspace_id = ? and capability_id = ? and asset_version = ? and status = 'PUBLISHED'",
+                actor.tenantId(), workspaceId, variant.id(), variant.version());
+        jdbc.update("update capability.prompt_variant_origin set status = 'REVOKED' where tenant_id = ? and workspace_id = ? "
+                        + "and candidate_id = ? and candidate_revision = ? and adoption_id = ? and status = 'PUBLISHED'",
+                actor.tenantId(), workspaceId, candidateId, revision, adoptionId);
+        jdbc.update("insert into capability.release(release_id, tenant_id, workspace_id, capability_id, capability_version, action, actor_id) "
+                        + "values (?, ?, ?, ?, ?, 'REVOKED', ?) on conflict do nothing",
+                UUID.randomUUID(), actor.tenantId(), workspaceId, variant.id(), variant.version(), actor.actorId());
+        return findPromptVariant(actor, workspaceId, candidateId, revision, adoptionId);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public boolean isPromptAnalysisVariant(ActorContext actor, UUID workspaceId, UUID capabilityId, String version) {
+        workspaces.require(actor, workspaceId, "capability:read");
+        var found = jdbc.query("select candidate_id, candidate_revision, adoption_id from capability.prompt_variant_origin "
+                        + "where tenant_id = ? and workspace_id = ? and capability_id = ? and capability_version = ? and status = 'PUBLISHED'",
+                rs -> rs.next() ? new AdoptionKey(rs.getObject("candidate_id", UUID.class), rs.getInt("candidate_revision"),
+                        rs.getObject("adoption_id", UUID.class)) : null,
+                actor.tenantId(), workspaceId, capabilityId, version);
+        if (found == null) return false;
+        var capability = requirePublished(actor, workspaceId, capabilityId, version);
+        var agent = agents.requirePublished(actor.tenantId(), workspaceId, capability.agentId(), capability.agentVersion());
+        return "p15-service-request-plan-v1".equals(capability.evaluationRef())
+                && capability.toolDependencies().isEmpty() && agent.promptId().equals(capability.promptId())
+                && agent.promptVersion().equals(capability.promptVersion())
+                && "SERVICE_REQUEST_PLAN_V1".equals(agent.responseProfile()) && agent.ragEnabled()
+                && "HYBRID".equals(agent.retrievalMode()) && "NONE".equals(agent.evidencePolicy())
+                && agents.tools(actor.tenantId(), workspaceId, capability.agentId(), capability.agentVersion()).isEmpty();
+    }
+
+    private PromptVariant findPromptVariant(ActorContext actor, UUID workspaceId, UUID candidateId, int revision, UUID adoptionId) {
+        return jdbc.query("select o.capability_id, o.capability_version, o.base_capability_id, o.base_capability_version, "
+                        + "o.agent_id, o.agent_version, o.skill_id, o.skill_version, o.prompt_id, o.prompt_version, o.status "
+                        + ", o.prompt_hash, o.approval_id, o.report_id, o.report_hash "
+                        + "from capability.prompt_variant_origin o where o.tenant_id = ? and o.workspace_id = ? and o.owner_id = ? "
+                        + "and o.candidate_id = ? and o.candidate_revision = ? and o.adoption_id = ?",
+                rs -> rs.next() ? new PromptVariant(rs.getObject("capability_id", UUID.class), rs.getString("capability_version"),
+                        rs.getObject("base_capability_id", UUID.class), rs.getString("base_capability_version"),
+                        rs.getObject("agent_id", UUID.class), rs.getString("agent_version"), rs.getObject("skill_id", UUID.class),
+                        rs.getString("skill_version"), rs.getObject("prompt_id", UUID.class), rs.getString("prompt_version"),
+                        rs.getString("prompt_hash"), rs.getObject("approval_id", UUID.class), rs.getObject("report_id", UUID.class),
+                        rs.getString("report_hash"),
+                        load(actor.tenantId(), workspaceId, rs.getObject("capability_id", UUID.class),
+                                rs.getString("capability_version")).contentHash(), rs.getString("status")) : null,
+                actor.tenantId(), workspaceId, actor.actorId(), candidateId, revision, adoptionId);
+    }
+
+    private void requirePromptOwner(ActorContext actor, UUID workspaceId, String permission) {
+        if (actor == null || actor.type() != io.eaf.shared.ActorType.HUMAN || actor.delegated())
+            throw EafException.forbidden("P31 Capability 变体只允许直接 HUMAN Owner 操作。");
+        workspaces.require(actor, workspaceId, "capability:read");
+        workspaces.require(actor, workspaceId, permission);
+    }
+
+    private boolean hexHash(String value) { return value != null && value.matches("[0-9a-f]{64}"); }
+
+    private record AdoptionKey(UUID candidateId, int revision, UUID adoptionId) { }
 
     private ValidatedVersion validateVersion(ActorContext actor, UUID workspaceId, CreateCapabilityVersionCommand command) {
         if (command == null) throw EafException.invalid("Capability 版本不能为空。");

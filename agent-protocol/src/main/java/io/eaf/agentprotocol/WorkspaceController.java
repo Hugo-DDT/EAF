@@ -26,7 +26,8 @@ import org.springframework.web.bind.annotation.RestController;
 @RestController
 public class WorkspaceController {
     private static final Set<String> GRANTABLE_ACTIONS = Set.of("context:read", "knowledge:read", "knowledge:write",
-            "knowledge:publish", "workspace:members:manage", "memory:read");
+            "knowledge:publish", "knowledge:source:manage", "workspace:members:manage", "memory:read",
+            "prompt:read", "prompt:manage", "prompt:publish");
     private final WorkspaceCatalog catalog;
     private final WorkspaceMembershipAdministration memberships;
 

@@ -31,7 +31,7 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class JdbcWorkspaceCatalog implements WorkspaceCatalog {
     private static final Set<String> INITIAL_ACTIONS = Set.of("context:read", "knowledge:read", "knowledge:write",
-            "knowledge:publish", "workspace:members:manage");
+            "knowledge:publish", "knowledge:source:manage", "workspace:members:manage", "prompt:read", "prompt:manage", "prompt:publish");
     private final JdbcTemplate jdbc;
     private final OrganizationDirectory organizations;
     private final WorkspaceAuthorization authorization;

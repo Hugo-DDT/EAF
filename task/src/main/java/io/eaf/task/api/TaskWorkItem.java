@@ -1,5 +1,6 @@
 package io.eaf.task.api;
 
+import io.eaf.model.api.ModelProfileSelection;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -12,5 +13,6 @@ public record TaskWorkItem(UUID id, UUID tenantId, UUID workspaceId, UUID actorI
                            UUID principalId, UUID delegationId, String authorizationHash,
                            UUID rootTaskId, UUID parentTaskId, String entryProtocol, String runKind,
                            String toolName, String toolVersion, String toolBindingRef, String toolArgumentsJson,
-                           UUID leaseOwnerId, long leaseFence, UUID qualityRunId) { }
+                           UUID leaseOwnerId, long leaseFence, UUID qualityRunId,
+                           ModelProfileSelection modelSelection) { }
 // 本文件负责实现 EAF 的 TaskWorkItem.java 相关代码。

@@ -28,6 +28,10 @@ public class JdbcTeamExperienceService implements TeamExperienceService {
             Instant cursorUpdatedAt, UUID cursorId, int limit) {
         return memory.listTeam(actor, workspaceId, scenarioKey, owned, status, cursorUpdatedAt, cursorId, limit);
     }
+    @Override public TeamExperienceDiscovery discover(ActorContext actor, UUID workspaceId, String scenarioKey,
+            List<String> keywords, int limit) {
+        return memory.discoverTeam(actor, workspaceId, scenarioKey, keywords, limit);
+    }
     @Override public TeamExperience get(ActorContext actor, UUID workspaceId, UUID cardId) {
         return memory.getTeam(actor, workspaceId, cardId);
     }

@@ -11,6 +11,7 @@ import io.eaf.workspace.api.WorkspaceAuthorization;
 import java.sql.Timestamp;
 import java.util.List;
 import java.util.Set;
+import java.util.Optional;
 import java.util.UUID;
 import java.time.Instant;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -126,6 +127,28 @@ public class JdbcQualityRunSourceVerifier implements QualityRunSourceVerifier {
     }
 
     @Override
+    public boolean scenarioSampleModelProfileMatches(UUID tenantId, UUID workspaceId, UUID actorId,
+            UUID qualityRunId, UUID sampleId, io.eaf.model.api.ModelProfileSelection selection) {
+        if (tenantId == null || workspaceId == null || actorId == null || qualityRunId == null || sampleId == null
+                || selection == null || selection.effectiveProfile() == null
+                || !Set.of("DEFAULT", "EXPLICIT").contains(selection.selectionKind())) return false;
+        var rows = jdbc.query("select r.manifest::text, s.side from evaluation.scenario_run r "
+                        + "join evaluation.scenario_sample s on s.run_id = r.id "
+                        + "where r.id = ? and r.tenant_id = ? and r.workspace_id = ? and r.owner_id = ? "
+                        + "and r.status = 'RUNNING' and not r.stop_requested and r.deadline_at > now() "
+                        + "and s.id = ? and s.status = 'PENDING' and s.task_id is null",
+                (rs, row) -> new Object[]{rs.getString(1), rs.getString(2)},
+                qualityRunId, tenantId, workspaceId, actorId, sampleId);
+        if (rows.size() != 1) return false;
+        try {
+            var manifest = json.readTree((String) rows.getFirst()[0]);
+            var side = manifest.path("modelSelections").path(((String) rows.getFirst()[1]).toLowerCase(java.util.Locale.ROOT));
+            return !side.isMissingNode() && side.equals(json.valueToTree(selection))
+                    && scenarioContextCurrent(tenantId, workspaceId, actorId, (String) rows.getFirst()[0]);
+        } catch (java.io.IOException invalid) { return false; }
+    }
+
+    @Override
     public boolean scenarioTaskMatches(UUID tenantId, UUID workspaceId, UUID actorId, UUID taskId, UUID rootTaskId,
                                        UUID qualityRunId, int attempt, UUID agentId, String agentVersion,
                                        String source, String runKind, String inputHash, TaskAssetBinding binding) {
@@ -187,6 +210,18 @@ public class JdbcQualityRunSourceVerifier implements QualityRunSourceVerifier {
                         + "where s.task_id = ? and r.tenant_id = ? and r.workspace_id = ?)",
                 Integer.class, taskId, tenantId, workspaceId, taskId, tenantId, workspaceId);
         return count != null && count == 1;
+    }
+
+    @Override
+    public Optional<UUID> scenarioTaskOwner(UUID tenantId, UUID workspaceId, UUID taskId) {
+        if (tenantId == null || workspaceId == null || taskId == null) return Optional.empty();
+        var owners = jdbc.query("select r.owner_id from evaluation.scenario_run r join evaluation.scenario_sample s on s.run_id = r.id "
+                        + "where s.task_id = ? and r.tenant_id = ? and r.workspace_id = ? union all "
+                        + "select r.owner_id from evaluation.team_preparation_run r join evaluation.team_preparation_sample s on s.run_id = r.id "
+                        + "where s.task_id = ? and r.tenant_id = ? and r.workspace_id = ?",
+                (rs, row) -> rs.getObject("owner_id", UUID.class), taskId, tenantId, workspaceId,
+                taskId, tenantId, workspaceId);
+        return owners.size() == 1 ? Optional.of(owners.getFirst()) : Optional.empty();
     }
 
     @Override
@@ -308,7 +343,7 @@ public class JdbcQualityRunSourceVerifier implements QualityRunSourceVerifier {
                         + "join evaluation.team_preparation_run r on r.id = s.run_id "
                         + "join evaluation.team_preparation_snapshot p on p.snapshot_id = s.snapshot_id "
                         + "join evaluation.quality_run_registration q on q.id = r.quality_run_id "
-                        + "where s.id = ? and s.run_id = ? and s.tenant_id = ? and s.workspace_id = ? and r.owner_id = ? "
+                        + "where s.id = ? and s.tenant_id = ? and s.workspace_id = ? and r.owner_id = ? "
                         + "and r.quality_run_id = ? and r.status = 'RUNNING' and not r.stop_requested and r.deadline_at > now() "
                         + "and r.deadline_at = ? and s.snapshot_id = ? and s.task_key = ? and s.status = 'PENDING' and s.task_id is null "
                         + "and s.input_hash = ? and s.agent_id = ? and s.agent_version = ? "
@@ -318,8 +353,7 @@ public class JdbcQualityRunSourceVerifier implements QualityRunSourceVerifier {
                         + "and p.improvement_run_id = r.improvement_run_id and q.owner_id = r.owner_id "
                         + "and q.purpose = 'TEAM_EXPERIENCE_IMPROVEMENT' and q.source = 'EVALUATION' "
                         + "and q.status in ('REGISTERED','RUNNING')",
-                Integer.class, sampleId, jdbc.queryForObject("select run_id from evaluation.team_preparation_sample where id = ?",
-                        UUID.class, sampleId), tenantId, workspaceId, ownerId, qualityRunId,
+                Integer.class, sampleId, tenantId, workspaceId, ownerId, qualityRunId,
                 Timestamp.from(deadlineAt.truncatedTo(java.time.temporal.ChronoUnit.MICROS)), snapshotId, taskKey, inputHash,
                 agentId, agentVersion, binding.capabilityId(), binding.capabilityVersion(), binding.capabilityHash(),
                 binding.skillId(), binding.skillVersion(), binding.skillHash());

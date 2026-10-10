@@ -33,6 +33,7 @@ final class ScenarioContextManifest {
         for (int page = 0; page < 40; page++) {
             var result = knowledge.listDocuments(actor, workspaceId, cursorTime, cursorId, 50);
             for (var item : result.items()) {
+                if ("REVOKED".equals(item.status()) && item.version() == null) continue;
                 var document = knowledge.get(actor, workspaceId, item.id());
                 if (!"PUBLISHED".equals(document.status())
                         || !"true".equalsIgnoreCase(document.metadata().get("synthetic")))

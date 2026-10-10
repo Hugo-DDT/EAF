@@ -7,6 +7,7 @@ import io.eaf.knowledge.api.KnowledgeService;
 import io.eaf.memory.api.MemoryService;
 import io.eaf.memory.api.TeamExperienceService;
 import io.eaf.shared.ActorContext;
+import io.eaf.context.api.EvaluationContextSnapshotReader.PromptCandidateTaskBinding;
 import io.eaf.shared.Hashing;
 import io.eaf.workspace.api.WorkspaceAuthorization;
 import java.time.Clock;
@@ -54,6 +55,20 @@ public class JdbcEvaluationContextSnapshotReader implements EvaluationContextSna
                                     EnterpriseContext context) {
         var current = readForTask(actor, workspaceId, taskId, snapshotId);
         return current.isPresent() && current.get().equals(context);
+    }
+
+    @Override
+    public Optional<PromptCandidateTaskBinding> promptCandidateForTask(ActorContext actor, UUID workspaceId, UUID taskId) {
+        if (actor == null || actor.delegated() || workspaceId == null || taskId == null) return Optional.empty();
+        var binding = jdbc.query("select p.candidate_id, p.candidate_revision from evaluation.scenario_sample s "
+                        + "join evaluation.scenario_run r on r.id = s.run_id "
+                        + "join evaluation.prompt_analysis_run p on p.run_id = s.run_id and p.tenant_id = r.tenant_id and p.workspace_id = r.workspace_id "
+                        + "where s.task_id = ? and r.tenant_id = ? and r.workspace_id = ? and s.side = 'COMPARISON' "
+                        + "and r.owner_id = ? and r.status in ('QUEUED','RUNNING','STOPPING','COMPLETED')",
+                rs -> rs.next() ? new PromptCandidateTaskBinding(rs.getObject("candidate_id", UUID.class),
+                        rs.getInt("candidate_revision")) : null,
+                taskId, actor.tenantId(), workspaceId, actor.actorId());
+        return Optional.ofNullable(binding);
     }
 
     private SnapshotRow load(ActorContext actor, UUID workspaceId, UUID taskId, UUID snapshotId) {

@@ -84,7 +84,8 @@ class P6A2aContractTest {
                 "service-request-plan@1.0.0", "service-request-plan@1.1.0", "service-request-registration@1.0.0",
                 "service-request-prepare@1.0.0", "service-request-prepare@1.1.0", "service-request-prepare@1.2.0",
                 "service-request-summary@1.0.0", "service-request-batch-knowledge@1.0.0",
-                "service-request-batch-experience@1.0.0", "team-experience-improvement@1.0.0");
+                "service-request-batch-experience@1.0.0", "team-experience-improvement@1.0.0",
+                "p27-business-tool@1.0.0", "project-brief-prepare@1.0.0", "my-p16-work-digest@1.0.0");
         assertThat(card.skills()).extracting("id").doesNotContain("p12-customer-result-sync@1.0.0");
         assertThat(card.capabilities().streaming()).isFalse();
         assertThat(card.capabilities().pushNotifications()).isFalse();

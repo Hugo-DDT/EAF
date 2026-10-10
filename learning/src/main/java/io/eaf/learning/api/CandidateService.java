@@ -12,6 +12,11 @@ public interface CandidateService {
     /** 仅改进运行的服务端生成 Task 可创建 TEAM_EXPERIENCE_UPDATE 候选。 */
     CandidateSubmission proposeFromImprovementRun(ActorContext actor, UUID workspaceId, UUID improvementRunId);
     ImprovementRunSubmission createImprovementRun(ImprovementRunCommand command);
+    PromptImprovementRunSubmission createPromptImprovementRun(PromptImprovementRunCommand command);
+    PromptImprovementRun getPromptImprovementRun(ActorContext actor, UUID workspaceId, UUID runId);
+    PromptImprovementRun stopPromptImprovementRun(ActorContext actor, UUID workspaceId, UUID runId, long expectedVersion);
+    PromptAdoption adoptPromptImprovementRun(PromptAdoptionCommand command);
+    PromptAdoption getPromptAdoption(ActorContext actor, UUID workspaceId, UUID candidateId);
     ImprovementRun getImprovementRun(ActorContext actor, UUID workspaceId, UUID improvementRunId);
     ImprovementRun stopImprovementRun(ActorContext actor, UUID workspaceId, UUID improvementRunId, long expectedVersion);
     CandidateSubmission propose(ManualCandidateCommand command);
@@ -66,6 +71,21 @@ public interface CandidateService {
             String datasetKey, String datasetVersion, Instant deadlineAt, String idempotencyKey) { }
 
     record ImprovementRunSubmission(ImprovementRun run, boolean created) { }
+
+    record PromptImprovementRunCommand(ActorContext actor, UUID workspaceId, UUID targetId,
+            long expectedTargetVersion, List<UUID> sourceFeedbackIds, String changeNote, String instructionAppendix,
+            Instant deadlineAt, String idempotencyKey) { }
+    record PromptImprovementRunSubmission(PromptImprovementRun run, LearningCandidate candidate, boolean created) { }
+    record PromptImprovementRun(UUID id, UUID ownerId, UUID targetId, String baseHash, String changeNote, UUID candidateId,
+            Integer candidateRevision, UUID devReportId, UUID heldOutReportId, String status, String reasonCode,
+            long rowVersion, Instant createdAt, Instant updatedAt, Instant deadlineAt,
+            List<UUID> sourceFeedbackIds) { }
+    record PromptAdoptionCommand(ActorContext actor, UUID workspaceId, UUID candidateId, String idempotencyKey) { }
+    record PromptAdoption(UUID id, UUID candidateId, int candidateRevision, UUID promptId, String promptVersion,
+            String promptHash, UUID agentId, String agentVersion, String agentHash, UUID skillId,
+            String skillVersion, String skillHash, UUID capabilityId, String capabilityVersion,
+            String capabilityHash, UUID approvalId, UUID reportId, String reportHash, String status,
+            Instant createdAt, Instant updatedAt) { }
 
     record ImprovementSourceRef(UUID feedbackId, UUID taskId, int attempt, String contextHash,
             int cardRevision, String memoryVersion, String contentHash) { }

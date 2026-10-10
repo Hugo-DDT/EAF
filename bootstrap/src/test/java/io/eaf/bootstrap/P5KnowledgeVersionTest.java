@@ -4,6 +4,7 @@ import io.eaf.knowledge.api.CreateKnowledgeDocumentCommand;
 import io.eaf.knowledge.api.CreateKnowledgeVersionCommand;
 import io.eaf.knowledge.api.KnowledgeService;
 import io.eaf.knowledge.infrastructure.KnowledgeOutboxPublisher;
+import io.eaf.model.api.ModelProfileCatalog;
 import io.eaf.audit.api.AuditPort;
 import io.eaf.shared.ActorContext;
 import io.eaf.shared.ActorType;
@@ -69,8 +70,9 @@ class P5KnowledgeVersionTest {
     @Autowired MockMvc mvc;
     @Autowired AuditPort audit;
     @Autowired PlatformTransactionManager transactionManager;
-    // 本测试从 V60 启动并手动迁移；隔离 P20 的当前版本启动检查，避免它提前访问 V206 表。
+    // 本测试从 V60 启动并手动迁移；隔离只在当前 schema 才可用的后台与档位服务。
     @MockitoBean TaskClusterCapacityMaintenance taskClusterCapacityMaintenance;
+    @MockitoBean ModelProfileCatalog modelProfileCatalog;
 
     @Test
     void preparedVersionStaysOutOfRetrievalUntilBaseVersionPublication() throws Exception {

@@ -28,6 +28,7 @@ public class JdbcPolicyService implements PolicyService, DelegationResourceAutho
     private static final String WRITE_VERSION = "p4-v2";
     private static final String MANAGE_ACTION = "policy:customer-grants:manage";
     private static final UUID SERVICE_REQUEST_REGISTRATION_AGENT_ID = UUID.fromString("20000000-0000-4000-8000-00000000000f");
+    private static final UUID P27_BUSINESS_TOOL_AGENT_ID = UUID.fromString("20000000-0000-4000-8000-000000000021");
     private final JdbcTemplate jdbc;
     private final WorkspaceAuthorization workspaces;
     private final AgentCatalog agents;
@@ -108,6 +109,7 @@ public class JdbcPolicyService implements PolicyService, DelegationResourceAutho
     @Override
     public PolicyDecision evaluate(PolicyRequest request) {
         if (request == null || request.actor() == null) return deny("身份上下文缺失。");
+        if (isP27BusinessTool(request.toolName())) return evaluateP27BusinessTool(request);
         if (request.customerId() == null || request.customerId().isBlank() || request.customerId().length() > 160)
             return deny("customerId 无效。");
         var actor = request.actor();
@@ -179,6 +181,38 @@ public class JdbcPolicyService implements PolicyService, DelegationResourceAutho
         }
         return new PolicyDecision(true, "WRITE".equals(request.effect()) ? WRITE_VERSION : READ_VERSION, "ALLOW");
     }
+
+    private PolicyDecision evaluateP27BusinessTool(PolicyRequest request) {
+        var actor = request.actor();
+        if (actor.type() != ActorType.HUMAN || actor.delegated() || request.workspaceId() == null
+                || !"USER".equals(request.taskSource()) || !P27_BUSINESS_TOOL_AGENT_ID.equals(request.agentId())
+                || !"1.0.0".equals(request.agentVersion()) || !"1.0.0".equals(request.toolVersion()))
+            return deny("P27 Tool 只接受本人 HUMAN 的固定 USER Workflow 版本。");
+        var tool = tools.requirePublished(actor.tenantId(), request.workspaceId(), request.toolName(), request.toolVersion());
+        var expected = switch (request.toolName()) {
+            case "oa.todo.list", "oa.todo.get" -> new P27PolicyBinding("READ", "oa:todo:read", "p27-oa.todo");
+            case "service.request.status.get" -> new P27PolicyBinding("READ", "service-request:status:read", "p27-service-desk.result");
+            case "service.request.result.record" -> new P27PolicyBinding("WRITE", "service-request:result:sync", "p27-service-desk.result");
+            default -> null;
+        };
+        if (expected == null || !expected.effect().equals(request.effect()) || !expected.effect().equals(tool.effect())
+                || !expected.action().equals(tool.permissionAction()) || !expected.bindingRef().equals(tool.bindingRef()))
+            return deny("P27 Tool 与固定动作或连接绑定不匹配。");
+        if (!workspaces.isAuthorized(actor.tenantId(), actor.actorId(), request.workspaceId(), "task:create")
+                || !workspaces.isAuthorized(actor.tenantId(), actor.actorId(), request.workspaceId(), expected.action()))
+            return deny("Workspace 未授权当前 P27 Tool 动作。");
+        var bound = agents.tools(actor.tenantId(), request.workspaceId(), request.agentId(), request.agentVersion())
+                .stream().anyMatch(binding -> binding.name().equals(tool.name()) && binding.version().equals(tool.version()));
+        return bound ? new PolicyDecision(true, "P27-BUSINESS-TOOL-V1", "ALLOW")
+                : deny("固定 P27 Agent 未绑定当前 Tool。");
+    }
+
+    private boolean isP27BusinessTool(String name) {
+        return Set.of("oa.todo.list", "oa.todo.get", "service.request.status.get", "service.request.result.record")
+                .contains(name);
+    }
+
+    private record P27PolicyBinding(String effect, String action, String bindingRef) { }
 
     @Override
     public PolicyDecision evaluateServiceRequest(ServiceRequestPolicyRequest request) {

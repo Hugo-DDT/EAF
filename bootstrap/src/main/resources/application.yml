@@ -30,6 +30,8 @@ spring:
     schemas: eaf_meta
 
 eaf:
+  agent-protocol:
+    declarative-resources-enabled: ${EAF_MCP_DECLARATIVE_RESOURCES_ENABLED:false}
   workflow:
     dispatcher-enabled: ${EAF_WORKFLOW_DISPATCHER_ENABLED:true}
     batch-enabled: ${EAF_WORKFLOW_BATCH_ENABLED:true}

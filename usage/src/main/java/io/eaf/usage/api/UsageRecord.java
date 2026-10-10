@@ -12,7 +12,25 @@ public record UsageRecord(UUID tenantId, UUID workspaceId, UUID taskId, UUID run
                           String scopeType, UUID scopeId, String priceVersion, String priceSourceVersion,
                           Instant priceEffectiveAt, String billingUnit, BigDecimal inputPricePerMillion,
                           BigDecimal outputPricePerMillion, BigDecimal requestPrice, BigDecimal actualCost,
-                          String actualCostCurrency, String billingSource) {
+                          String actualCostCurrency, String billingSource, UUID modelProfileId,
+                          String modelProfileVersion, String modelConfigurationHash, String requestedModel,
+                          Integer effectiveOutputTokenLimit, String reportedResponseModel, String finishReason,
+                          Long modelOperationMillis) {
+    public UsageRecord(UUID tenantId, UUID workspaceId, UUID taskId, UUID runId, String source,
+                       String provider, String model, Integer inputTokens, Integer outputTokens,
+                       String usageStatus, BigDecimal estimatedCost, String costCurrency,
+                       String costStatus, String costSource, int reservedTokens, String status, String errorCode,
+                       Instant startedAt, Instant endedAt, int callNo, String callKey, String callType,
+                       String scopeType, UUID scopeId, String priceVersion, String priceSourceVersion,
+                       Instant priceEffectiveAt, String billingUnit, BigDecimal inputPricePerMillion,
+                       BigDecimal outputPricePerMillion, BigDecimal requestPrice, BigDecimal actualCost,
+                       String actualCostCurrency, String billingSource) {
+        this(tenantId, workspaceId, taskId, runId, source, provider, model, inputTokens, outputTokens, usageStatus,
+                estimatedCost, costCurrency, costStatus, costSource, reservedTokens, status, errorCode, startedAt,
+                endedAt, callNo, callKey, callType, scopeType, scopeId, priceVersion, priceSourceVersion,
+                priceEffectiveAt, billingUnit, inputPricePerMillion, outputPricePerMillion, requestPrice,
+                actualCost, actualCostCurrency, billingSource, null, null, null, null, null, null, null, null);
+    }
     // 旧调用方按 Task/Run/调用序号生成稳定键，统一视作聊天模型调用。
     public UsageRecord(UUID tenantId, UUID workspaceId, UUID taskId, UUID runId, String source,
                        String provider, String model, Integer inputTokens, Integer outputTokens,

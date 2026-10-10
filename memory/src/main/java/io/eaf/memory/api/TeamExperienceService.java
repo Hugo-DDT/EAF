@@ -10,6 +10,7 @@ import java.util.UUID;
 public interface TeamExperienceService {
     TeamExperiencePage list(ActorContext actor, UUID workspaceId, String scenarioKey, boolean owned, String status,
                             Instant cursorUpdatedAt, UUID cursorId, int limit);
+    TeamExperienceDiscovery discover(ActorContext actor, UUID workspaceId, String scenarioKey, List<String> keywords, int limit);
     TeamExperience get(ActorContext actor, UUID workspaceId, UUID cardId);
     List<TeamExperienceRevision> versions(ActorContext actor, UUID workspaceId, UUID cardId,
                                           Integer beforeRevision, int limit);
@@ -53,6 +54,18 @@ public interface TeamExperienceService {
     record TeamExperiencePage(List<TeamExperience> items, Instant nextCursorUpdatedAt, UUID nextCursorId) {
         public TeamExperiencePage { items = items == null ? List.of() : List.copyOf(items); }
     }
+    record TeamExperienceDiscovery(String algorithmVersion, List<DiscoveredTeamExperience> items) {
+        public TeamExperienceDiscovery { items = items == null ? List.of() : List.copyOf(items); }
+    }
+    record DiscoveredTeamExperience(UUID cardId, int revision, String memoryVersion, String contentHash,
+            String title, String appliesWhen, int score, List<String> matchedTerms, List<String> matchedFields,
+            String preview, Instant expiresAt, TeamExperienceSourceSummary source) {
+        public DiscoveredTeamExperience {
+            matchedTerms = List.copyOf(matchedTerms);
+            matchedFields = List.copyOf(matchedFields);
+        }
+    }
+    record TeamExperienceSourceSummary(UUID workItemId, String outcome, Instant completedAt) { }
     record TeamExperience(UUID id, UUID ownerId, String scenarioKey, int latestRevision,
             Integer activeRevision, long version, String status, Instant updatedAt,
             TeamExperienceRevision latest, TeamExperienceRevision active) { }

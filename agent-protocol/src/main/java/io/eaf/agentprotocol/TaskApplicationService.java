@@ -7,6 +7,7 @@ import io.eaf.capability.api.CapabilityService;
 import io.eaf.execution.api.ExecutionService;
 import io.eaf.execution.api.ExecutionSnapshot;
 import io.eaf.learning.api.FeedbackService;
+import io.eaf.model.api.ModelProfileSelection;
 import io.eaf.knowledge.api.KnowledgeService;
 import io.eaf.workspace.api.WorkspaceAuthorization;
 import io.eaf.workflow.api.CreateWorkflowInstanceCommand;
@@ -107,7 +108,7 @@ public class TaskApplicationService {
         var task = tasks.create(new CreateTaskCommand(actor, workspaceId, agentId, agentVersion, request.input(),
                 entity == null ? null : entity.type(), entity == null ? null : entity.id(), idempotencyKey,
                 traceId == null || traceId.isBlank() ? UUID.randomUUID().toString() : traceId,
-                "USER", binding, entryProtocol));
+                "USER", binding, entryProtocol, request.modelProfileRef()));
         return project(actor, workspaceId, task, List.of());
     }
 
@@ -163,7 +164,8 @@ public class TaskApplicationService {
     public TaskResponse get(ActorContext actor, UUID workspaceId, UUID taskId) {
         tasks.requireConversationTaskAccess(actor, workspaceId, taskId);
         var task = tasks.get(actor, workspaceId, taskId);
-        var steps = runtime.steps(actor, workspaceId, taskId);
+        var steps = actor.delegated() && io.eaf.identity.api.IdentityService.MCP_AUDIENCE.equals(actor.delegationAudience())
+                ? List.<TaskStepView>of() : runtime.steps(actor, workspaceId, taskId);
         return project(actor, workspaceId, task, steps);
     }
 
@@ -189,7 +191,8 @@ public class TaskApplicationService {
         tasks.requireConversationTaskAccess(actor, workspaceId, taskId);
         var task = tasks.get(actor, workspaceId, taskId);
         var rows = usage.findForTask(actor.tenantId(), workspaceId, task.id());
-        if (rows.isEmpty()) return new TaskUsageResponse(0, null, null, "NOT_RECORDED", List.of());
+        var selection = tasks.modelSelection(actor, workspaceId, task.id());
+        if (rows.isEmpty()) return new TaskUsageResponse(0, null, null, "NOT_RECORDED", List.of(), selection);
         var known = rows.stream().filter(row -> "KNOWN".equals(row.usageStatus())
                 && row.inputTokens() != null && row.outputTokens() != null).toList();
         var input = known.stream().mapToInt(UsageRecord::inputTokens).sum();
@@ -211,7 +214,7 @@ public class TaskApplicationService {
         var costs = grouped.values().stream().map(item -> new TaskUsageCost(item.currency,
                 item.amountKnown ? item.amount : null, item.status, item.calls)).toList();
         return new TaskUsageResponse(rows.size(), known.isEmpty() ? null : input,
-                known.isEmpty() ? null : output, tokenStatus, costs);
+                known.isEmpty() ? null : output, tokenStatus, costs, selection);
     }
 
     @Transactional
@@ -463,13 +466,24 @@ public class TaskApplicationService {
     }
 
     public record CreateRequest(UUID agentId, String agentVersion, UUID capabilityId, String capabilityVersion,
-                                String input, BusinessEntity businessEntity) { }
+                                String input, BusinessEntity businessEntity,
+                                io.eaf.model.api.ModelProfileRef modelProfileRef) {
+        public CreateRequest(UUID agentId, String agentVersion, UUID capabilityId, String capabilityVersion,
+                             String input, BusinessEntity businessEntity) {
+            this(agentId, agentVersion, capabilityId, capabilityVersion, input, businessEntity, null);
+        }
+    }
 
     public record TaskPageResponse(List<TaskResponse> items, long totalSize, TaskPageCursor nextCursor) { }
     public record ExperienceDraftRequest(UUID feedbackId, String draftText) { }
     private record ExperienceDraftInput(String correction, String evidence, String draftText) { }
     public record TaskUsageResponse(int calls, Integer inputTokens, Integer outputTokens, String tokenStatus,
-                                    List<TaskUsageCost> costs) { }
+                                    List<TaskUsageCost> costs, ModelProfileSelection modelSelection) {
+        public TaskUsageResponse(int calls, Integer inputTokens, Integer outputTokens, String tokenStatus,
+                                 List<TaskUsageCost> costs) {
+            this(calls, inputTokens, outputTokens, tokenStatus, costs, null);
+        }
+    }
     public record TaskUsageCost(String currency, BigDecimal amount, String status, int calls) { }
     public record ServiceRequestExecution(UUID id, String status, UUID operationId, String requestId, String errorCode) { }
     public record ServiceRequestResponse(UUID submissionId, UUID sourceTaskId, long sourceTaskVersion,

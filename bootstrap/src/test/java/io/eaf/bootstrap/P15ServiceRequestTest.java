@@ -13,22 +13,29 @@ import io.eaf.knowledge.api.CreateKnowledgeDocumentCommand;
 import io.eaf.knowledge.api.KnowledgeService;
 import io.eaf.knowledge.infrastructure.KnowledgeOutboxPublisher;
 import io.eaf.evaluation.api.EvaluationService;
+import io.eaf.evaluation.api.PromptAnalysisEvaluationService;
 import io.eaf.evaluation.api.ScenarioEvaluationService;
 import io.eaf.evaluation.infrastructure.JdbcEvaluationService;
 import io.eaf.evaluation.infrastructure.JdbcScenarioEvaluationService;
 import io.eaf.learning.api.CandidateService;
 import io.eaf.learning.infrastructure.JdbcCandidateService;
 import io.eaf.model.api.ModelGateway;
+import io.eaf.model.api.ModelProfileRef;
+import io.eaf.model.api.ModelRequest;
+import io.eaf.model.api.ModelResult;
+import io.eaf.model.infrastructure.DeterministicModelGateway;
 import io.eaf.shared.ActorContext;
 import io.eaf.shared.ActorType;
 import io.eaf.shared.Hashing;
 import io.eaf.shared.Ids;
 import io.eaf.task.api.CreateTaskCommand;
+import io.eaf.task.api.CreateQualityRunTaskCommand;
 import io.eaf.task.api.TaskAssetBinding;
 import io.eaf.task.api.TaskRunner;
 import io.eaf.task.api.TaskService;
 import io.eaf.task.api.TaskStatus;
 import io.eaf.workflow.api.WorkflowService;
+import io.eaf.workflow.api.WorkflowAutomationService;
 import io.eaf.workflow.infrastructure.JdbcWorkflowService;
 import io.eaf.workflow.infrastructure.WorkflowDispatcher;
 import java.net.InetSocketAddress;
@@ -38,6 +45,8 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -53,6 +62,7 @@ import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -62,6 +72,8 @@ import org.testcontainers.utility.DockerImageName;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -70,10 +82,14 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @SpringBootTest(properties = {"eaf.task.dispatcher-enabled=false", "eaf.execution.outbox-publisher-enabled=false",
         "eaf.knowledge.outbox-publisher-enabled=false", "eaf.memory.outbox-publisher-enabled=false",
         "eaf.workflow.dispatcher-enabled=false", "eaf.model.mode=deterministic",
+        "eaf.workflow.automation.enabled=false",
         "eaf.model.scenario=SERVICE_REQUEST_SEARCH", "eaf.model.jev.mode=deterministic",
         "eaf.model.jev.evidence-mode=deterministic", "eaf.credentials.p15-service-desk.token=p15-synthetic-token",
+        "eaf.credentials.p27-oa.token=p27-oa-token",
+        "eaf.credentials.p27-service-desk-result.token=p27-service-token",
         "eaf.learning.improvement.enabled=true", "eaf.learning.improvement.poll-delay-ms=3600000",
         "eaf.learning.improvement-evaluation-poll-delay-ms=3600000",
+        "eaf.learning.prompt-improvement-poll-delay-ms=3600000",
         "eaf.evaluation.team-preparation-poll-delay-ms=3600000", "eaf.evaluation.scenario-poll-delay-ms=3600000"})
 @AutoConfigureMockMvc
 class P15ServiceRequestTest {
@@ -109,19 +125,198 @@ class P15ServiceRequestTest {
     @Autowired KnowledgeService knowledge;
     @Autowired CapabilityService capabilities;
     @Autowired WorkflowService workflows;
+    @Autowired WorkflowAutomationService automations;
     @Autowired CandidateService candidates;
     @Autowired JdbcCandidateService candidateDispatcher;
     @Autowired EvaluationService evaluations;
     @Autowired JdbcEvaluationService evaluationDispatcher;
     @Autowired ScenarioEvaluationService scenarioEvaluations;
+    @Autowired PromptAnalysisEvaluationService promptEvaluations;
     @Autowired JdbcScenarioEvaluationService scenarioDispatcher;
     @Autowired WorkflowDispatcher workflowDispatcher;
     @Autowired JdbcWorkflowService jdbcWorkflows;
     @Autowired ExecutionService executions;
     @Autowired ApprovalService approvals;
-    @Autowired ModelGateway model;
+    @MockitoSpyBean ModelGateway model;
     @Autowired AuditPort audit;
     @Autowired PlatformTransactionManager transactionManager;
+
+    @Test
+    void p31PromptRunAcceptsOptionalFeedbackAndReplaysDefaultDeadline() throws Exception {
+        var targetPath = "/api/v1/workspaces/" + WORKSPACE + "/prompt-improvement-targets";
+        var target = json.readTree(mvc.perform(post(targetPath).header("Authorization", AUTH)
+                        .header("Idempotency-Key", "p31-target-" + UUID.randomUUID())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString());
+        var runPath = "/api/v1/workspaces/" + WORKSPACE + "/prompt-improvement-runs";
+        var body = json.createObjectNode().put("targetId", target.path("id").asText())
+                .put("expectedTargetVersion", target.path("rowVersion").asLong())
+                .put("changeNote", "让首轮分析先区分已有证据与待补信息。")
+                .put("instructionAppendix", "先列出已知事实及引用，再明确说明仍缺少哪些信息。");
+        body.putArray("sourceFeedbackIds");
+        var key = "p31-run-" + UUID.randomUUID();
+        var firstResponse = mvc.perform(post(runPath).header("Authorization", AUTH).header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(body)))
+                .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString();
+        var first = json.readTree(firstResponse);
+        mvc.perform(get(targetPath + "/" + target.path("id").asText()).header("Authorization", AUTH))
+                .andExpect(status().isOk());
+        assertThat(first.path("status").asText()).isEqualTo("AWAITING_REVIEW");
+        assertThat(first.path("candidateId").asText()).isNotBlank();
+        mvc.perform(get("/api/v1/workspaces/" + WORKSPACE + "/learning-candidates/" + first.path("candidateId").asText())
+                        .header("Authorization", AUTH))
+                .andExpect(status().isOk());
+        assertThat(first.path("changeNote").asText()).isEqualTo(body.path("changeNote").asText());
+        assertThat(first.path("sourceFeedbackIds")).isEmpty();
+        var replayResponse = mvc.perform(post(runPath).header("Authorization", AUTH).header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(body)))
+                .andReturn().getResponse();
+        assertThat(replayResponse.getStatus()).as(replayResponse.getContentAsString()).isEqualTo(200);
+        var replay = json.readTree(replayResponse.getContentAsString());
+        assertThat(replay.path("id").asText()).isEqualTo(first.path("id").asText());
+        assertThat(replay.path("deadlineAt").asText()).isEqualTo(first.path("deadlineAt").asText());
+        mvc.perform(get(runPath + "/" + first.path("id").asText()).header("Authorization", "Bearer eaf-local-bob"))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void p31ControlledPromptCandidateCanBeReviewedPublishedAdoptedAndWithdrawn() throws Exception {
+        grantP23(ALICE, "prompt:manage", "prompt:publish", "learning:propose", "learning:read", "learning:publish",
+                "learning:withdraw", "evaluation:run", "evaluation:read", "task:create", "agent:write", "agent:publish",
+                "skill:write", "skill:publish", "capability:write", "capability:publish");
+        grantP23(ALICE, "prompt:read");
+        grantP23(BOB, "learning:read", "learning:review", "learning:approve", "evaluation:read", "prompt:read");
+        var marker = "P31_TEST_CONTROLLED_APPENDIX";
+        doAnswer(invocation -> p31ControlledPromptResult(invocation.getArgument(0), marker))
+                .when(model).call(any(ModelRequest.class));
+
+        var fixtureKey = "p31-controlled-" + UUID.randomUUID();
+        publishKnowledge("P31 合成服务请求依据",
+                "新员工无法访问项目管理系统，请确认应如何开通账号。会议室 B201 的顶灯闪烁，影响会议，请协助处理。新增育儿假申请需要哪些材料。项目管理系统账号开通属于 IT 服务；会议室照明故障属于设施服务；育儿假申请应核对人事材料清单。",
+                fixtureKey);
+        new KnowledgeOutboxPublisher(jdbc, audit, transactionManager).publish();
+
+        var targetPath = path("/prompt-improvement-targets");
+        var target = json.readTree(mvc.perform(post(targetPath).header("Authorization", AUTH)
+                        .header("Idempotency-Key", fixtureKey + "-target").contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString());
+        var runBody = json.createObjectNode().put("targetId", target.path("id").asText())
+                .put("expectedTargetVersion", target.path("rowVersion").asLong())
+                .put("changeNote", "受控 Gateway 检查候选是否区分完整请求、待澄清请求和证据不足。")
+                .put("instructionAppendix", "P31_TEST_CONTROLLED_APPENDIX：依据请求与已授权资料区分分类、待补信息和证据不足。");
+        runBody.putArray("sourceFeedbackIds");
+        var runResponse = json.readTree(mvc.perform(post(path("/prompt-improvement-runs"))
+                        .header("Authorization", AUTH).header("Idempotency-Key", fixtureKey + "-run")
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(runBody)))
+                .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString());
+        var runId = UUID.fromString(runResponse.path("id").asText());
+        var candidateId = UUID.fromString(runResponse.path("candidateId").asText());
+        var candidate = candidates.get(ALICE, WORKSPACE, candidateId);
+        var proposedVersion = candidate.rowVersion();
+        assertThatThrownBy(() -> candidates.review(new CandidateService.CandidateReviewCommand(ALICE, WORKSPACE,
+                candidateId, proposedVersion, "ACCEPTED", "proposer cannot review", List.of("policy:service-request-facts"))))
+                .isInstanceOf(io.eaf.shared.EafException.class);
+        candidate = candidates.review(new CandidateService.CandidateReviewCommand(BOB, WORKSPACE, candidateId,
+                candidate.rowVersion(), "ACCEPTED", "按固定合成规则核对 Prompt 补充和基线边界。",
+                List.of("policy:service-request-facts")));
+
+        var evaluating = candidates.getPromptImprovementRun(ALICE, WORKSPACE, runId);
+        assertThat(evaluating.status()).isEqualTo("DEV_EVALUATING");
+        var devReport = drivePromptReport(evaluating.devReportId());
+        assertThat(devReport.improvedPairs()).isPositive();
+        assertThat(devReport.regressedPairs()).isZero();
+        candidateDispatcher.dispatchNextPromptImprovementEvaluation();
+
+        evaluating = candidates.getPromptImprovementRun(ALICE, WORKSPACE, runId);
+        assertThat(evaluating.status()).isEqualTo("HELD_OUT_EVALUATING");
+        var heldOutReport = drivePromptReport(evaluating.heldOutReportId());
+        assertThat(heldOutReport.improvedPairs()).isPositive();
+        assertThat(heldOutReport.regressedPairs()).isZero();
+        candidateDispatcher.dispatchNextPromptImprovementEvaluation();
+        var ready = candidates.getPromptImprovementRun(ALICE, WORKSPACE, runId);
+        assertThat(ready.status()).as("P31 prompt run: %s", ready).isEqualTo("READY");
+        var evidence = promptEvaluations.releaseEvidence(ALICE, WORKSPACE, candidateId, 1,
+                ready.devReportId(), ready.heldOutReportId());
+        assertThat(evidence.eligibility()).isEqualTo("ELIGIBLE");
+        assertThat(evidence.current()).isTrue();
+
+        var approval = candidates.approve(new CandidateService.CandidateApprovalCommand(BOB, WORKSPACE,
+                candidateId, candidate.rowVersion(), "APPROVED", "批准当前 DEV 与 HELD_OUT 工程证据。", ready.heldOutReportId()));
+        var currentEvidence = promptEvaluations.releaseEvidence(ALICE, WORKSPACE, candidateId, 1,
+                ready.devReportId(), ready.heldOutReportId());
+        assertThat(approval.evaluationReportId()).as("approval=%s evidence=%s", approval, currentEvidence)
+                .isEqualTo(currentEvidence.reportId());
+        assertThat(approval.evaluationReportHash()).as("approval=%s evidence=%s", approval, currentEvidence)
+                .isEqualTo(currentEvidence.reportHash());
+        assertThat(approval.evaluationConfigurationHash()).as("approval=%s evidence=%s", approval, currentEvidence)
+                .isEqualTo(currentEvidence.configurationHash());
+        assertThat(approval.datasetHash()).as("approval=%s evidence=%s", approval, currentEvidence)
+                .isEqualTo(currentEvidence.datasetHash());
+        candidate = candidates.get(ALICE, WORKSPACE, candidateId);
+        assertThat(candidates.publish(new CandidateService.CandidateReleaseCommand(ALICE, WORKSPACE,
+                candidateId, candidate.rowVersion(), approval.id())).status()).isEqualTo("RELEASED");
+        var adoption = candidates.adoptPromptImprovementRun(new CandidateService.PromptAdoptionCommand(ALICE, WORKSPACE,
+                candidateId, fixtureKey + "-adopt"));
+        assertThat(adoption.status()).isEqualTo("ADOPTED");
+        var capability = capabilities.requirePublished(ALICE, WORKSPACE, adoption.capabilityId(), adoption.capabilityVersion());
+        var trial = tasks.create(new CreateTaskCommand(ALICE, WORKSPACE, adoption.agentId(), adoption.agentVersion(),
+                "新员工无法访问项目管理系统，请确认应如何开通账号。", null, null, fixtureKey + "-trial", "trace-" + fixtureKey,
+                "USER", new TaskAssetBinding(capability.id(), capability.version(), capability.contentHash(), capability.skillId(),
+                        capability.skillVersion(), capability.skillContentHash()), "REST"));
+        var work = tasks.claimOne().orElseThrow(() -> new AssertionError(
+                "P31 adopted USER trial is not claimable: " + tasks.get(ALICE, WORKSPACE, trial.id())));
+        assertThat(work.id()).isEqualTo(trial.id());
+        tasks.complete(work, runtime.run(work));
+        assertThat(tasks.get(ALICE, WORKSPACE, trial.id()).status()).isEqualTo(TaskStatus.SUCCEEDED);
+        assertThat(candidates.recordIteration(ALICE, WORKSPACE, candidateId, trial.id()).iteration().taskStatus())
+                .isEqualTo("SUCCEEDED");
+
+        candidate = candidates.get(ALICE, WORKSPACE, candidateId);
+        assertThat(candidates.withdrawRelease(new CandidateService.CandidateWithdrawalCommand(ALICE, WORKSPACE,
+                candidateId, candidate.rowVersion(), fixtureKey + "-withdraw")).status()).isEqualTo("WITHDRAWN");
+        assertThatThrownBy(() -> tasks.create(new CreateTaskCommand(ALICE, WORKSPACE, adoption.agentId(), adoption.agentVersion(),
+                "新员工无法访问项目管理系统，请确认应如何开通账号。", null, null, fixtureKey + "-after-withdrawal",
+                "trace-" + fixtureKey + "-withdrawn", "USER", new TaskAssetBinding(capability.id(),
+                        capability.version(), capability.contentHash(), capability.skillId(),
+                        capability.skillVersion(), capability.skillContentHash()), "REST")))
+                .isInstanceOf(io.eaf.shared.EafException.class);
+
+        doAnswer(invocation -> new ModelResult("deterministic", "p15-test",
+                "{\"action\":\"FINAL\",\"outcome\":\"NEEDS_INPUT\",\"citations\":[],"
+                        + "\"questions\":[\"请补充受影响的系统或地点。\"]}", 64, 18, "KNOWN"))
+                .when(model).call(any(ModelRequest.class));
+        var unchangedKey = fixtureKey + "-unchanged";
+        var unchangedTarget = json.readTree(mvc.perform(post(targetPath).header("Authorization", AUTH)
+                        .header("Idempotency-Key", unchangedKey + "-target").contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString());
+        var unchangedBody = json.createObjectNode().put("targetId", unchangedTarget.path("id").asText())
+                .put("expectedTargetVersion", unchangedTarget.path("rowVersion").asLong())
+                .put("changeNote", "验证默认确定性模型对固定提示词保持相同输出。")
+                .put("instructionAppendix", "保留原有请求分类和输出行为。");
+        unchangedBody.putArray("sourceFeedbackIds");
+        var unchangedCreated = json.readTree(mvc.perform(post(path("/prompt-improvement-runs"))
+                        .header("Authorization", AUTH).header("Idempotency-Key", unchangedKey + "-run")
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(unchangedBody)))
+                .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString());
+        var unchangedRunId = UUID.fromString(unchangedCreated.path("id").asText());
+        var unchangedCandidateId = UUID.fromString(unchangedCreated.path("candidateId").asText());
+        var unchangedCandidate = candidates.get(ALICE, WORKSPACE, unchangedCandidateId);
+        candidates.review(new CandidateService.CandidateReviewCommand(BOB, WORKSPACE, unchangedCandidateId,
+                unchangedCandidate.rowVersion(), "ACCEPTED", "核对该候选保持固定提示模板的说明。",
+                List.of("policy:service-request-facts")));
+        var unchangedRun = candidates.getPromptImprovementRun(ALICE, WORKSPACE, unchangedRunId);
+        var unchangedDev = drivePromptReport(unchangedRun.devReportId());
+        assertThat(unchangedDev.improvedPairs()).isZero();
+        assertThat(unchangedDev.unchangedPairs()).isEqualTo(4);
+        candidateDispatcher.dispatchNextPromptImprovementEvaluation();
+        unchangedRun = candidates.getPromptImprovementRun(ALICE, WORKSPACE, unchangedRunId);
+        var unchangedHeldOut = drivePromptReport(unchangedRun.heldOutReportId());
+        assertThat(unchangedHeldOut.improvedPairs()).isZero();
+        assertThat(unchangedHeldOut.unchangedPairs()).isEqualTo(1);
+        candidateDispatcher.dispatchNextPromptImprovementEvaluation();
+        assertThat(candidates.getPromptImprovementRun(ALICE, WORKSPACE, unchangedRunId).status())
+                .isEqualTo("NOT_SELECTED");
+    }
 
     @Test
     void p21BatchRunsFixedBranchesWithOwnerAndSourceBoundResults() throws Exception {
@@ -225,6 +420,13 @@ class P15ServiceRequestTest {
         assertThat(compact.promptVersion()).isEqualTo("1.0.0");
         assertThat(compact.skillVersion()).isEqualTo("1.0.0");
         assertThat(compact.toolDependencies()).isEmpty();
+        var profileCatalog = json.readTree(mvc.perform(get(path("/model-profiles"))
+                        .param("capabilityId", PLAN_CAPABILITY.toString()).param("capabilityVersion", "1.1.0")
+                        .header("Authorization", AUTH))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        assertThat(profileCatalog.size()).isEqualTo(2);
+        assertThat(profileCatalog.findValuesAsText("profileId")).contains(
+                "22000000-0000-4000-8000-000000000001", "22000000-0000-4000-8000-000000000002");
 
         var baseline = capabilities.requirePublished(ALICE, WORKSPACE, PLAN_CAPABILITY, "1.0.0");
         var baselineTask = tasks.create(new CreateTaskCommand(ALICE, WORKSPACE, PLAN_AGENT, "1.0.0", "办公电脑无法启动",
@@ -239,15 +441,28 @@ class P15ServiceRequestTest {
         assertThat(baselineMeta.path("strategy").asText()).isEqualTo("FULL_CONTEXT_V1");
         assertThat(baselineMeta.path("contextUtf8Bytes").asLong()).isEqualTo(baselineMeta.path("fullContextUtf8Bytes").asLong());
 
-        var userTask = tasks.create(new CreateTaskCommand(ALICE, WORKSPACE, PLAN_AGENT, "1.1.0", "办公电脑无法启动",
-                null, null, "p24-user-" + UUID.randomUUID(), "trace-p24-user", "USER",
-                new TaskAssetBinding(compact.id(), compact.version(), compact.contentHash(), compact.skillId(),
-                        compact.skillVersion(), compact.skillContentHash()), "REST"));
+        var userTaskRequest = json.createObjectNode().put("agentId", PLAN_AGENT.toString()).put("agentVersion", "1.1.0")
+                .put("capabilityId", PLAN_CAPABILITY.toString()).put("capabilityVersion", "1.1.0")
+                .put("input", "办公电脑无法启动");
+        userTaskRequest.set("modelProfileRef", json.createObjectNode()
+                .put("profileId", "22000000-0000-4000-8000-000000000002").put("version", "1.0.0"));
+        var createdUserTask = json.readTree(mvc.perform(post(path("/tasks"))
+                        .header("Authorization", AUTH).header("Idempotency-Key", "p24-user-" + UUID.randomUUID())
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(userTaskRequest)))
+                .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString());
+        var userTask = tasks.get(ALICE, WORKSPACE, UUID.fromString(createdUserTask.path("id").asText()));
         var userWork = tasks.claimOne().orElseThrow();
         assertThat(userWork.id()).isEqualTo(userTask.id());
         tasks.complete(userWork, runtime.run(userWork));
         var userResult = tasks.get(ALICE, WORKSPACE, userTask.id());
         assertThat(userResult.status()).isEqualTo(TaskStatus.SUCCEEDED);
+        var usageResponse = json.readTree(mvc.perform(get(path("/tasks/" + userTask.id() + "/usage"))
+                        .header("Authorization", AUTH))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        assertThat(usageResponse.path("modelSelection").path("effectiveProfile").path("profileId").asText())
+                .isEqualTo("22000000-0000-4000-8000-000000000002");
+        assertThat(usageResponse.path("modelSelection").path("effectiveProfile").path("maxOutputTokens").asInt())
+                .isEqualTo(1024);
         var userOutput = json.readTree(userResult.resultJson());
         assertThat(userOutput.path("readyToSubmit").asBoolean()).isTrue();
         var userPresentation = runtimeQuery.steps(ALICE, WORKSPACE, userTask.id()).stream()
@@ -323,11 +538,43 @@ class P15ServiceRequestTest {
         assertThat(report.optimization().comparison().preparedRequests()).isPositive();
         assertThat(report.optimization().comparison().contextReductionUtf8Bytes()).isPositive();
         assertThat(report.optimization().conditionsComparable()).isFalse();
-        assertThat(report.optimization().conditionsReasons()).contains("PROVIDER_CONFIGURATION_UNVERIFIED");
+        assertThat(report.optimization().conditionsReasons()).contains("MODEL_IDENTITY_NOT_RECORDED");
         assertThat(report.optimization().pairs()).hasSize(4);
         assertThat(report.optimization().pairs()).allSatisfy(pair ->
                 assertThat(pair.metricDeltas()).containsKeys("queueMillis", "taskMillis"));
         assertThat(report.optimization().pairedSummary().metricDeltas()).containsKeys("queueMillis", "taskMillis");
+
+        var profileRun = scenarioEvaluations.createRun(ALICE, WORKSPACE,
+                new ScenarioEvaluationService.ScenarioRunRequest("service-request-synthetic", "1.0.0", "DEV", "PAIRED",
+                        new ScenarioEvaluationService.CapabilityVersion(PLAN_CAPABILITY, "1.0.0"),
+                        new ScenarioEvaluationService.CapabilityVersion(PLAN_CAPABILITY, "1.0.0"),
+                        Instant.now().plusSeconds(900), "P15_MODEL_PROFILE_V1",
+                        new ModelProfileRef(UUID.fromString("22000000-0000-4000-8000-000000000001"), "1.0.0"),
+                        new ModelProfileRef(UUID.fromString("22000000-0000-4000-8000-000000000002"), "1.0.0")),
+                "p32-profile-paired-" + UUID.randomUUID()).report();
+        for (var attempt = 0; attempt < 100; attempt++) {
+            jdbc.update("update evaluation.scenario_run set next_poll_at = now(), lease_until = null where id = ?", profileRun.runId());
+            scenarioDispatcher.dispatchNext();
+            var activeTaskId = jdbc.query("select task_id from evaluation.scenario_sample where run_id = ? and status = 'ACTIVE' "
+                            + "and task_id is not null order by case_id, side limit 1", rs -> rs.next() ? rs.getObject(1, UUID.class) : null,
+                    profileRun.runId());
+            var work = activeTaskId == null ? java.util.Optional.<io.eaf.task.api.TaskWorkItem>empty() : tasks.claim(activeTaskId);
+            if (work.isPresent()) tasks.complete(work.get(), runtime.run(work.get()));
+            var current = scenarioEvaluations.getRun(ALICE, WORKSPACE, profileRun.runId());
+            if (Set.of("COMPLETED", "COMPLETED_WITH_ERRORS", "STOPPED", "FAILED", "TIMED_OUT").contains(current.status())) break;
+        }
+        var profileReport = scenarioEvaluations.getRun(ALICE, WORKSPACE, profileRun.runId());
+        assertThat(profileReport.status()).isEqualTo("COMPLETED");
+        assertThat(profileReport.modelProfileEvidence().experiment()).isEqualTo("P15_MODEL_PROFILE_V1");
+        assertThat(profileReport.modelProfileEvidence().configurationComparable()).isTrue();
+        assertThat(profileReport.modelProfileEvidence().baseline().effectiveProfile().maxOutputTokens()).isEqualTo(8_000);
+        assertThat(profileReport.modelProfileEvidence().comparison().effectiveProfile().maxOutputTokens()).isEqualTo(1_024);
+        assertThat(profileReport.optimization().pairs()).hasSize(4);
+        var recordedOutputLimits = jdbc.queryForList("select distinct effective_output_token_limit from usage.model_usage "
+                        + "where scope_type = 'EVALUATION' and scope_id = ? and effective_output_token_limit is not null",
+                Integer.class, profileRun.runId());
+        assertThat(recordedOutputLimits).contains(1_024);
+        assertThat(recordedOutputLimits).anySatisfy(limit -> assertThat(limit).isBetween(1_025, 8_000));
 
         var evaluationTaskId = scenarioEvaluations.listSamples(ALICE, WORKSPACE, runId, 40).stream()
                 .filter(sample -> "COMPARISON".equals(sample.side()) && sample.taskId() != null)
@@ -361,6 +608,9 @@ class P15ServiceRequestTest {
 
     @Test
     void boundedAnalysisConfirmationApprovalAndIdempotentLoopbackRegistration() throws Exception {
+        var methodModel = new DeterministicModelGateway("SERVICE_REQUEST_SEARCH");
+        doAnswer(invocation -> methodModel.call(invocation.getArgument(0))).when(model).call(any(ModelRequest.class));
+        doAnswer(invocation -> methodModel.callCount()).when(model).callCount();
         var registration = capabilities.requirePublished(ALICE, WORKSPACE, REGISTER_CAPABILITY, "1.0.0");
         assertThat(registration.contentHash()).isEqualTo("43517612934f783d09a9e801e6c520153a4b20faaeccc5bfbfa626c439de34cb");
         assertThat(registration.toolDependencies()).extracting("name").containsExactly("service.request.register");
@@ -369,8 +619,8 @@ class P15ServiceRequestTest {
         assertThat(definition.dependencies()).singleElement().satisfies(dependency ->
                 assertThat(dependency.contentHash()).isEqualTo(registration.contentHash()));
 
-        publishKnowledge("IT 设备说明", "办公电脑无法启动属于 IT 设备维修事项；员工希望登记设备检修。", "p15-it");
-        publishKnowledge("服务请求登记规范", "内部服务请求登记所需信息包括设备地点和故障现象；按设备处理规范核对后受理。", "p15-policy");
+        var itGuideId = publishKnowledge("IT 设备说明", "办公电脑无法启动属于 IT 设备维修事项；员工希望登记设备检修。", "p15-it");
+        var requestPolicyId = publishKnowledge("服务请求登记规范", "内部服务请求登记所需信息包括设备地点和故障现象；按设备处理规范核对后受理。", "p15-policy");
         new KnowledgeOutboxPublisher(jdbc, audit, transactionManager).publish();
 
         var analysis = capabilities.requirePublished(ALICE, WORKSPACE, PLAN_CAPABILITY, "1.0.0");
@@ -403,8 +653,14 @@ class P15ServiceRequestTest {
         assertThat(result.path("readyToSubmit").asBoolean()).isTrue();
         assertThat(result.path("searchCount").asInt()).isEqualTo(1);
         assertThat(result.path("generationCount").asInt()).isEqualTo(1);
-        assertThat(result.path("contextRefs").size()).isEqualTo(2);
-        assertThat(model.callCount()).isEqualTo(2);
+        var contextRefs = result.path("contextRefs");
+        var citedDocumentIds = java.util.stream.StreamSupport.stream(contextRefs.spliterator(), false)
+                .map(ref -> ref.path("documentId").asText()).toList();
+        assertThat(citedDocumentIds).contains(itGuideId.toString(), requestPolicyId.toString());
+        assertThat(java.util.stream.StreamSupport.stream(contextRefs.spliterator(), false)
+                .allMatch(ref -> "KNOWLEDGE".equals(ref.path("sourceType").asText()))).isTrue();
+        var p15ModelCallBaseline = methodModel.callCount();
+        assertThat(p15ModelCallBaseline).isPositive();
 
         mvc.perform(post(path("/tasks/" + task.id() + "/service-requests"))
                         .header("Authorization", "Bearer eaf-local-bob")
@@ -434,10 +690,7 @@ class P15ServiceRequestTest {
             jdbc.update("update connector.instance set base_url = ?, status = 'ACTIVE' where tenant_id = ? and workspace_id = ? and provider = ?",
                     fixture.url(), Ids.TENANT_A, WORKSPACE, "P15_INTERNAL_SERVICE_DESK_FIXTURE");
             var workflowId = UUID.fromString(submission.path("workflowId").asText());
-            assertThat(workflowDispatcher.dispatchOne()).isTrue();
-            assertThat(workflowDispatcher.dispatchOne()).isTrue();
-            var childTaskId = jdbc.queryForObject("select child_task_id from workflow.step where instance_id = ? and step_id = 'register'",
-                    UUID.class, workflowId);
+            var childTaskId = dispatchUntilChildTask(workflowId, "register");
             var waitingWork = tasks.claimOne().orElseThrow();
             assertThat(waitingWork.id()).isEqualTo(childTaskId);
             tasks.complete(waitingWork, runtime.run(waitingWork));
@@ -522,6 +775,8 @@ class P15ServiceRequestTest {
             mvc.perform(get(path("/work-items/" + workItemId)).header("Authorization", "Bearer eaf-local-bob"))
                     .andExpect(status().isNotFound());
 
+            var p30 = exerciseP30Weekly(workItemId);
+
             var completion = "{\"expectedVersion\":2,\"outcome\":\"NEEDS_FOLLOWUP\","
                     + "\"summary\":\"已完成初步检查，仍需设备维护人员确认。\","
                     + "\"nextAction\":\"安排设备维护人员复查。\"}";
@@ -540,6 +795,11 @@ class P15ServiceRequestTest {
                             .contentType(MediaType.APPLICATION_JSON).content(completion.replace("初步检查", "其他处理")))
                     .andExpect(status().isConflict());
 
+            exerciseP30Event(p30.eventSubscriptionId());
+            assertThatThrownBy(() -> tasks.get(ALICE, WORKSPACE, p30.weeklyTaskId()))
+                    .isInstanceOfSatisfying(io.eaf.shared.EafException.class,
+                            error -> assertThat(error.code()).isEqualTo("AUTOMATION_SOURCE_CHANGED"));
+
             driveHandlingUntil(handlingId, "SUCCEEDED");
             var handlingResult = json.readTree(workflows.getInstance(ALICE, WORKSPACE, handlingId).resultJson());
             assertThat(handlingResult.path("outcome").asText()).isEqualTo("NEEDS_FOLLOWUP");
@@ -555,7 +815,148 @@ class P15ServiceRequestTest {
             assertThat(jdbc.queryForObject("select count(distinct root_task_id) from task.task "
                     + "where workflow_instance_id = ? and workflow_step_id in ('prepare','summarize')", Integer.class, handlingId))
                     .isEqualTo(1);
-            assertThat(model.callCount()).isEqualTo(4);
+            assertThat(model.callCount()).isEqualTo(p15ModelCallBaseline + 4);
+            exerciseProjectBrief(workItemId);
+            assertThat(model.callCount()).isEqualTo(p15ModelCallBaseline + 5);
+
+            var p27Capability = capabilities.requirePublished(ALICE, WORKSPACE,
+                    UUID.fromString("54000000-0000-4000-8000-000000000022"), "1.0.0");
+            assertThat(p27Capability.contentHash()).isEqualTo("aa7ba842a57cb162eabd0d720ec31f2a3cfaf03d6d028ac5ebc56efa088c8708");
+            var p27WorkflowHashes = Map.of(
+                    "58000000-0000-4000-8000-000000000019", "d0de3577d3e637dc8e9cc8c6d4aa2e56dc48e46ed32d96b332a7d6b82b5b7997",
+                    "58000000-0000-4000-8000-00000000001a", "998666cbd099054627b001414e38772160345feca99fdb53650db92727faf336",
+                    "58000000-0000-4000-8000-00000000001b", "1404ed1622636164f51f3f3a8a294c2585fb7de2928eb5197ab1fc3a5ce75901",
+                    "58000000-0000-4000-8000-00000000001c", "c760e8765af106694594a1c7cda9d5ce954c4f0ab4c2a13f37dc90e2925e3b14");
+            for (var entry : p27WorkflowHashes.entrySet()) {
+                var fixedWorkflow = workflows.get(ALICE, WORKSPACE, UUID.fromString(entry.getKey()), "1.0.0");
+                assertThat(fixedWorkflow.contentHash()).isEqualTo(entry.getValue());
+                assertThat(fixedWorkflow.dependencies()).singleElement().satisfies(dependency ->
+                        assertThat(dependency.contentHash()).isEqualTo(p27Capability.contentHash()));
+            }
+
+            jdbc.update("update connector.instance set base_url = ?, status = 'ACTIVE' where tenant_id = ? and workspace_id = ? "
+                            + "and provider in ('P27_OA_TODO_FIXTURE','P27_SERVICE_DESK_RESULT_FIXTURE')",
+                    fixture.url(), Ids.TENANT_A, WORKSPACE);
+            var oaList = json.readTree(mvc.perform(post(path("/oa/todo-queries"))
+                            .header("Authorization", AUTH).header("Idempotency-Key", "p27-oa-list-" + UUID.randomUUID())
+                            .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                    .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString());
+            var oaListId = UUID.fromString(oaList.path("queryId").asText());
+            driveP27Workflow(oaListId, "read", false);
+            var oaListResult = json.readTree(mvc.perform(get(path("/oa/todo-queries/" + oaListId)).header("Authorization", AUTH))
+                    .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+            assertThat(oaListResult.path("result").path("page").path("items").get(0).path("todoId").asText())
+                    .isEqualTo("todo-1");
+            mvc.perform(get(path("/oa/todo-queries/" + oaListId)).header("Authorization", "Bearer eaf-local-bob"))
+                    .andExpect(status().isNotFound());
+            var oaItem = json.readTree(mvc.perform(post(path("/oa/todo-queries/item"))
+                            .header("Authorization", AUTH).header("Idempotency-Key", "p27-oa-item-" + UUID.randomUUID())
+                            .contentType(MediaType.APPLICATION_JSON).content("{\"todoId\":\"todo-1\"}"))
+                    .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString());
+            var oaItemId = UUID.fromString(oaItem.path("queryId").asText());
+            driveP27Workflow(oaItemId, "read", false);
+            var oaItemResult = json.readTree(mvc.perform(get(path("/oa/todo-queries/" + oaItemId)).header("Authorization", AUTH))
+                    .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+            assertThat(oaItemResult.path("result").path("found").asBoolean()).isTrue();
+            mvc.perform(post(path("/oa/todo-queries")).header("Authorization", AUTH)
+                            .header("Idempotency-Key", "p27-oa-invalid-" + UUID.randomUUID())
+                            .contentType(MediaType.APPLICATION_JSON).content("{\"ownerId\":\"other\"}"))
+                    .andExpect(status().isBadRequest());
+
+            var stateQuery = json.readTree(mvc.perform(post(path("/work-items/" + workItemId + "/external-state-queries"))
+                            .header("Authorization", AUTH).header("Idempotency-Key", "p27-state-" + UUID.randomUUID())
+                            .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                    .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString());
+            var stateQueryId = UUID.fromString(stateQuery.path("queryId").asText());
+            driveP27Workflow(stateQueryId, "read", false);
+            var stateResult = json.readTree(mvc.perform(get(path("/work-items/" + workItemId
+                                    + "/external-state-queries/" + stateQueryId)).header("Authorization", AUTH))
+                    .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+            assertThat(stateResult.path("result").path("state").path("status").asText()).isEqualTo("REGISTERED");
+
+            var workItemVersion = jdbc.queryForObject("select row_version from workflow.human_work_item where id = ?",
+                    Long.class, workItemId);
+            var syncPath = path("/work-items/" + workItemId + "/result-syncs");
+            var staleSourceBody = "{\"expectedWorkItemVersion\":" + (workItemVersion - 1)
+                    + ",\"stateQueryId\":\"" + stateQueryId + "\"}";
+            mvc.perform(post(syncPath).header("Authorization", AUTH).header("Idempotency-Key", "p27-stale-source-" + UUID.randomUUID())
+                            .contentType(MediaType.APPLICATION_JSON).content(staleSourceBody))
+                    .andExpect(status().isConflict());
+
+            var requestId = handlingResult.path("requestId").asText();
+            fixture.advanceExternalVersion(requestId);
+            var conflictKey = "p27-conflict-" + UUID.randomUUID();
+            var conflictBody = "{\"expectedWorkItemVersion\":" + workItemVersion
+                    + ",\"stateQueryId\":\"" + stateQueryId + "\"}";
+            var conflictSync = json.readTree(mvc.perform(post(syncPath).header("Authorization", AUTH)
+                            .header("Idempotency-Key", conflictKey).contentType(MediaType.APPLICATION_JSON).content(conflictBody))
+                    .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString());
+            var conflictId = UUID.fromString(conflictSync.path("id").asText());
+            var conflictWorkflowId = UUID.fromString(conflictSync.path("workflowInstanceId").asText());
+            var conflictTaskId = driveP27Workflow(conflictWorkflowId, "record", true);
+            var conflictTask = tasks.get(ALICE, WORKSPACE, conflictTaskId);
+            assertThat(conflictTask.status()).isEqualTo(TaskStatus.WAITING_APPROVAL);
+            var conflictExecutionId = jdbc.queryForObject("select id from execution.execution where task_id = ?", UUID.class, conflictTaskId);
+            var conflictExecution = executions.get(ALICE, WORKSPACE, conflictExecutionId);
+            assertThat(conflictExecution.status()).isEqualTo("AWAITING_APPROVAL");
+            assertThat(fixture.p27Posts()).hasValue(0);
+            var conflictApproval = approvals.get(reviewer(), WORKSPACE, conflictExecution.approvalId());
+            approvals.decide(new ApprovalDecisionCommand(reviewer(), WORKSPACE, conflictApproval.id(), "APPROVED", conflictApproval.version()));
+            tasks.resume(ALICE, WORKSPACE, conflictTaskId, conflictTask.version(), "p27-conflict-resume-" + UUID.randomUUID());
+            var conflictWork = tasks.claimOne().orElseThrow();
+            assertThat(conflictWork.id()).isEqualTo(conflictTaskId);
+            tasks.complete(conflictWork, runtime.run(conflictWork));
+            assertThat(executions.get(ALICE, WORKSPACE, conflictExecutionId).status()).isEqualTo("FAILED");
+            driveP27Workflow(conflictWorkflowId, "record", false, "FAILED");
+            assertThat(fixture.p27Posts()).hasValue(1);
+            assertThat(fixture.p27Readbacks()).hasValue(0);
+            var conflictRead = mvc.perform(get(syncPath + "/" + conflictId).header("Authorization", AUTH))
+                    .andReturn().getResponse();
+            assertThat(conflictRead.getStatus()).withFailMessage(conflictRead.getContentAsString()).isEqualTo(200);
+            var conflictResult = json.readTree(conflictRead.getContentAsString());
+            assertThat(conflictResult.path("syncStatus").asText()).isEqualTo("FAILED_SAFE");
+
+            var currentStateQuery = json.readTree(mvc.perform(post(path("/work-items/" + workItemId + "/external-state-queries"))
+                            .header("Authorization", AUTH).header("Idempotency-Key", "p27-state-current-" + UUID.randomUUID())
+                            .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                    .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString());
+            var currentStateQueryId = UUID.fromString(currentStateQuery.path("queryId").asText());
+            driveP27Workflow(currentStateQueryId, "read", false);
+            var syncKey = "p27-sync-" + UUID.randomUUID();
+            var syncBody = "{\"expectedWorkItemVersion\":" + workItemVersion
+                    + ",\"stateQueryId\":\"" + currentStateQueryId + "\"}";
+            var sync = json.readTree(mvc.perform(post(syncPath).header("Authorization", AUTH)
+                            .header("Idempotency-Key", syncKey).contentType(MediaType.APPLICATION_JSON).content(syncBody))
+                    .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString());
+            var syncId = UUID.fromString(sync.path("id").asText());
+            var syncWorkflowId = UUID.fromString(sync.path("workflowInstanceId").asText());
+            var syncTaskId = driveP27Workflow(syncWorkflowId, "record", true);
+            var syncTask = tasks.get(ALICE, WORKSPACE, syncTaskId);
+            assertThat(syncTask.status()).isEqualTo(TaskStatus.WAITING_APPROVAL);
+            var syncExecutionId = jdbc.queryForObject("select id from execution.execution where task_id = ?", UUID.class, syncTaskId);
+            var syncExecution = executions.get(ALICE, WORKSPACE, syncExecutionId);
+            assertThat(syncExecution.status()).isEqualTo("AWAITING_APPROVAL");
+            var syncApproval = approvals.get(reviewer(), WORKSPACE, syncExecution.approvalId());
+            approvals.decide(new ApprovalDecisionCommand(reviewer(), WORKSPACE, syncApproval.id(), "APPROVED", syncApproval.version()));
+            tasks.resume(ALICE, WORKSPACE, syncTaskId, syncTask.version(), "p27-resume-" + UUID.randomUUID());
+            var syncWork = tasks.claimOne().orElseThrow();
+            assertThat(syncWork.id()).isEqualTo(syncTaskId);
+            tasks.complete(syncWork, runtime.run(syncWork));
+            assertThat(executions.get(ALICE, WORKSPACE, syncExecutionId).status()).isEqualTo("SUCCEEDED");
+            driveP27Workflow(syncWorkflowId, "record", false);
+            assertThat(fixture.p27Posts()).hasValue(2);
+            assertThat(fixture.p27Readbacks()).hasValue(1);
+            var syncReadResponse = mvc.perform(get(syncPath + "/" + syncId).header("Authorization", AUTH))
+                    .andReturn().getResponse();
+            assertThat(syncReadResponse.getStatus()).withFailMessage(syncReadResponse.getContentAsString()).isEqualTo(200);
+            var synced = json.readTree(syncReadResponse.getContentAsString());
+            assertThat(synced.path("syncStatus").asText()).isEqualTo("SUCCEEDED");
+            assertThat(synced.path("externalStatus").asText()).isEqualTo("IN_PROGRESS");
+            var syncReplay = json.readTree(mvc.perform(post(syncPath).header("Authorization", AUTH)
+                            .header("Idempotency-Key", syncKey).contentType(MediaType.APPLICATION_JSON).content(syncBody))
+                    .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString());
+            assertThat(syncReplay.path("id").asText()).isEqualTo(syncId.toString());
+            assertThat(fixture.p27Posts()).hasValue(2);
 
             var teamPath = path("/team-experiences");
             var teamBody = json.createObjectNode().put("scenarioKey", "printer-jam")
@@ -595,6 +996,16 @@ class P15ServiceRequestTest {
                             .header("Authorization", "Bearer eaf-local-bob"))
                     .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
             assertThat(sharedCard.path("activeRevision").asInt()).isEqualTo(1);
+            var discovered = json.readTree(mvc.perform(post(teamPath + "/discover").header("Authorization", AUTH)
+                            .contentType(MediaType.APPLICATION_JSON).content("{\"scenarioKey\":\"printer-jam\",\"keywords\":[\"进纸组件\"],\"limit\":10}"))
+                    .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+            assertThat(discovered.path("algorithmVersion").asText()).isEqualTo("TEAM_KEYWORD_DISCOVERY_V1");
+            assertThat(discovered.path("items")).anySatisfy(item -> {
+                assertThat(item.path("cardId").asText()).isEqualTo(cardId.toString());
+                assertThat(item.path("revision").asInt()).isEqualTo(1);
+                assertThat(item.path("matchedTerms")).extracting(JsonNode::asText).containsExactly("进纸组件");
+                assertThat(item.path("matchedFields").toString()).contains("title", "content");
+            });
 
             var duplicateCard = json.readTree(mvc.perform(post(teamPath).header("Authorization", AUTH)
                             .header("Idempotency-Key", "p17-create-duplicate-" + workItemId)
@@ -696,7 +1107,7 @@ class P15ServiceRequestTest {
             var p17Result = json.readTree(workflows.getInstance(ALICE, WORKSPACE, handlingP17Id).resultJson());
             assertThat(p17Result.path("teamExperienceUsage").path("included").get(0).path("contentHash").asText())
                     .isEqualTo(teamUsage.path("included").get(0).path("contentHash").asText());
-            assertThat(model.callCount()).isEqualTo(6);
+            assertThat(model.callCount()).isEqualTo(p15ModelCallBaseline + 7);
 
             // 已创建的精确版本引用不会被悄悄换成纠正后的新修订。
             var staleV1 = json.readTree(mvc.perform(post(path("/service-request-handlings"))
@@ -825,17 +1236,39 @@ class P15ServiceRequestTest {
         candidateDispatcher.dispatchNextImprovementGeneration();
 
         var awaitingReview = candidates.getImprovementRun(ALICE, WORKSPACE, runId);
-        assertThat(awaitingReview.status()).isEqualTo("AWAITING_REVIEW");
+        assertThat(awaitingReview.status()).as("P23 run stop reason: %s, generation error: %s", awaitingReview.stopReason(),
+                tasks.getTeamImprovementGenerationTask(ALICE, WORKSPACE, generationTaskId).errorDetail()).isEqualTo("AWAITING_REVIEW");
         var candidate = candidates.get(ALICE, WORKSPACE, awaitingReview.candidateId());
         candidate = candidates.review(new CandidateService.CandidateReviewCommand(BOB, WORKSPACE,
                 candidate.id(), candidate.rowVersion(), "ACCEPTED", "按已知处理规范独立核对候选事实。",
                 List.of("policy:service-request-facts")));
+        var reviewedCandidateId = candidate.id();
+        var reviewedRevision = candidate.revision();
+        var teamSnapshot = evaluations.findTeamPreparationSnapshot(ALICE, WORKSPACE, reviewedCandidateId, reviewedRevision)
+                .orElseThrow();
+        assertThat(teamSnapshot.targetType()).isEqualTo("TEAM_EXPERIENCE_UPDATE");
+        assertThat(teamSnapshot.candidateContentHash()).matches("[0-9a-f]{64}");
+        assertThat(evaluations.findTeamPreparationSnapshot(BOB, WORKSPACE, reviewedCandidateId, reviewedRevision)).isEmpty();
+        var delegatedEvaluationActor = new ActorContext(UUID.randomUUID(), Ids.TENANT_A, ActorType.AGENT,
+                Set.of("evaluation:run"), ALICE.actorId(), UUID.randomUUID(), WORKSPACE, "a".repeat(64));
+        assertThatThrownBy(() -> evaluations.findTeamPreparationSnapshot(delegatedEvaluationActor, WORKSPACE,
+                reviewedCandidateId, reviewedRevision))
+                .isInstanceOfSatisfying(io.eaf.shared.EafException.class,
+                        error -> assertThat(error.code()).isEqualTo("POLICY_DENIED"));
         var devReportId = candidates.getImprovementRun(ALICE, WORKSPACE, runId).devReportId();
         driveP23Report(devReportId);
+        var sampleTaskId = jdbc.queryForObject("select task_id from evaluation.team_preparation_sample "
+                + "where run_id = ? and status = 'SUCCEEDED' order by case_id limit 1", UUID.class, devReportId);
+        var redactedSampleTask = tasks.get(ALICE, WORKSPACE, sampleTaskId);
+        assertThat(redactedSampleTask.inputText()).isNull();
+        assertThat(redactedSampleTask.resultJson()).isNull();
         candidateDispatcher.dispatchNextImprovementEvaluation();
 
         var heldOutReportId = candidates.getImprovementRun(ALICE, WORKSPACE, runId).heldOutReportId();
         assertThat(heldOutReportId).isNotNull();
+        assertThatThrownBy(() -> evaluations.getTeamPreparationPair(ALICE, WORKSPACE, heldOutReportId, "unregistered-case"))
+                .isInstanceOfSatisfying(io.eaf.shared.EafException.class,
+                        error -> assertThat(error.code()).isEqualTo("RESOURCE_NOT_FOUND"));
         driveP23Report(heldOutReportId);
         candidateDispatcher.dispatchNextImprovementEvaluation();
         for (var caseId : jdbc.queryForList("select distinct case_id from evaluation.team_preparation_sample where run_id = ?",
@@ -889,12 +1322,65 @@ class P15ServiceRequestTest {
         assertThat(withdrawal.status()).isEqualTo("WITHDRAWN");
     }
 
+    private ModelResult p31ControlledPromptResult(ModelRequest request, String appendixMarker) {
+        var userText = request.messages().stream().filter(message -> "user".equalsIgnoreCase(message.role()))
+                .map(message -> message.content()).reduce((first, second) -> second).orElse("");
+        var candidate = request.messages().stream().filter(message -> "system".equals(message.role()))
+                .anyMatch(message -> message.content().contains(appendixMarker));
+        if (userText.contains("天王星"))
+            return new ModelResult("deterministic", "p15-test",
+                    "{\"action\":\"FINAL\",\"outcome\":\"INSUFFICIENT_EVIDENCE\","
+                            + "\"citations\":[],\"questions\":[],\"missingInformation\":\"缺少可核验的正式依据。\"}", 64, 18, "KNOWN");
+        if (userText.contains("我需要访问一个系统") || !candidate)
+            return new ModelResult("deterministic", "p15-test",
+                    "{\"action\":\"FINAL\",\"outcome\":\"NEEDS_INPUT\",\"citations\":[],"
+                            + "\"questions\":[\"请补充受影响的系统或地点。\"]}", 64, 18, "KNOWN");
+        var originalRequest = Pattern.compile("\\\"originalRequest\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"")
+                .matcher(userText);
+        var requestText = originalRequest.find() ? originalRequest.group(1) : userText;
+        var category = requestText.contains("会议室 B201") ? "FACILITIES" : requestText.contains("育儿假") ? "HR" : "IT";
+        var matcher = Pattern.compile("\\\"citationId\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"").matcher(userText);
+        if (!matcher.find()) return new ModelResult("deterministic", "p15-test",
+                "{\"action\":\"FINAL\",\"outcome\":\"INSUFFICIENT_EVIDENCE\","
+                        + "\"citations\":[],\"questions\":[],\"missingInformation\":\"没有检索到可引用的正式依据。\"}",
+                64, 18, "KNOWN");
+        var citation = "[\"" + matcher.group(1) + "\"]";
+        var output = ("{\"action\":\"FINAL\",\"outcome\":\"READY\",\"category\":\"%s\","
+                + "\"title\":\"合成服务请求\",\"summary\":\"按授权资料整理的待处理请求。\","
+                + "\"handlingSuggestion\":\"依据当前适用规范核验后处理。\",\"citations\":%s,\"questions\":[]}")
+                .formatted(category, citation);
+        return new ModelResult("deterministic", "p15-test", output, 64, 18, "KNOWN");
+    }
+
+    private ScenarioEvaluationService.ScenarioRunReport drivePromptReport(UUID reportId) {
+        for (var attempt = 0; attempt < 50; attempt++) {
+            jdbc.update("update evaluation.scenario_run set next_poll_at = now(), lease_until = null where id = ?", reportId);
+            scenarioDispatcher.dispatchNext();
+            var active = jdbc.queryForList("select task_id from evaluation.scenario_sample where run_id = ? and status = 'ACTIVE' "
+                    + "and task_id is not null order by case_id, side", UUID.class, reportId);
+            for (var taskId : active) {
+                var work = tasks.claim(taskId).orElseThrow(() -> new AssertionError("Prompt evaluation Task could not be claimed: " + taskId));
+                tasks.complete(work, runtime.run(work));
+            }
+            var report = scenarioEvaluations.getRun(ALICE, WORKSPACE, reportId);
+            if (Set.of("COMPLETED", "COMPLETED_WITH_ERRORS", "STOPPED", "FAILED", "TIMED_OUT").contains(report.status())) {
+                assertThat(report.status()).as("Prompt report %s samples=%s", reportId,
+                        jdbc.queryForList("select case_id, side, status, error_code, task_id from evaluation.scenario_sample "
+                                + "where run_id = ? order by case_id, side", reportId)).isEqualTo("COMPLETED");
+                assertThat(report.completedSamples()).isEqualTo(report.plannedSamples());
+                return report;
+            }
+        }
+        throw new AssertionError("Prompt evaluation did not complete: " + scenarioEvaluations.getRun(ALICE, WORKSPACE, reportId));
+    }
+
     private void driveP23Report(UUID reportId) {
         for (var attempt = 0; attempt < 40; attempt++) {
             jdbc.update("update evaluation.team_preparation_run set next_poll_at = now() where id = ? and lease_owner is null", reportId);
             evaluationDispatcher.dispatchNextTeamPreparation();
             var active = jdbc.queryForList("select task_id from evaluation.team_preparation_sample "
                     + "where run_id = ? and status = 'ACTIVE' and task_id is not null order by case_id, side", UUID.class, reportId);
+            if (attempt == 0 && !active.isEmpty()) assertTeamPreparationSampleCannotBeReused(reportId, active.get(0));
             for (var taskId : active) {
                 var work = tasks.claim(taskId).orElseThrow(() -> new AssertionError("sample Task could not be claimed: " + taskId));
                 tasks.complete(work, runtime.run(work));
@@ -909,10 +1395,78 @@ class P15ServiceRequestTest {
         throw new AssertionError("evaluation did not complete: " + evaluations.getTeamPreparationRun(ALICE, WORKSPACE, reportId));
     }
 
+    private void assertTeamPreparationSampleCannotBeReused(UUID reportId, UUID taskId) {
+        var command = jdbc.query("select s.id, s.snapshot_id, s.task_key, s.input_text, s.agent_id, s.agent_version, "
+                        + "s.capability_id, s.capability_version, s.capability_hash, s.skill_id, s.skill_version, s.skill_hash, "
+                        + "r.quality_run_id, r.deadline_at from evaluation.team_preparation_sample s "
+                        + "join evaluation.team_preparation_run r on r.id = s.run_id where s.run_id = ? and s.task_id = ?",
+                rs -> rs.next() ? new CreateQualityRunTaskCommand(ALICE, WORKSPACE,
+                        rs.getObject("quality_run_id", UUID.class),
+                        rs.getObject("agent_id", UUID.class), rs.getString("agent_version"), rs.getString("input_text"),
+                        "TEAM_EXPERIENCE_PREPARATION", rs.getObject("snapshot_id", UUID.class).toString(),
+                        rs.getString("task_key") + "-duplicate", "p23-duplicate-sample", "EVALUATION",
+                        rs.getObject("id", UUID.class), new io.eaf.task.api.TaskAssetBinding(
+                                rs.getObject("capability_id", UUID.class), rs.getString("capability_version"),
+                                rs.getString("capability_hash"), rs.getObject("skill_id", UUID.class),
+                                rs.getString("skill_version"), rs.getString("skill_hash")),
+                        rs.getTimestamp("deadline_at").toInstant()) : null,
+                reportId, taskId);
+        assertThat(command).isNotNull();
+        assertThatThrownBy(() -> tasks.createQualityRunTask(command))
+                .isInstanceOfSatisfying(io.eaf.shared.EafException.class,
+                        error -> assertThat(error.code()).isEqualTo("TEAM_PREPARATION_SAMPLE_BINDING_MISMATCH"));
+        var unregistered = new CreateQualityRunTaskCommand(command.actor(), command.workspaceId(), command.qualityRunId(),
+                command.agentId(), command.agentVersion(), command.input(), command.businessEntityType(),
+                command.businessEntityId(), command.idempotencyKey(), command.traceId(), command.source(),
+                UUID.randomUUID(), command.assetBinding(), command.deadlineAt());
+        assertThatThrownBy(() -> tasks.createQualityRunTask(unregistered))
+                .isInstanceOfSatisfying(io.eaf.shared.EafException.class,
+                        error -> assertThat(error.code()).isEqualTo("TEAM_PREPARATION_SAMPLE_BINDING_MISMATCH"));
+    }
+
     private void grantP23(ActorContext actor, String... actions) {
         for (var action : actions) jdbc.update("insert into workspace.\"grant\"(tenant_id, workspace_id, actor_id, action, status) "
                         + "values (?, ?, ?, ?, 'ACTIVE') on conflict (workspace_id, actor_id, action) do update set status = 'ACTIVE'",
                 actor.tenantId(), WORKSPACE, actor.actorId(), action);
+    }
+
+    private UUID dispatchUntilChildTask(UUID workflowInstanceId, String stepId) {
+        for (var attempt = 0; attempt < 20; attempt++) {
+            var childTaskId = jdbc.query("select child_task_id from workflow.step where instance_id = ? and step_id = ?",
+                    rs -> rs.next() ? rs.getObject("child_task_id", UUID.class) : null, workflowInstanceId, stepId);
+            if (childTaskId != null) return childTaskId;
+            jdbc.update("update workflow.instance set next_poll_at = null, lease_until = null where id = ?", workflowInstanceId);
+            if (!workflowDispatcher.dispatchOne()) break;
+        }
+        throw new AssertionError("Workflow 没有为指定步骤创建 Task：" + workflowInstanceId + "/" + stepId);
+    }
+
+    private UUID driveP27Workflow(UUID instanceId, String stepId, boolean stopAtApproval) {
+        return driveP27Workflow(instanceId, stepId, stopAtApproval, "SUCCEEDED");
+    }
+
+    private UUID driveP27Workflow(UUID instanceId, String stepId, boolean stopAtApproval, String expectedTerminalStatus) {
+        UUID taskId = null;
+        for (var attempt = 0; attempt < 30; attempt++) {
+            var instance = workflows.getInstance(ALICE, WORKSPACE, instanceId);
+            if (Set.of("SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT").contains(instance.status())) {
+                if (expectedTerminalStatus.equals(instance.status())) return taskId;
+                throw new AssertionError("P27 workflow ended at " + instance.status() + " with " + instance.errorCode());
+            }
+            jdbc.update("update workflow.instance set next_poll_at = now() where id = ?", instanceId);
+            workflowDispatcher.dispatchOne();
+            taskId = jdbc.query("select child_task_id from workflow.step where instance_id = ? and step_id = ?",
+                    rs -> rs.next() ? rs.getObject("child_task_id", UUID.class) : null, instanceId, stepId);
+            if (taskId == null) continue;
+            var task = tasks.get(ALICE, WORKSPACE, taskId);
+            if (stopAtApproval && task.status() == TaskStatus.WAITING_APPROVAL) return taskId;
+            if (task.status() == TaskStatus.QUEUED) {
+                var work = tasks.claimOne().orElseThrow();
+                assertThat(work.id()).isEqualTo(taskId);
+                tasks.complete(work, runtime.run(work));
+            }
+        }
+        throw new AssertionError("P27 workflow did not reach its expected state: " + instanceId);
     }
 
     private void driveHandlingUntil(UUID instanceId, String targetStatus) {
@@ -937,6 +1491,260 @@ class P15ServiceRequestTest {
             if (work.isPresent()) tasks.complete(work.get(), runtime.run(work.get()));
         }
         throw new AssertionError("workflow did not reach " + targetStatus + ".");
+    }
+
+    private P30Subscriptions exerciseP30Weekly(UUID p16WorkItemId) throws Exception {
+        var endpoint = path("/automation-subscriptions");
+        var weeklyBody = json.createObjectNode().put("name", "本人每周 P16 待办摘要")
+                .put("triggerKind", "WEEKLY").put("dayOfWeek", "MONDAY").put("localTime", "09:00")
+                .put("timeZone", "UTC").put("maxItems", 20)
+                .put("expiresAt", Instant.now().plusSeconds(60L * 24 * 60 * 60).toString()).put("maxRuns", 3);
+        var weeklyKey = "p30-weekly-" + UUID.randomUUID();
+        var weekly = json.readTree(mvc.perform(post(endpoint).header("Authorization", AUTH)
+                        .header("Idempotency-Key", weeklyKey).contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(weeklyBody)))
+                .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString());
+        var weeklyId = UUID.fromString(weekly.path("id").asText());
+        var replay = json.readTree(mvc.perform(post(endpoint).header("Authorization", AUTH)
+                        .header("Idempotency-Key", weeklyKey).contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(weeklyBody)))
+                .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString());
+        assertThat(replay.path("id").asText()).isEqualTo(weeklyId.toString());
+        mvc.perform(get(endpoint + "/" + weeklyId).header("Authorization", "Bearer eaf-local-bob"))
+                .andExpect(result -> assertThat(result.getResponse().getStatus()).isIn(403, 404));
+
+        var planned = Instant.now().minusSeconds(90).truncatedTo(java.time.temporal.ChronoUnit.MINUTES);
+        var local = java.time.LocalDateTime.ofInstant(planned, java.time.ZoneOffset.UTC);
+        jdbc.update("update workflow.automation_subscription set day_of_week = ?, local_time = ?, time_zone = 'UTC', "
+                        + "next_fire_at = ?, updated_at = now() where id = ?",
+                local.getDayOfWeek().name(), java.sql.Time.valueOf(local.toLocalTime()),
+                java.sql.Timestamp.from(planned), weeklyId);
+        assertThat(automations.dispatchOne()).isTrue();
+        assertThat(automations.dispatchOne()).isTrue();
+        var weeklyRunId = jdbc.queryForObject("select id from workflow.automation_run where subscription_id = ?",
+                UUID.class, weeklyId);
+        var weeklyTaskId = jdbc.queryForObject("select task_id from workflow.automation_run where id = ?", UUID.class, weeklyRunId);
+        var weeklyWork = tasks.claimOne().orElseThrow();
+        assertThat(weeklyWork.id()).isEqualTo(weeklyTaskId);
+        tasks.complete(weeklyWork, runtime.run(weeklyWork));
+        assertThat(automations.dispatchOne()).isTrue();
+        assertThat(jdbc.queryForObject("select status from workflow.automation_run where id = ?", String.class, weeklyRunId))
+                .as("P30 Task state: %s", jdbc.queryForMap("select status, error_code, error_detail from task.task where id = ?", weeklyTaskId))
+                .isEqualTo("SUCCEEDED");
+        assertThat(jdbc.queryForObject("select source = 'USER' and run_kind = 'AGENT' and workflow_id is null "
+                        + "and business_entity_type is null from task.task where id = ?", Boolean.class, weeklyTaskId)).isTrue();
+        var weeklyResult = tasks.get(ALICE, WORKSPACE, weeklyTaskId);
+        assertThat(json.readTree(weeklyResult.resultJson()).path("markdown").asText()).contains("本人 P16 待办摘要", "W1");
+        assertThat(tasks.listMyRootResults(ALICE, WORKSPACE, null, null, 20).items())
+                .anyMatch(resultItem -> resultItem.id().equals(weeklyTaskId));
+        assertThatThrownBy(() -> tasks.get(BOB, WORKSPACE, weeklyTaskId))
+                .isInstanceOf(io.eaf.shared.EafException.class);
+
+        var current = automations.get(ALICE, WORKSPACE, weeklyId);
+        var pauseBody = json.createObjectNode().put("expectedVersion", current.version());
+        var paused = json.readTree(mvc.perform(post(endpoint + "/" + weeklyId + "/pause")
+                        .header("Authorization", AUTH).header("Idempotency-Key", "p30-pause-" + weeklyId)
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(pauseBody)))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        assertThat(paused.path("status").asText()).isEqualTo("PAUSED");
+        var resumeBody = json.createObjectNode().put("expectedVersion", paused.path("version").asLong());
+        var resumed = json.readTree(mvc.perform(post(endpoint + "/" + weeklyId + "/resume")
+                        .header("Authorization", AUTH).header("Idempotency-Key", "p30-resume-" + weeklyId)
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(resumeBody)))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        assertThat(resumed.path("status").asText()).isEqualTo("ACTIVE");
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete(endpoint + "/" + weeklyId)
+                        .param("expectedVersion", resumed.path("version").asText())
+                        .header("Authorization", AUTH).header("Idempotency-Key", "p30-delete-" + weeklyId))
+                .andExpect(status().isOk())
+                .andExpect(result -> assertThat(json.readTree(result.getResponse().getContentAsString()).path("status").asText())
+                        .isEqualTo("DELETED"));
+
+        var eventBody = json.createObjectNode().put("name", "指定 P16 工作项变化摘要")
+                .put("triggerKind", "P16_WORK_ITEM_CHANGED").put("workItemId", p16WorkItemId.toString())
+                .put("expiresAt", Instant.now().plusSeconds(60L * 24 * 60 * 60).toString()).put("maxRuns", 1);
+        var event = json.readTree(mvc.perform(post(endpoint).header("Authorization", AUTH)
+                        .header("Idempotency-Key", "p30-event-" + UUID.randomUUID())
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(eventBody)))
+                .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString());
+
+        var revokedWeeklyBody = weeklyBody.deepCopy().put("name", "撤销来源权限后停止的周摘要");
+        var revokedWeekly = json.readTree(mvc.perform(post(endpoint).header("Authorization", AUTH)
+                        .header("Idempotency-Key", "p30-revoked-weekly-" + UUID.randomUUID())
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(revokedWeeklyBody)))
+                .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString());
+        var revokedWeeklyId = UUID.fromString(revokedWeekly.path("id").asText());
+        var revokedPlanned = Instant.now().minusSeconds(90).truncatedTo(java.time.temporal.ChronoUnit.MINUTES);
+        var revokedLocal = java.time.LocalDateTime.ofInstant(revokedPlanned, java.time.ZoneOffset.UTC);
+        jdbc.update("update workflow.automation_subscription set day_of_week = ?, local_time = ?, time_zone = 'UTC', "
+                        + "next_fire_at = ?, updated_at = now() where id = ?",
+                revokedLocal.getDayOfWeek().name(), java.sql.Time.valueOf(revokedLocal.toLocalTime()),
+                java.sql.Timestamp.from(revokedPlanned), revokedWeeklyId);
+        var revokedGrant = jdbc.update("update workspace.\"grant\" set status = 'REVOKED' "
+                        + "where workspace_id = ? and actor_id = ? and action = 'work-item:read' and status = 'ACTIVE'",
+                WORKSPACE, Ids.ALICE);
+        assertThat(revokedGrant).isEqualTo(1);
+        try {
+            assertThat(automations.dispatchOne()).isTrue(); // 登记已到期的周计划槽。
+            assertThat(automations.dispatchOne()).isTrue(); // Task 入队前重新核验权限。
+        } finally {
+            jdbc.update("update workspace.\"grant\" set status = 'ACTIVE' "
+                            + "where workspace_id = ? and actor_id = ? and action = 'work-item:read' and status = 'REVOKED'",
+                    WORKSPACE, Ids.ALICE);
+        }
+        assertThat(jdbc.queryForObject("select status from workflow.automation_subscription where id = ?",
+                String.class, revokedWeeklyId)).isEqualTo("BLOCKED");
+        assertThat(jdbc.queryForObject("select reason from workflow.automation_run where subscription_id = ?",
+                String.class, revokedWeeklyId)).isEqualTo("AUTHORIZATION_REVOKED");
+        assertThat(jdbc.queryForObject("select count(*) from workflow.automation_run where subscription_id = ? and task_id is not null",
+                Integer.class, revokedWeeklyId)).isZero();
+        return new P30Subscriptions(UUID.fromString(event.path("id").asText()), weeklyTaskId);
+    }
+
+    private record P30Subscriptions(UUID eventSubscriptionId, UUID weeklyTaskId) { }
+
+    private void exerciseP30Event(UUID subscriptionId) throws Exception {
+        UUID eventRunId = null;
+        for (var attempt = 0; attempt < 100; attempt++) {
+            if (!automations.consumeOneEvent()) break;
+            eventRunId = jdbc.query("select id from workflow.automation_run where subscription_id = ? and status = 'READY' "
+                            + "order by created_at desc limit 1", rs -> rs.next() ? rs.getObject(1, UUID.class) : null,
+                    subscriptionId);
+            if (eventRunId != null) break;
+        }
+        assertThat(eventRunId).as("current P16 completion event creates one ready run").isNotNull();
+        assertThat(jdbc.queryForObject("select count(*) from workflow.automation_run where subscription_id = ? "
+                + "and status = 'SKIPPED' and reason = 'SUBSCRIPTION_NOT_ACTIVE'", Integer.class, subscriptionId))
+                .isGreaterThanOrEqualTo(1);
+        assertThat(automations.dispatchOne()).isTrue();
+        var taskId = jdbc.queryForObject("select task_id from workflow.automation_run where id = ?", UUID.class, eventRunId);
+        var work = tasks.claimOne().orElseThrow();
+        assertThat(work.id()).isEqualTo(taskId);
+        tasks.complete(work, runtime.run(work));
+        assertThat(automations.dispatchOne()).isTrue();
+        assertThat(jdbc.queryForObject("select status from workflow.automation_run where id = ?", String.class, eventRunId))
+                .isEqualTo("SUCCEEDED");
+        assertThat(json.readTree(tasks.get(ALICE, WORKSPACE, taskId).resultJson()).path("markdown").asText())
+                .contains("COMPLETED");
+        var subscription = automations.get(ALICE, WORKSPACE, subscriptionId);
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete(
+                        path("/automation-subscriptions/" + subscriptionId))
+                        .param("expectedVersion", Long.toString(subscription.version()))
+                        .header("Authorization", AUTH).header("Idempotency-Key", "p30-event-delete-" + subscriptionId))
+                .andExpect(status().isOk());
+        assertThat(tasks.get(ALICE, WORKSPACE, taskId).resultJson()).isNotBlank();
+    }
+
+    private void exerciseProjectBrief(UUID p16WorkItemId) throws Exception {
+        var documentId = publishKnowledge("P29 合成项目资料", "设备维护记录：现场人员报告设备间歇性停机，尚未完成复测。",
+                "p29-" + UUID.randomUUID());
+        var ref = jdbc.queryForObject("select c.document_id, c.asset_version, c.id, p.build_id, trim(c.content_hash) "
+                        + "from knowledge.chunk c join knowledge.document_publication p on p.tenant_id = c.tenant_id "
+                        + "and p.workspace_id = c.workspace_id and p.document_id = c.document_id "
+                        + "and p.asset_version = c.asset_version and p.status = 'ACTIVE' "
+                        + "where c.document_id = ? order by c.chunk_order limit 1",
+                (rs, row) -> new io.eaf.knowledge.api.PublishedKnowledgeChunk.Ref(rs.getObject(1, UUID.class),
+                        rs.getInt(2), rs.getObject(3, UUID.class), rs.getObject(4, UUID.class), rs.getString(5)), documentId);
+        var sourceItem = workflows.getHumanWorkItem(ALICE, WORKSPACE, p16WorkItemId);
+        var body = json.createObjectNode().put("title", "设备稳定性跟进").put("goal", "整理当前依据与待办，交接复测安排。");
+        body.putArray("knowledgeRefs").addObject().put("documentId", ref.documentId().toString())
+                .put("documentVersion", ref.documentVersion()).put("chunkId", ref.chunkId().toString())
+                .put("buildId", ref.buildId().toString()).put("contentHash", ref.contentHash());
+        body.putArray("workItemRefs").addObject().put("workItemId", p16WorkItemId.toString())
+                .put("expectedRowVersion", sourceItem.rowVersion());
+        var endpoint = path("/project-briefs");
+        var key = "p29-create-" + UUID.randomUUID();
+        var created = json.readTree(mvc.perform(post(endpoint).header("Authorization", AUTH)
+                        .header("Idempotency-Key", key).contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(body)))
+                .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString());
+        var briefId = UUID.fromString(created.path("briefId").asText());
+        var replay = json.readTree(mvc.perform(post(endpoint).header("Authorization", AUTH)
+                        .header("Idempotency-Key", key).contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(body)))
+                .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString());
+        assertThat(replay.path("briefId").asText()).isEqualTo(briefId.toString());
+        driveProjectBriefUntil(briefId, "review");
+        var prepareTaskId = jdbc.queryForObject("select child_task_id from workflow.step where instance_id = ? and step_id = 'prepare'",
+                UUID.class, briefId);
+        var v1 = workflows.getProjectBriefArtifact(ALICE, WORKSPACE, briefId, 1);
+        assertThat(v1.blocked()).isFalse();
+        assertThat(v1.markdown()).contains("整理目标", "分析建议", "K1");
+        assertThat(tasks.get(ALICE, WORKSPACE, prepareTaskId).status()).isEqualTo(TaskStatus.SUCCEEDED);
+        var briefInbox = json.readTree(mvc.perform(get(path("/work-inbox?kind=BRIEF"))
+                        .header("Authorization", AUTH)).andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString());
+        assertThat(briefInbox.path("items").findValuesAsText("id")).contains(briefId.toString());
+
+        var reviewId = jdbc.queryForObject("select id from workflow.human_work_item where instance_id = ? and step_id = 'review'",
+                UUID.class, briefId);
+        var review = workflows.getProjectBriefWorkItem(ALICE, WORKSPACE, reviewId);
+        var reviewBody = json.createObjectNode().put("expectedVersion", review.rowVersion())
+                .put("decision", "CONFIRMED").put("notes", "复核后补充：现场仍需记录复测时间。")
+                .put("nextAction", "由交接人安排复测并回填观察结果。");
+        var reviewPath = path("/project-brief-work-items/" + reviewId + "/review");
+        mvc.perform(post(reviewPath).header("Authorization", "Bearer eaf-local-bob")
+                        .header("Idempotency-Key", "p29-review-denied")
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(reviewBody)))
+                .andExpect(result -> assertThat(result.getResponse().getStatus()).isIn(403, 404));
+        var reviewKey = "p29-review-" + briefId;
+        var reviewed = json.readTree(mvc.perform(post(reviewPath).header("Authorization", AUTH)
+                        .header("Idempotency-Key", reviewKey).contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(reviewBody)))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        var reviewReplay = json.readTree(mvc.perform(post(reviewPath).header("Authorization", AUTH)
+                        .header("Idempotency-Key", reviewKey).contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(reviewBody)))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        assertThat(reviewed.path("status").asText()).isEqualTo("COMPLETED");
+        assertThat(reviewReplay.path("completedAt").asText()).isEqualTo(reviewed.path("completedAt").asText());
+        var v2 = workflows.getProjectBriefArtifact(ALICE, WORKSPACE, briefId, 2);
+        assertThat(v2.markdown()).contains("人工补充与复核", "现场仍需记录复测时间");
+        driveProjectBriefUntil(briefId, "handoff");
+        var handoffId = jdbc.queryForObject("select id from workflow.human_work_item where instance_id = ? and step_id = 'handoff'",
+                UUID.class, briefId);
+        var handoff = workflows.getProjectBriefWorkItem(ALICE, WORKSPACE, handoffId);
+        var handoffBody = json.createObjectNode().put("expectedVersion", handoff.rowVersion())
+                .put("disposition", "RECEIVED").put("note", "已收到 v2，将按记录安排复测。");
+        mvc.perform(post(path("/project-brief-work-items/" + handoffId + "/receive"))
+                        .header("Authorization", AUTH).header("Idempotency-Key", "p29-handoff-" + briefId)
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(handoffBody)))
+                .andExpect(status().isOk());
+        driveProjectBriefUntil(briefId, "complete");
+        assertThat(workflows.getInstance(ALICE, WORKSPACE, briefId).status()).isEqualTo("SUCCEEDED");
+        for (var version : List.of(1, 2)) {
+            mvc.perform(get(path("/project-briefs/" + briefId + "/artifacts/" + version + ".md"))
+                            .header("Authorization", AUTH)).andExpect(status().isOk())
+                    .andExpect(result -> assertThat(result.getResponse().getContentAsString()).isNotBlank());
+        }
+        var doc = knowledge.get(ALICE, WORKSPACE, documentId);
+        knowledge.revoke(ALICE, WORKSPACE, documentId, doc.rowVersion(), "p29-revoke-" + briefId);
+        assertThat(workflows.getProjectBriefArtifact(ALICE, WORKSPACE, briefId, 1).blocked()).isTrue();
+        mvc.perform(get(path("/project-briefs/" + briefId + "/artifacts/2.md"))
+                        .header("Authorization", AUTH)).andExpect(status().isConflict());
+        assertThatThrownBy(() -> tasks.get(ALICE, WORKSPACE, prepareTaskId))
+                .isInstanceOfSatisfying(io.eaf.shared.EafException.class,
+                        error -> assertThat(error.code()).isIn("BRIEF_SOURCE_UNAVAILABLE", "NOT_FOUND", "RESOURCE_NOT_FOUND"));
+    }
+
+    private void driveProjectBriefUntil(UUID briefId, String stepId) {
+        for (var attempt = 0; attempt < 20; attempt++) {
+            var instance = workflows.getInstance(ALICE, WORKSPACE, briefId);
+            if ("complete".equals(stepId) && "SUCCEEDED".equals(instance.status())) return;
+            if ("WAITING_HUMAN".equals(instance.status()) && stepId.equals(instance.currentStepId())) return;
+            if (java.util.Set.of("FAILED", "CANCELLED", "TIMED_OUT").contains(instance.status()))
+                throw new AssertionError("P29 workflow ended at " + instance.status() + " with " + instance.errorCode());
+            jdbc.update("update workflow.instance set next_poll_at = null where id = ? and status <> 'WAITING_HUMAN'", briefId);
+            workflowDispatcher.dispatchOne();
+            var taskId = jdbc.query("select child_task_id from workflow.step where instance_id = ? and step_id = 'prepare'",
+                    rs -> rs.next() ? rs.getObject(1, UUID.class) : null, briefId);
+            if (taskId != null && tasks.get(ALICE, WORKSPACE, taskId).status() == TaskStatus.QUEUED) {
+                var work = tasks.claimOne().orElseThrow();
+                assertThat(work.id()).isEqualTo(taskId);
+                tasks.complete(work, runtime.run(work));
+            }
+        }
+        throw new AssertionError("P29 workflow did not reach " + stepId + ".");
     }
 
     private String workflowContentHash(io.eaf.workflow.api.WorkflowDefinition definition) throws Exception {
@@ -993,12 +1801,34 @@ class P15ServiceRequestTest {
         private final HttpServer server;
         private final ObjectMapper json;
         private final Map<String, JsonNode> records = new ConcurrentHashMap<>();
+        private final Map<String, JsonNode> p27Results = new ConcurrentHashMap<>();
+        private final Map<String, String> statuses = new ConcurrentHashMap<>();
+        private final Map<String, String> externalVersions = new ConcurrentHashMap<>();
         private final AtomicInteger posts = new AtomicInteger();
         private final AtomicInteger gets = new AtomicInteger();
+        private final AtomicInteger p27Posts = new AtomicInteger();
+        private final AtomicInteger p27Readbacks = new AtomicInteger();
 
         private ServiceDeskFixture(ObjectMapper json) throws Exception {
             this.json = json;
             server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            server.createContext("/users/", exchange -> {
+                var path = exchange.getRequestURI().getPath();
+                if (!"alice".equals(exchange.getRequestHeaders().getFirst("X-External-Subject"))
+                        || !"Bearer p27-oa-token".equals(exchange.getRequestHeaders().getFirst("Authorization"))
+                        || !path.matches("/users/alice/todos(?:/todo-1)?")) {
+                    send(exchange, 404, ""); return;
+                }
+                if ("HEAD".equals(exchange.getRequestMethod())) { send(exchange, 200, ""); return; }
+                if (!"GET".equals(exchange.getRequestMethod())) { send(exchange, 405, ""); return; }
+                var todo = json.createObjectNode().put("sourceId", "EAF-OA-TODO-V1").put("todoId", "todo-1")
+                        .put("title", "确认办公电脑检修安排").put("status", "OPEN").put("sourceVersion", "v1")
+                        .put("externalSubjectId", "alice").put("updatedAt", Instant.now().toString());
+                if (path.endsWith("/todo-1")) { send(exchange, 200, json.writeValueAsString(todo)); return; }
+                var page = json.createObjectNode().put("sourceId", "EAF-OA-TODO-V1").putNull("nextCursor");
+                page.putArray("items").add(todo);
+                send(exchange, 200, json.writeValueAsString(page));
+            });
             server.createContext("/requests/by-operation/", exchange -> {
                 gets.incrementAndGet();
                 var operationId = exchange.getRequestURI().getPath().substring("/requests/by-operation/".length());
@@ -1006,7 +1836,67 @@ class P15ServiceRequestTest {
                 if (record == null) { send(exchange, 404, ""); return; }
                 send(exchange, 200, json.writeValueAsString(record));
             });
+            server.createContext("/handling-results/by-operation/", exchange -> {
+                p27Readbacks.incrementAndGet();
+                if (!"Bearer p27-service-token".equals(exchange.getRequestHeaders().getFirst("Authorization"))
+                        || !"alice".equals(exchange.getRequestHeaders().getFirst("X-External-Subject"))) {
+                    send(exchange, 403, ""); return;
+                }
+                var operationId = exchange.getRequestURI().getPath().substring("/handling-results/by-operation/".length());
+                var result = p27Results.get(operationId);
+                if (result == null) { send(exchange, 404, ""); return; }
+                send(exchange, 200, json.writeValueAsString(result));
+            });
             server.createContext("/requests", exchange -> {
+                var path = exchange.getRequestURI().getPath();
+                if (path.matches("/requests/[^/]+/state")) {
+                    var requestId = path.substring("/requests/".length(), path.length() - "/state".length());
+                    var registered = registeredRequest(requestId);
+                    if (!authorizedP27(exchange) || registered == null) { send(exchange, 404, ""); return; }
+                    if ("HEAD".equals(exchange.getRequestMethod())) { send(exchange, 200, ""); return; }
+                    if (!"GET".equals(exchange.getRequestMethod())) { send(exchange, 405, ""); return; }
+                    var state = json.createObjectNode().put("contractVersion", "EAF-SERVICE-DESK-HANDLING-V1")
+                            .put("sourceId", "P15_INTERNAL_SERVICE_DESK_FIXTURE").put("requestId", requestId)
+                            .put("registrationOperationId", registered.path("operationId").asText())
+                            .put("status", statuses.computeIfAbsent(requestId, ignored -> "REGISTERED"))
+                            .put("externalVersion", externalVersions.computeIfAbsent(requestId, ignored -> "v1"))
+                            .put("updatedAt", Instant.now().toString());
+                    send(exchange, 200, json.writeValueAsString(state)); return;
+                }
+                if (path.matches("/requests/[^/]+/handling-results")) {
+                    p27Posts.incrementAndGet();
+                    var requestId = path.substring("/requests/".length(), path.length() - "/handling-results".length());
+                    if (!authorizedP27(exchange) || registeredRequest(requestId) == null) { send(exchange, 403, ""); return; }
+                    var body = json.readTree(exchange.getRequestBody().readAllBytes());
+                    var operationId = exchange.getRequestHeaders().getFirst("Idempotency-Key");
+                    var version = externalVersions.computeIfAbsent(requestId, ignored -> "v1");
+                    if (operationId == null || !operationId.equals(body.path("operationId").asText())
+                            || !requestId.equals(body.path("requestId").asText())
+                            || !version.equals(exchange.getRequestHeaders().getFirst("If-Match"))) {
+                        send(exchange, 412, ""); return;
+                    }
+                    var completed = body.path("outcome").asText();
+                    var result = json.createObjectNode().put("contractVersion", "EAF-SERVICE-DESK-HANDLING-V1")
+                            .put("operationId", operationId).put("requestId", requestId)
+                            .put("registrationOperationId", body.path("registrationOperationId").asText())
+                            .put("resultId", "RESULT-" + operationId).put("workItemId", body.path("workItemId").asText())
+                            .put("workItemVersion", body.path("workItemVersion").asLong())
+                            .put("sourceResultHash", body.path("sourceResultHash").asText())
+                            .put("externalSubjectId", body.path("externalSubjectId").asText())
+                            .put("completedBy", body.path("completedBy").asText())
+                            .put("completedAt", body.path("completedAt").asText()).put("outcome", completed)
+                            .put("summary", body.path("summary").asText()).put("nextAction", body.path("nextAction").asText())
+                            .put("recordState", "RECORDED")
+                            .put("previousExternalVersion", version).put("resultingExternalVersion", nextExternalVersion(version))
+                            .put("resultingStatus", "COMPLETED".equals(completed) ? "RESOLVED" : "IN_PROGRESS")
+                            .put("acceptedAt", Instant.now().toString());
+                    var previous = p27Results.putIfAbsent(operationId, result);
+                    if (previous != null) { send(exchange, 200, json.writeValueAsString(previous)); return; }
+                    statuses.put(requestId, result.path("resultingStatus").asText());
+                    externalVersions.put(requestId, result.path("resultingExternalVersion").asText());
+                    // 首次写入后模拟响应丢失，验证服务按原 operationId 回读而不重发。
+                    send(exchange, 500, ""); return;
+                }
                 if (!"POST".equals(exchange.getRequestMethod())) { send(exchange, 405, ""); return; }
                 posts.incrementAndGet();
                 if (!"Bearer p15-synthetic-token".equals(exchange.getRequestHeaders().getFirst("Authorization"))) {
@@ -1021,14 +1911,36 @@ class P15ServiceRequestTest {
                 ((com.fasterxml.jackson.databind.node.ObjectNode) result).put("requestId", "P15-" + operationId);
                 ((com.fasterxml.jackson.databind.node.ObjectNode) result).put("status", "REGISTERED");
                 var previous = records.putIfAbsent(operationId, result);
+                statuses.putIfAbsent("P15-" + operationId, "REGISTERED");
+                externalVersions.putIfAbsent("P15-" + operationId, "v1");
                 send(exchange, previous == null ? 201 : 200, json.writeValueAsString(previous == null ? result : previous));
             });
             server.start();
         }
 
+        private boolean authorizedP27(com.sun.net.httpserver.HttpExchange exchange) {
+            return "Bearer p27-service-token".equals(exchange.getRequestHeaders().getFirst("Authorization"))
+                    && "alice".equals(exchange.getRequestHeaders().getFirst("X-External-Subject"));
+        }
+
+        private JsonNode registeredRequest(String requestId) {
+            return records.values().stream().filter(record -> requestId.equals(record.path("requestId").asText()))
+                    .findFirst().orElse(null);
+        }
+
+        private void advanceExternalVersion(String requestId) {
+            externalVersions.compute(requestId, (ignored, version) -> nextExternalVersion(version == null ? "v1" : version));
+        }
+
+        private String nextExternalVersion(String version) {
+            return "v" + (Integer.parseInt(version.substring(1)) + 1);
+        }
+
         private String url() { return "http://127.0.0.1:" + server.getAddress().getPort(); }
         private AtomicInteger posts() { return posts; }
         private AtomicInteger gets() { return gets; }
+        private AtomicInteger p27Posts() { return p27Posts; }
+        private AtomicInteger p27Readbacks() { return p27Readbacks; }
         private Map<String, JsonNode> records() { return records; }
 
         private static void send(com.sun.net.httpserver.HttpExchange exchange, int status, String body) throws java.io.IOException {

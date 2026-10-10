@@ -122,7 +122,8 @@ public final class ScenarioEvaluationController {
     }
 
     private ScenarioRunRequest runRequest(Map<String, Object> raw) {
-        Set<String> allowed = Set.of("datasetKey", "datasetVersion", "split", "mode", "baseline", "comparison", "deadlineAt");
+        Set<String> allowed = Set.of("datasetKey", "datasetVersion", "split", "mode", "baseline", "comparison", "deadlineAt",
+                "experiment", "baselineModelProfileRef", "comparisonModelProfileRef");
         if (raw == null || raw.keySet().stream().anyMatch(key -> !allowed.contains(key)))
             throw EafException.invalid("请求包含未允许字段。");
         var mode = raw.get("mode");
@@ -133,7 +134,17 @@ public final class ScenarioEvaluationController {
         catch (IllegalArgumentException invalid) { throw EafException.invalid("deadlineAt 字段类型无效。"); }
         return new ScenarioRunRequest(stringValue(raw.get("datasetKey")), stringValue(raw.get("datasetVersion")),
                 stringValue(raw.get("split")), stringValue(mode), assetVersion(raw.get("baseline")),
-                assetVersion(raw.get("comparison")), deadline);
+                assetVersion(raw.get("comparison")), deadline, stringValue(raw.get("experiment")),
+                modelProfileRef(raw.get("baselineModelProfileRef")), modelProfileRef(raw.get("comparisonModelProfileRef")));
+    }
+
+    private io.eaf.model.api.ModelProfileRef modelProfileRef(Object raw) {
+        if (raw == null) return null;
+        if (!(raw instanceof Map<?, ?> map) || map.keySet().stream().anyMatch(key -> !(key instanceof String name)
+                || !Set.of("profileId", "version").contains(name)))
+            throw EafException.invalid("modelProfileRef 字段无效。");
+        try { return json.convertValue(raw, io.eaf.model.api.ModelProfileRef.class); }
+        catch (IllegalArgumentException invalid) { throw EafException.invalid("modelProfileRef 字段类型无效。"); }
     }
 
     private CapabilityVersion assetVersion(Object raw) {

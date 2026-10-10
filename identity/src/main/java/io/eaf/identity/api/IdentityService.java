@@ -7,6 +7,8 @@ import java.util.UUID;
 public interface IdentityService {
     // 此受众固定给本地 REST 入口；调用方不能用请求字段改写受众。
     String REST_AUDIENCE = "eaf:rest";
+    String MCP_AUDIENCE = "eaf:mcp";
+    String MCP_READONLY_PROFILE = "MCP_SERVICE_REQUEST_READ_V1";
 
     // token 只识别主体；AGENT 还必须通过 resolveDelegatedToken 建立可信委托上下文。
     Optional<ActorContext> resolveToken(String token);
@@ -20,6 +22,8 @@ public interface IdentityService {
     boolean allowsDelegatedCustomerRead(ActorContext actor, String customerId);
     // 签发前在当前授权交集中验证范围，撤销只更新委托状态。
     DelegationSnapshot createDelegation(CreateDelegationCommand command);
+    McpReadonlyDelegationSnapshot createMcpReadonlyDelegation(CreateMcpReadonlyDelegationCommand command);
+    Optional<McpReadonlyDelegationScope> mcpReadonlyScope(ActorContext actor);
     DelegationSnapshot revokeDelegation(ActorContext owner, UUID workspaceId, UUID delegationId);
 }
 // 本文件负责实现 EAF 的 IdentityService.java 相关代码。

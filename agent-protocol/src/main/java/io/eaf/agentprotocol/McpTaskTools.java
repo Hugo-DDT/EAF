@@ -5,6 +5,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.eaf.capability.api.CapabilityService;
 import io.eaf.context.api.ScopedContextQueryService;
+import io.eaf.identity.api.IdentityService;
 import io.eaf.workspace.api.WorkspaceCatalog;
 import io.eaf.workspace.api.ContextSourceSelection;
 import io.eaf.agentprotocol.PlatformAccessApplicationService.CapabilityUsageDetail;
@@ -44,16 +45,19 @@ public class McpTaskTools {
     private final ObjectMapper json;
     private final WorkspaceCatalog workspaces;
     private final ScopedContextQueryService scopedContexts;
+    private final IdentityService identities;
 
     public McpTaskTools(TaskApplicationService tasks, CapabilityService capabilities,
                         PlatformAccessApplicationService access, ObjectMapper json,
-                        WorkspaceCatalog workspaces, ScopedContextQueryService scopedContexts) {
+                        WorkspaceCatalog workspaces, ScopedContextQueryService scopedContexts,
+                        IdentityService identities) {
         this.tasks = tasks;
         this.capabilities = capabilities;
         this.access = access;
         this.json = json;
         this.workspaces = workspaces;
         this.scopedContexts = scopedContexts;
+        this.identities = identities;
     }
 
     List<SyncToolSpecification> specifications() {
@@ -63,7 +67,16 @@ public class McpTaskTools {
                         (exchange, request) -> execute(() -> {
                             var args = arguments(request, Set.of("workspaceId"));
                             var actor = actor(exchange);
-                            var items = capabilities.list(actor, uuid(args, "workspaceId")).stream()
+                            var workspaceId = uuid(args, "workspaceId");
+                            var scope = actor.delegated() ? identities.mcpReadonlyScope(actor).orElseThrow() : null;
+                            var listed = capabilities.list(actor, workspaceId).stream()
+                                    .filter(capability -> scope == null || scope.capabilityId().equals(capability.id())
+                                            && scope.capabilityVersion().equals(capability.version())
+                                            && scope.capabilityHash().equals(capability.contentHash()))
+                                    .toList();
+                            if (actor.delegated() && !listed.isEmpty())
+                                access.getCapability(actor, workspaceId, listed.getFirst().id(), listed.getFirst().version());
+                            var items = listed.stream()
                                     .map(capability -> new CapabilityView(capability.id(), capability.name(),
                                             capability.description(), capability.version())).toList();
                             return new CapabilityList(items);
@@ -76,8 +89,11 @@ public class McpTaskTools {
                         taskOutput(), (exchange, request) -> execute(() -> {
                             var args = arguments(request, Set.of("workspaceId", "capabilityId", "capabilityVersion",
                                     "input", "idempotencyKey", "businessEntity"));
+                            var actor = actor(exchange);
                             var entity = businessEntity(args.get("businessEntity"));
-                            return tasks.create(actor(exchange), uuid(args, "workspaceId"),
+                            if (actor.delegated() && entity != null)
+                                throw EafException.forbidden("MCP 只读委托不接受 businessEntity。");
+                            return tasks.create(actor, uuid(args, "workspaceId"),
                                     new TaskApplicationService.CreateRequest(null, null,
                                             uuid(args, "capabilityId"), string(args, "capabilityVersion"),
                                             string(args, "input"), entity), string(args, "idempotencyKey"), null, "MCP");
@@ -94,7 +110,9 @@ public class McpTaskTools {
                                 "workspaceId", "taskId", "expectedVersion"), taskOutput(),
                         (exchange, request) -> execute(() -> {
                             var args = arguments(request, Set.of("workspaceId", "taskId", "expectedVersion"));
-                            return tasks.cancel(actor(exchange), uuid(args, "workspaceId"), uuid(args, "taskId"),
+                            var actor = actor(exchange);
+                            requireDirectAgent(actor, "Task 取消");
+                            return tasks.cancel(actor, uuid(args, "workspaceId"), uuid(args, "taskId"),
                                     integer(args, "expectedVersion"));
                         })),
                 specification(CATALOG_SEARCH, "按类别和关键词发现当前身份可读取的已发布 Skill 或 Capability 摘要。",
@@ -138,9 +156,11 @@ public class McpTaskTools {
                                 "offset", nullableIntegerSchema()), "workspaceId"), sourceSelectionOutput(),
                         (exchange, request) -> execute(() -> {
                             var args = arguments(request, Set.of("workspaceId", "limit", "offset"));
+                            var actor = actor(exchange);
+                            requireDirectAgent(actor, "Context 来源列表");
                             var limit = PlatformAccessApplicationService.optionalInteger(args, "limit");
                             var offset = PlatformAccessApplicationService.optionalInteger(args, "offset");
-                            return workspaces.listContextSources(actor(exchange), uuid(args, "workspaceId"),
+                            return workspaces.listContextSources(actor, uuid(args, "workspaceId"),
                                     limit == null ? 20 : limit, offset == null ? 0 : offset);
                         })),
                 specification(CONTEXT_SCOPED_QUERY, "按明确来源选择执行有出处、统一预算的多来源上下文读取；不生成回答。",
@@ -150,8 +170,10 @@ public class McpTaskTools {
                                         "items", uuidSchema())), "workspaceId", "query"), scopedContextOutput(),
                         (exchange, request) -> execute(() -> {
                             var args = arguments(request, Set.of("workspaceId", "query", "topK", "tokenBudget", "sourceWorkspaceIds"));
+                            var actor = actor(exchange);
+                            requireDirectAgent(actor, "多来源 Context 查询");
                             var sourceIds = optionalUuidList(args.get("sourceWorkspaceIds"));
-                            return scopedContexts.query(actor(exchange), uuid(args, "workspaceId"), string(args, "query"),
+                            return scopedContexts.query(actor, uuid(args, "workspaceId"), string(args, "query"),
                                     PlatformAccessApplicationService.optionalInteger(args, "topK"),
                                     PlatformAccessApplicationService.optionalInteger(args, "tokenBudget"), sourceIds);
                         })));
@@ -187,12 +209,17 @@ public class McpTaskTools {
         catch (JsonProcessingException impossible) { return "{\"code\":\"INTERNAL_ERROR\",\"message\":\"服务未能完成请求。\"}"; }
     }
 
-    private static ActorContext actor(McpSyncServerExchange exchange) {
+    ActorContext actor(McpSyncServerExchange exchange) {
         Object actor = exchange.transportContext().get(McpTransportConfiguration.ACTOR_CONTEXT_KEY);
         if (!(actor instanceof ActorContext context)) throw EafException.unauthenticated();
-        //  的委托 audience 固定为 eaf:rest；MCP 不复用该受托身份跨协议授权。
-        if (context.delegated()) throw EafException.forbidden("当前 MCP 入口不接受绑定 REST audience 的委托身份。");
+        if (context.delegated() && (!IdentityService.MCP_AUDIENCE.equals(context.delegationAudience())
+                || identities.mcpReadonlyScope(context).isEmpty()))
+            throw EafException.forbidden("当前 MCP 委托不存在或已失效。");
         return context;
+    }
+
+    private void requireDirectAgent(ActorContext actor, String action) {
+        if (actor.delegated()) throw EafException.forbidden(action + "不在 MCP 只读委托范围内。");
     }
 
     private static Map<String, Object> arguments(CallToolRequest request, Set<String> allowed) {

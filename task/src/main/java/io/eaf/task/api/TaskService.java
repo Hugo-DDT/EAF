@@ -1,6 +1,7 @@
 package io.eaf.task.api;
 
 import io.eaf.shared.ActorContext;
+import io.eaf.model.api.ModelProfileSelection;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -9,6 +10,10 @@ import java.util.UUID;
 
 public interface TaskService {
     TaskSnapshot create(CreateTaskCommand command);
+    /** Workflow 仅可为已登记的 P30 运行创建固定只读 USER 根 Task；REST/MCP/A2A 请求不能伪造来源。 */
+    TaskSnapshot createAutomationReadTask(CreateAutomationReadTaskCommand command);
+    /** Workflow 提交暂停或撤回后，通过 Task 原取消入口协同停止未完成任务。 */
+    void cancelAutomationTask(ActorContext actor, UUID workspaceId, UUID taskId);
     TaskSnapshot createExperienceDraft(CreateExperienceDraftCommand command);
     ExperienceDraftBinding experienceDraftBinding(ActorContext actor, UUID workspaceId, UUID taskId);
     void requireExperienceDraftTask(ActorContext actor, UUID workspaceId, UUID taskId);
@@ -73,9 +78,17 @@ public interface TaskService {
     // 固定工具任务只记录不可变 Tool 快照，实际调用仍经过 Runtime 和 Execution。
     TaskSnapshot createToolExecution(CreateToolExecutionCommand command);
     TaskSnapshot get(ActorContext actor, UUID workspaceId, UUID taskId);
+    /** Workflow 只读取固定 P27 来源校验所需的状态、版本和 Workflow 绑定元数据。 */
+    Optional<WorkflowExecutionSource> findWorkflowExecutionSource(ActorContext actor, UUID workspaceId,
+            UUID taskId, int attempt);
+    /** Execution 只能读取精确租户和 Workspace 中 Task 自有的总截止时间。 */
+    Instant deadlineAt(UUID tenantId, UUID workspaceId, UUID taskId);
+    ModelProfileSelection modelSelection(ActorContext actor, UUID workspaceId, UUID taskId);
     // 列表过滤与单项读取共用 Workspace 和委托快照校验，游标只影响排序位置。
     TaskPage list(ActorContext actor, UUID workspaceId, UUID rootTaskId, Set<TaskStatus> statuses,
                   Instant statusUpdatedAfter, TaskPageCursor cursor, int pageSize);
+    UserTaskResultPage listMyRootResults(ActorContext actor, UUID workspaceId, Instant cursorUpdatedAt,
+            UUID cursorId, int pageSize);
     TaskSnapshot cancel(ActorContext actor, UUID workspaceId, UUID taskId, long expectedVersion);
     // Execution 按原 remoteTaskId 收到取消确认后，Task 域提交最终取消事实。
     void confirmRemoteCancellation(UUID tenantId, UUID workspaceId, UUID taskId, int attempt, UUID operationId);

@@ -1,6 +1,8 @@
 package io.eaf.evaluation.api;
 
 import io.eaf.shared.ActorContext;
+import io.eaf.model.api.ModelProfileRef;
+import io.eaf.model.api.ModelProfileSelection;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -23,7 +25,14 @@ public interface ScenarioEvaluationService {
                                   int devCases, int heldOutCases, String manifestHash) { }
 
     record ScenarioRunRequest(String datasetKey, String datasetVersion, String split, String mode,
-                              CapabilityVersion baseline, CapabilityVersion comparison, Instant deadlineAt) { }
+                              CapabilityVersion baseline, CapabilityVersion comparison, Instant deadlineAt,
+                              String experiment, ModelProfileRef baselineModelProfileRef,
+                              ModelProfileRef comparisonModelProfileRef) {
+        public ScenarioRunRequest(String datasetKey, String datasetVersion, String split, String mode,
+                                  CapabilityVersion baseline, CapabilityVersion comparison, Instant deadlineAt) {
+            this(datasetKey, datasetVersion, split, mode, baseline, comparison, deadlineAt, null, null, null);
+        }
+    }
 
     record CapabilityVersion(UUID capabilityId, String version) { }
 
@@ -38,7 +47,27 @@ public interface ScenarioEvaluationService {
                              int improvedPairs, int regressedPairs, int unchangedPairs, int unevaluablePairs,
                              String manifestHash, Instant createdAt, Instant updatedAt, Instant deadlineAt,
                              ScenarioUsageSummary usage, ScenarioTimingSummary timing,
-                             ScenarioOptimizationSummary optimization) { }
+                             ScenarioOptimizationSummary optimization,
+                             ScenarioModelProfileEvidence modelProfileEvidence) {
+        public ScenarioRunReport(UUID runId, String status, long version, boolean partial, String stopReason,
+                                 int plannedSamples, int completedSamples, int failedSamples, int notRunSamples,
+                                 boolean comparable, boolean sameAsset, String comparisonReason,
+                                 ScenarioMetric execution, ScenarioMetric structure, ScenarioMetric category,
+                                 ScenarioMetric outcome, ScenarioMetric citationBinding, ScenarioMetric evidenceHit,
+                                 ScenarioMetric readOnlySafety, int improvedPairs, int regressedPairs,
+                                 int unchangedPairs, int unevaluablePairs, String manifestHash, Instant createdAt,
+                                 Instant updatedAt, Instant deadlineAt, ScenarioUsageSummary usage,
+                                 ScenarioTimingSummary timing, ScenarioOptimizationSummary optimization) {
+            this(runId, status, version, partial, stopReason, plannedSamples, completedSamples, failedSamples,
+                    notRunSamples, comparable, sameAsset, comparisonReason, execution, structure, category, outcome,
+                    citationBinding, evidenceHit, readOnlySafety, improvedPairs, regressedPairs, unchangedPairs,
+                    unevaluablePairs, manifestHash, createdAt, updatedAt, deadlineAt, usage, timing, optimization, null);
+        }
+    }
+
+    record ScenarioModelProfileEvidence(String status, String experiment, String reasonCode,
+                                        boolean configurationComparable, ModelProfileSelection baseline,
+                                        ModelProfileSelection comparison) { }
 
     record ScenarioOptimizationSummary(int schemaVersion, String experiment, String manifestHash, Instant asOf,
                                        String status, List<String> reasonCodes, boolean conditionsComparable,
@@ -63,7 +92,13 @@ public interface ScenarioEvaluationService {
                                     ScenarioOptimizationTiming timing) { }
 
     record ScenarioOptimizationTiming(Long queueMedianMillis, Long taskMedianMillis, Long modelCallMedianMillis,
-                                      int modelCallSamples) { }
+                                      int modelCallSamples, Long retrievalMedianMillis, int retrievalSamples,
+                                      Long preparationMedianMillis, int preparationSamples) {
+        public ScenarioOptimizationTiming(Long queueMedianMillis, Long taskMedianMillis,
+                                          Long modelCallMedianMillis, int modelCallSamples) {
+            this(queueMedianMillis, taskMedianMillis, modelCallMedianMillis, modelCallSamples, null, 0, null, 0);
+        }
+    }
 
     record ScenarioOptimizationPair(String caseId, String inputHash, UUID baselineSampleId,
                                     UUID comparisonSampleId, UUID baselineTaskId, UUID comparisonTaskId,

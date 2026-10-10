@@ -50,6 +50,14 @@ public class TeamExperienceController {
         return new TeamExperienceList(page.items(), encode(page));
     }
 
+    @PostMapping("/discover")
+    TeamExperienceService.TeamExperienceDiscovery discover(@PathVariable UUID workspaceId,
+            @RequestBody Map<String, Object> raw, Authentication authentication) {
+        var body = convert(raw, DiscoverRequest.class, Set.of("scenarioKey", "keywords", "limit"));
+        return experiences.discover(ApiSupport.actor(authentication), workspaceId, body.scenarioKey(), body.keywords(),
+                body.limit() == null ? 10 : body.limit());
+    }
+
     @GetMapping("/{cardId}")
     TeamExperienceService.TeamExperience get(@PathVariable UUID workspaceId, @PathVariable UUID cardId,
                                                Authentication authentication) {
@@ -123,6 +131,7 @@ public class TeamExperienceController {
     }
 
     private record Cursor(Instant updatedAt, UUID id) { }
+    private record DiscoverRequest(String scenarioKey, List<String> keywords, Integer limit) { }
     private record VersionCheck(long expectedVersion) { }
     private record TeamExperienceList(List<TeamExperienceService.TeamExperience> items, String nextCursor) { }
 }

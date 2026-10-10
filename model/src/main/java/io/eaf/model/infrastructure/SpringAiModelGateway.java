@@ -51,6 +51,7 @@ public final class SpringAiModelGateway implements ModelGateway {
 
     @Override
     public ModelResult call(ModelRequest request) {
+        requireProfileTarget(request);
         requireCurrentAuthorization();
         if (request.deadline().isBefore(Instant.now())) throw new ModelFailure("UPSTREAM_TIMEOUT", "模型截止时间已到。", true, false);
         try {
@@ -105,8 +106,10 @@ public final class SpringAiModelGateway implements ModelGateway {
         var output = generation.getClass().getMethod("getOutput").invoke(generation);
         var text = (String) output.getClass().getMethod("getText").invoke(output);
         var metadata = response.getClass().getMethod("getMetadata").invoke(response);
-        var model = metadata == null ? null : (String) metadata.getClass().getMethod("getModel").invoke(metadata);
+        var model = text(metadata, "getModel");
         var usage = metadata == null ? null : metadata.getClass().getMethod("getUsage").invoke(metadata);
+        var generationMetadata = generation.getClass().getMethod("getMetadata").invoke(generation);
+        var finishReason = text(generationMetadata, "getFinishReason");
         Integer inputTokens = usage == null ? null : token(usage, "getPromptTokens");
         Integer outputTokens = usage == null ? null : token(usage, "getCompletionTokens");
         if (Integer.valueOf(0).equals(inputTokens) && Integer.valueOf(0).equals(outputTokens)) {
@@ -115,7 +118,16 @@ public final class SpringAiModelGateway implements ModelGateway {
         }
         var resolvedModel = model == null || model.isBlank() ? modelName : model;
         var usageStatus = inputTokens != null && outputTokens != null ? "KNOWN" : "UNKNOWN";
-        return new ModelResult("spring-ai-openai-compatible", resolvedModel, text, inputTokens, outputTokens, usageStatus);
+        return new ModelResult("spring-ai-openai-compatible", resolvedModel, text, inputTokens, outputTokens,
+                usageStatus, List.of(), finishReason, model == null || model.isBlank() ? null : model);
+    }
+
+    private String text(Object source, String method) {
+        if (source == null) return null;
+        try {
+            var value = source.getClass().getMethod(method).invoke(source);
+            return value == null ? null : String.valueOf(value);
+        } catch (ReflectiveOperationException ignored) { return null; }
     }
 
     private Integer token(Object usage, String method) throws Exception {
@@ -172,11 +184,15 @@ public final class SpringAiModelGateway implements ModelGateway {
                     .filter(value -> ((Enum<?>) value).name().equals("JSON_OBJECT")).findFirst().orElseThrow();
             responseFormat.getClass().getMethod("setType", responseFormatType).invoke(responseFormat, jsonObject);
             options.getClass().getMethod("setResponseFormat", responseFormat.getClass()).invoke(options, responseFormat);
-            var estimatedInputTokens = request.messages().stream().mapToInt(m -> m.content().length()).sum();
-            var outputTokenBudget = request.tokenBudget() - estimatedInputTokens;
+            var estimatedInputTokens = request.messages().stream().mapToInt(m -> m.content() == null ? 0 : m.content().length()).sum();
+            var outputTokenBudget = request.profileSnapshot() == null ? request.tokenBudget() - estimatedInputTokens
+                    : request.effectiveOutputTokenLimit();
             if (outputTokenBudget <= 0) throw new ModelFailure("BUDGET_EXCEEDED", "模型输入预算不足。", false, false);
-            options.getClass().getMethod("setModel", String.class).invoke(options, modelName);
+            var selected = request.profileSnapshot();
+            options.getClass().getMethod("setModel", String.class).invoke(options,
+                    selected == null ? modelName : selected.requestedModel());
             options.getClass().getMethod("setMaxTokens", Integer.class).invoke(options, outputTokenBudget);
+            if (selected != null) options.getClass().getMethod("setTemperature", Double.class).invoke(options, selected.temperature());
             return options;
         } catch (ModelFailure e) {
             throw e;
@@ -185,16 +201,21 @@ public final class SpringAiModelGateway implements ModelGateway {
         }
     }
 
+    private void requireProfileTarget(ModelRequest request) {
+        var selected = request.profileSnapshot();
+        if (selected == null) return;
+        if (!"LIVE".equals(selected.mode()) || !providerName.equalsIgnoreCase(selected.provider())
+                || !modelName.equals(selected.requestedModel()) || selected.toolCallingEnabled()
+                || !"JSON_OBJECT".equals(selected.responseFormat()) || !"NONE".equals(selected.retryPolicy()))
+            throw new ModelFailure("MODEL_PROFILE_CONFIGURATION_CHANGED", "模型请求与冻结档位不一致，未出站。", false, false);
+    }
+
     ModelFailure providerFailure(Throwable failure) {
         if (ProviderFailureSupport.capacityExceeded(failure))
             return new ModelFailure("MODEL_CAPACITY_EXCEEDED", "模型出站并发已满，请稍后重试。", false, false);
         if (ProviderFailureSupport.quotaUnavailable(failure))
             return new ModelFailure("MODEL_QUOTA_UNAVAILABLE", "模型共享并发协调暂不可用，未发送请求。", false, false);
-        var description = "";
-        for (var cause = failure; cause != null; cause = cause.getCause()) {
-            description += " " + cause.getClass().getName() + " " + String.valueOf(cause.getMessage());
-        }
-        var text = description.toLowerCase(Locale.ROOT);
+        var text = ProviderFailureSupport.describe(failure).toLowerCase(Locale.ROOT);
         if (contains(text, "timeout", "timed out", "read timed"))
             return new ModelFailure("UPSTREAM_TIMEOUT", "真实模型调用超时。", true, true);
         if (contains(text, "401", "403", "unauthorized", "forbidden", "invalid api key", "authentication"))

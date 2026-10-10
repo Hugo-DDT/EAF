@@ -10,6 +10,8 @@
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-workspace</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-task</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-agent</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-skill</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-capability</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-execution</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-agent-runtime</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-context</artifactId><version>${project.version}</version></dependency>
@@ -17,6 +19,7 @@
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-knowledge</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-memory</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-evaluation</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-prompt</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-usage</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-jdbc</artifactId></dependency>
         <!-- Learning 域只发布自己的 Outbox 聚合指标。 -->

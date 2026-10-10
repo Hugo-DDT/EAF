@@ -11,6 +11,9 @@ import io.eaf.approval.api.ApprovalService;
 import io.eaf.approval.api.ApprovalSnapshot;
 import io.eaf.audit.api.AuditPort;
 import io.eaf.capability.api.CapabilityService;
+import io.eaf.connector.api.ConnectorDefinition;
+import io.eaf.connector.api.ExternalWriteResult;
+import io.eaf.connector.api.IntegrationPort;
 import io.eaf.context.api.ContextService;
 import io.eaf.context.api.EvaluationContextSnapshotReader;
 import io.eaf.execution.api.ExecutionCommand;
@@ -60,6 +63,9 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -67,6 +73,9 @@ import org.testcontainers.utility.DockerImageName;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 
 @Testcontainers
 @SpringBootTest(properties = {"eaf.task.dispatcher-enabled=false", "eaf.execution.outbox-publisher-enabled=false",
@@ -90,8 +99,13 @@ class P7EnterpriseCrmWriteTest {
     private static final AtomicBoolean LOSE_NEXT_POST_RESPONSE = new AtomicBoolean();
     private static final AtomicBoolean HOLD_NEXT_POST_RESPONSE = new AtomicBoolean();
     private static final AtomicBoolean MISMATCH_READBACK = new AtomicBoolean();
+    private static final AtomicBoolean HOLD_NEXT_READBACK = new AtomicBoolean();
+    private static final AtomicBoolean EMPTY_NEXT_READBACK = new AtomicBoolean();
+    private static final AtomicBoolean FAIL_NEXT_READBACK = new AtomicBoolean();
     private static volatile CountDownLatch postCommitted = new CountDownLatch(0);
     private static volatile CountDownLatch releasePostResponse = new CountDownLatch(0);
+    private static volatile CountDownLatch readbackStarted = new CountDownLatch(0);
+    private static volatile CountDownLatch releaseReadback = new CountDownLatch(0);
 
     @Container
     static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(
@@ -110,6 +124,7 @@ class P7EnterpriseCrmWriteTest {
     @AfterAll
     static void stopCrmFixture() {
         releasePostResponse.countDown();
+        releaseReadback.countDown();
         if (crm != null) crm.stop(0);
     }
 
@@ -141,6 +156,8 @@ class P7EnterpriseCrmWriteTest {
     @Autowired ObjectMapper objectMapper;
     @Autowired java.time.Clock clock;
     @Autowired EvaluationContextSnapshotReader evaluationContexts;
+    @MockitoSpyBean IntegrationPort crmIntegration;
+    @Autowired PlatformTransactionManager transactionManager;
 
     @BeforeEach
     void enableOnlyTheLocalWriteFixture() {
@@ -151,8 +168,13 @@ class P7EnterpriseCrmWriteTest {
         LOSE_NEXT_POST_RESPONSE.set(false);
         HOLD_NEXT_POST_RESPONSE.set(false);
         MISMATCH_READBACK.set(false);
+        HOLD_NEXT_READBACK.set(false);
+        EMPTY_NEXT_READBACK.set(false);
+        FAIL_NEXT_READBACK.set(false);
         postCommitted = new CountDownLatch(0);
         releasePostResponse = new CountDownLatch(0);
+        readbackStarted = new CountDownLatch(0);
+        releaseReadback = new CountDownLatch(0);
         jdbc.update("update connector.instance set status = 'ACTIVE', base_url = ? where tenant_id = ? and workspace_id = ? and provider = ?",
                 fixtureUrl(), Ids.TENANT_A, WORKSPACE, CONNECTOR_PROVIDER);
         jdbc.update("update workspace.operational_gate set enabled = true, changed_by = null, command_id = null "
@@ -258,6 +280,84 @@ class P7EnterpriseCrmWriteTest {
         assertThat(actionCount(pending.task().id(), "WRITE_VERIFIED")).isEqualTo(1);
         assertThat(jdbc.queryForObject("select count(*) from task.budget_reservation where task_id = ? and kind = 'MODEL'",
                 Integer.class, pending.task().id())).isEqualTo(modelReservations);
+    }
+
+    @Test
+    void acceptedWithoutReceiptReleasesExecutionLockAndLateReadbackCannotBeatRecovery() throws Exception {
+        var pending = preparePendingWrite("p7-23-accepted-without-receipt");
+        approve(pending);
+        returnAcceptedWithoutReceipt();
+        HOLD_NEXT_READBACK.set(true);
+        readbackStarted = new CountDownLatch(1);
+        releaseReadback = new CountDownLatch(1);
+
+        var worker = CompletableFuture.supplyAsync(() -> {
+            runApprovedTask(pending);
+            return executions.get(alice(), WORKSPACE, pending.execution().id());
+        });
+        try {
+            assertThat(readbackStarted.await(15, TimeUnit.SECONDS)).isTrue();
+            assertThat(executions.get(alice(), WORKSPACE, pending.execution().id()).status()).isEqualTo("VERIFYING");
+            var independentLock = new TransactionTemplate(transactionManager).execute(tx -> jdbc.queryForObject(
+                    "select status from execution.execution where id = ? for update nowait", String.class,
+                    pending.execution().id()));
+            assertThat(independentLock).isEqualTo("VERIFYING");
+
+            jdbc.update("update execution.execution set lease_until = now() - interval '1 second' where id = ?", pending.execution().id());
+            executions.recoverOnStartup();
+            assertThat(executions.get(alice(), WORKSPACE, pending.execution().id()).status()).isEqualTo("UNKNOWN");
+        } finally {
+            releaseReadback.countDown();
+        }
+
+        assertThat(worker.get(30, TimeUnit.SECONDS).status()).isEqualTo("UNKNOWN");
+        assertThat(actionCount(pending.task().id(), "WRITE_VERIFIED")).isZero();
+        assertThat(jdbc.queryForObject("select tool_executions from task.budget_scope where root_task_id = ?",
+                Integer.class, pending.task().id())).isZero();
+        assertThat(executions.verify(alice(), WORKSPACE, pending.execution().id()).status()).isEqualTo("SUCCEEDED");
+        assertThat(FOLLOWUP_POSTS).hasValue(1);
+        assertThat(FOLLOWUP_GETS).hasValue(2);
+        assertThat(actionCount(pending.task().id(), "WRITE_VERIFIED")).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select tool_executions from task.budget_scope where root_task_id = ?",
+                Integer.class, pending.task().id())).isEqualTo(1);
+    }
+
+    @Test
+    void acceptedWithoutReceiptKeepsEmptyAndUnavailableReadbacksUnknown() {
+        var missing = preparePendingWrite("p7-23-accepted-empty-readback");
+        approve(missing);
+        returnAcceptedWithoutReceipt();
+        EMPTY_NEXT_READBACK.set(true);
+        runApprovedTask(missing);
+        assertThat(executions.get(alice(), WORKSPACE, missing.execution().id()).status()).isEqualTo("UNKNOWN");
+        assertThat(FOLLOWUP_POSTS).hasValue(1);
+        assertThat(executions.verify(alice(), WORKSPACE, missing.execution().id()).status()).isEqualTo("SUCCEEDED");
+
+        var unavailable = preparePendingWrite("p7-23-accepted-failed-readback");
+        approve(unavailable);
+        returnAcceptedWithoutReceipt();
+        FAIL_NEXT_READBACK.set(true);
+        runApprovedTask(unavailable);
+        assertThat(executions.get(alice(), WORKSPACE, unavailable.execution().id()).status()).isEqualTo("UNKNOWN");
+        assertThat(executions.verify(alice(), WORKSPACE, unavailable.execution().id()).status()).isEqualTo("SUCCEEDED");
+
+        var mismatched = preparePendingWrite("p7-23-accepted-mismatched-readback");
+        approve(mismatched);
+        returnAcceptedWithoutReceipt();
+        MISMATCH_READBACK.set(true);
+        runApprovedTask(mismatched);
+        assertThat(executions.get(alice(), WORKSPACE, mismatched.execution().id()).status()).isEqualTo("VERIFICATION_FAILED");
+        MISMATCH_READBACK.set(false);
+        assertThat(executions.verify(alice(), WORKSPACE, mismatched.execution().id()).status()).isEqualTo("SUCCEEDED");
+        assertThat(FOLLOWUP_POSTS).hasValue(3);
+    }
+
+    private void returnAcceptedWithoutReceipt() {
+        doAnswer(invocation -> {
+            var result = (ExternalWriteResult) invocation.callRealMethod();
+            return "ACCEPTED".equals(result.state()) ? ExternalWriteResult.accepted(null) : result;
+        }).when(crmIntegration).createFollowup(any(ConnectorDefinition.class), anyString(), anyString(), anyString(),
+                anyString(), any(Instant.class));
     }
 
     @Test
@@ -659,7 +759,14 @@ class P7EnterpriseCrmWriteTest {
     private static void findFollowup(HttpExchange exchange) throws IOException {
         FOLLOWUP_GETS.incrementAndGet();
         if (!authorized(exchange)) { respond(exchange, 401, ""); return; }
+        if (HOLD_NEXT_READBACK.compareAndSet(true, false)) {
+            readbackStarted.countDown();
+            try { releaseReadback.await(45, TimeUnit.SECONDS); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+        }
+        if (FAIL_NEXT_READBACK.compareAndSet(true, false)) { respond(exchange, 503, ""); return; }
         var operationId = exchange.getRequestURI().getPath().substring("/followups/by-operation/".length());
+        if (EMPTY_NEXT_READBACK.compareAndSet(true, false)) { respond(exchange, 404, ""); return; }
         var record = FOLLOWUPS.get(operationId);
         if (record == null) { respond(exchange, 404, ""); return; }
         if (MISMATCH_READBACK.get()) record = new FixtureRecord(record.operationId(), record.externalId(), record.customerId(),

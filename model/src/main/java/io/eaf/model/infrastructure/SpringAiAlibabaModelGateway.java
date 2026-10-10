@@ -10,8 +10,6 @@ import io.eaf.model.api.ModelToolCall;
 import io.eaf.model.api.ModelToolDefinition;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -50,6 +48,7 @@ public final class SpringAiAlibabaModelGateway implements ModelGateway {
 
     @Override
     public ModelResult call(ModelRequest request) {
+        requireProfileTarget(request);
         requireCurrentAuthorization();
         if (request.deadline().isBefore(Instant.now())) throw new ModelFailure("UPSTREAM_TIMEOUT", "模型截止时间已到。", true, false);
         try {
@@ -114,11 +113,16 @@ public final class SpringAiAlibabaModelGateway implements ModelGateway {
         }
         var metadata = response.getClass().getMethod("getMetadata").invoke(response);
         var usage = metadata == null ? null : metadata.getClass().getMethod("getUsage").invoke(metadata);
+        var reportedModel = text(metadata, "getModel");
+        var generationMetadata = generation == null ? null : generation.getClass().getMethod("getMetadata").invoke(generation);
+        var finishReason = text(generationMetadata, "getFinishReason");
         Integer input = usage == null ? null : token(usage, "getPromptTokens");
         Integer outputTokens = usage == null ? null : token(usage, "getCompletionTokens");
         if (Integer.valueOf(0).equals(input) && Integer.valueOf(0).equals(outputTokens)) { input = null; outputTokens = null; }
-        return new ModelResult("spring-ai-alibaba", modelName, text, input, outputTokens,
-                input != null && outputTokens != null ? "KNOWN" : "UNKNOWN", List.copyOf(calls), calls.isEmpty() ? "STOP" : "TOOL_CALLS");
+        return new ModelResult("spring-ai-alibaba", reportedModel == null ? modelName : reportedModel, text,
+                input, outputTokens, input != null && outputTokens != null ? "KNOWN" : "UNKNOWN",
+                List.copyOf(calls), finishReason == null ? calls.isEmpty() ? "NOT_RECORDED" : "TOOL_CALLS" : finishReason,
+                reportedModel);
     }
 
     private Object message(ModelMessage message) {
@@ -174,9 +178,10 @@ public final class SpringAiAlibabaModelGateway implements ModelGateway {
             }
             // 每次请求复制 options，避免请求级工具、模型名和预算修改共享默认对象。
             var options = defaults.getClass().getMethod("copy").invoke(defaults);
-            invokeIfPresent(options, "setModel", modelName);
+            var selected = request.profileSnapshot();
+            invokeIfPresent(options, "setModel", selected == null ? modelName : selected.requestedModel());
             var estimate = request.messages().stream().mapToInt(m -> m.content() == null ? 0 : m.content().length()).sum();
-            var outputBudget = request.tokenBudget() - estimate;
+            var outputBudget = selected == null ? request.tokenBudget() - estimate : request.effectiveOutputTokenLimit();
             if (outputBudget <= 0) throw new ModelFailure("BUDGET_EXCEEDED", "模型输入预算不足。", false, false);
             invokeIfPresent(options, "setMaxTokens", outputBudget);
             var callbacks = new ArrayList<>();
@@ -185,10 +190,40 @@ public final class SpringAiAlibabaModelGateway implements ModelGateway {
             options.getClass().getMethod("setToolNames", Set.class).invoke(options,
                     request.tools().stream().map(ModelToolDefinition::name).collect(java.util.stream.Collectors.toUnmodifiableSet()));
             options.getClass().getMethod("setInternalToolExecutionEnabled", Boolean.class).invoke(options, false);
-            invokeIfPresent(options, "setTemperature", 0.0d);
+            invokeIfPresent(options, "setTemperature", selected == null ? 0.0d : selected.temperature());
+            if (selected != null) {
+                try {
+                    var formatType = Class.forName("com.alibaba.cloud.ai.dashscope.api.DashScopeResponseFormat");
+                    var type = Class.forName("com.alibaba.cloud.ai.dashscope.api.DashScopeResponseFormat$Type");
+                    var jsonObject = java.util.Arrays.stream(type.getEnumConstants())
+                            .filter(value -> ((Enum<?>) value).name().equals("JSON_OBJECT")).findFirst().orElseThrow();
+                    var format = formatType.getConstructor().newInstance();
+                    format.getClass().getMethod("setType", type).invoke(format, jsonObject);
+                    options.getClass().getMethod("setResponseFormat", formatType).invoke(options, format);
+                } catch (ReflectiveOperationException unsupported) {
+                    throw new ModelFailure("MODEL_PROFILE_UNSUPPORTED", "当前 Alibaba Gateway 不支持 JSON response format。", false, false);
+                }
+            }
             return options;
         } catch (ModelFailure e) { throw e; }
         catch (Exception e) { throw new ModelFailure("DEPENDENCY_UNAVAILABLE", "无法确认 Spring AI Alibaba 工具执行配置。", false, false); }
+    }
+
+    private void requireProfileTarget(ModelRequest request) {
+        var selected = request.profileSnapshot();
+        if (selected == null) return;
+        if (!"LIVE".equals(selected.mode()) || !"dashscope".equalsIgnoreCase(selected.provider())
+                || !modelName.equals(selected.requestedModel()) || selected.toolCallingEnabled()
+                || !"JSON_OBJECT".equals(selected.responseFormat()) || !"NONE".equals(selected.retryPolicy()))
+            throw new ModelFailure("MODEL_PROFILE_CONFIGURATION_CHANGED", "模型请求与冻结档位不一致，未出站。", false, false);
+    }
+
+    private String text(Object source, String method) {
+        if (source == null) return null;
+        try {
+            var value = source.getClass().getMethod(method).invoke(source);
+            return value == null ? null : String.valueOf(value);
+        } catch (ReflectiveOperationException ignored) { return null; }
     }
 
     private Object toolCallback(ModelToolDefinition tool) {
@@ -227,12 +262,7 @@ public final class SpringAiAlibabaModelGateway implements ModelGateway {
         if (ProviderFailureSupport.quotaUnavailable(failure))
             return new ModelFailure("MODEL_QUOTA_UNAVAILABLE", "模型共享并发协调暂不可用，未发送请求。", false, false);
         // HTTP 客户端会包装超时异常；沿 cause 链分类，同时避免循环 cause 造成死循环。
-        var seen = Collections.newSetFromMap(new IdentityHashMap<Throwable, Boolean>());
-        var text = new StringBuilder();
-        for (var cause = failure; cause != null && seen.add(cause); cause = cause.getCause()) {
-            text.append(cause.getClass().getName()).append(' ').append(cause.getMessage()).append(' ');
-        }
-        var normalized = text.toString().toLowerCase(Locale.ROOT);
+        var normalized = ProviderFailureSupport.describe(failure).toLowerCase(Locale.ROOT);
         if (normalized.contains("timeout") || normalized.contains("timed out")) return new ModelFailure("UPSTREAM_TIMEOUT", "模型调用超时。", true, true);
         if (normalized.contains("401") || normalized.contains("403") || normalized.contains("unauthorized")) return new ModelFailure("UPSTREAM_AUTH", "模型认证失败。", false, true);
         if (normalized.contains("429") || normalized.contains("rate limit")) return new ModelFailure("UPSTREAM_RATE_LIMITED", "模型被限流。", false, true);

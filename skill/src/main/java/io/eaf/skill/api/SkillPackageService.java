@@ -11,6 +11,9 @@ public interface SkillPackageService {
     String PROFILE = "EAF_DECLARATIVE_CAPABILITY_V1";
 
     byte[] export(ActorContext actor, UUID workspaceId, ExportSource source);
+    DeclarationPackage describe(ActorContext actor, UUID workspaceId, ExportSource source);
+    DeclarationFile readDeclarationFile(ActorContext actor, UUID workspaceId, ExportSource source,
+                                        String expectedPackageHash, String relativePath);
     PackageValidation validate(ActorContext actor, UUID workspaceId, byte[] zip);
     ImportResult importPackage(ActorContext actor, UUID workspaceId, String idempotencyKey, byte[] zip);
     PackagePage list(ActorContext actor, UUID workspaceId, int limit, int offset);
@@ -32,4 +35,11 @@ public interface SkillPackageService {
     record PackagePage(List<PackageView> items, Integer nextOffset) { }
     record PackageDownload(String fileName, byte[] content) { }
     record ImportResult(PackageView packageView, boolean created) { }
+    record DeclarationFileInfo(String path, String mimeType, int sizeBytes, String sha256) { }
+    record DeclarationPackage(PackageSource source, String profile, String packageHash,
+                              List<DeclarationFileInfo> files) { }
+    record DeclarationFile(DeclarationFileInfo info, byte[] content) {
+        public DeclarationFile { content = content.clone(); }
+        @Override public byte[] content() { return content.clone(); }
+    }
 }

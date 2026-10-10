@@ -7,6 +7,8 @@ import io.eaf.capability.api.CapabilityService;
 import io.eaf.context.api.ContextQuery;
 import io.eaf.context.api.ContextService;
 import io.eaf.context.api.EnterpriseContext;
+import io.eaf.identity.api.IdentityService;
+import io.eaf.identity.api.McpReadonlyDelegationScope;
 import io.eaf.shared.ActorContext;
 import io.eaf.shared.EafException;
 import io.eaf.skill.api.SkillDefinition;
@@ -34,13 +36,15 @@ public final class PlatformAccessApplicationService {
     private final CapabilityService capabilities;
     private final ContextService contexts;
     private final ObjectMapper json;
+    private final IdentityService identities;
 
     public PlatformAccessApplicationService(SkillService skills, CapabilityService capabilities,
-                                            ContextService contexts, ObjectMapper json) {
+                                            ContextService contexts, ObjectMapper json, IdentityService identities) {
         this.skills = skills;
         this.capabilities = capabilities;
         this.contexts = contexts;
         this.json = json;
+        this.identities = identities;
     }
 
     public DiscoveryPage search(ActorContext actor, UUID workspaceId, DiscoveryRequest request) {
@@ -53,17 +57,23 @@ public final class PlatformAccessApplicationService {
         var rawQuery = request.query() == null ? "" : request.query();
         if (rawQuery.length() > MAX_QUERY_LENGTH) throw EafException.invalid("query 最多 200 个字符。");
         var query = rawQuery.trim();
+        var delegatedScope = mcpReadonlyScope(actor, workspaceId);
         var limit = request.limit() == null ? DEFAULT_LIMIT : request.limit();
         var offset = request.offset() == null ? 0 : request.offset();
         if (limit < 1 || limit > MAX_LIMIT) throw EafException.invalid("limit 必须在 1-50 之间。");
         if (offset < 0) throw EafException.invalid("offset 必须是非负整数。");
 
         // 先经 Owner API 授权并只取选中的资产类型，再从发布结果构造目录，避免摘要入口成为草稿读取旁路。
+        var allowedCapability = delegatedScope == null ? null : requireBoundCapability(actor, workspaceId, delegatedScope);
         var items = kind == AssetKind.SKILL
                 ? skills.list(actor, workspaceId).stream().filter(asset -> "PUBLISHED".equals(asset.status()))
+                        .filter(asset -> allowedCapability == null || allowedCapability.skillId().equals(asset.id())
+                                && allowedCapability.skillVersion().equals(asset.version()))
                         .filter(asset -> matches(asset.name(), asset.description(), query))
                         .map(PlatformAccessApplicationService::summary).toList()
                 : capabilities.list(actor, workspaceId).stream().filter(asset -> "PUBLISHED".equals(asset.status()))
+                        .filter(asset -> delegatedScope == null || delegatedScope.capabilityId().equals(asset.id())
+                                && delegatedScope.capabilityVersion().equals(asset.version()))
                         .filter(asset -> matches(asset.name(), asset.description(), query))
                         .map(PlatformAccessApplicationService::summary).toList();
         var ordered = items.stream().sorted(Comparator.comparing(DiscoveryItem::name)
@@ -76,6 +86,12 @@ public final class PlatformAccessApplicationService {
     }
 
     public SkillUsageDetail getSkill(ActorContext actor, UUID workspaceId, UUID skillId, String version) {
+        var scope = mcpReadonlyScope(actor, workspaceId);
+        if (scope != null) {
+            var capability = requireBoundCapability(actor, workspaceId, scope);
+            if (!capability.skillId().equals(skillId) || !capability.skillVersion().equals(version))
+                throw EafException.notFound();
+        }
         var skill = skills.get(actor, workspaceId, skillId, version);
         // get 允许 Owner 查看草稿用于管理；使用方投影必须对 Owner 同样隐藏非发布版本。
         if (!"PUBLISHED".equals(skill.status())) throw EafException.notFound();
@@ -89,7 +105,11 @@ public final class PlatformAccessApplicationService {
     }
 
     public CapabilityUsageDetail getCapability(ActorContext actor, UUID workspaceId, UUID capabilityId, String version) {
-        var capability = capabilities.get(actor, workspaceId, capabilityId, version);
+        var scope = mcpReadonlyScope(actor, workspaceId);
+        if (scope != null && (!scope.capabilityId().equals(capabilityId)
+                || !scope.capabilityVersion().equals(version))) throw EafException.notFound();
+        var capability = scope == null ? capabilities.get(actor, workspaceId, capabilityId, version)
+                : requireBoundCapability(actor, workspaceId, scope);
         // 不使用 requirePublished：详情不扩展执行资格检查，但发布状态必须当前有效。
         if (!"PUBLISHED".equals(capability.status())) throw EafException.notFound();
         return new CapabilityUsageDetail("CAPABILITY", capability.id(), capability.name(), capability.description(),
@@ -111,6 +131,22 @@ public final class PlatformAccessApplicationService {
         if (tokenBudget < 1 || tokenBudget > DEFAULT_CONTEXT_TOKEN_BUDGET)
             throw EafException.invalid("tokenBudget 必须在 1-2000 之间。");
         return contexts.query(actor, workspaceId, new ContextQuery(request.query(), topK, tokenBudget));
+    }
+
+    private McpReadonlyDelegationScope mcpReadonlyScope(ActorContext actor, UUID workspaceId) {
+        if (actor == null || !actor.delegated()) return null;
+        if (!IdentityService.MCP_AUDIENCE.equals(actor.delegationAudience()))
+            throw EafException.forbidden("MCP 不接受 REST audience 委托。");
+        return identities.mcpReadonlyScope(actor).filter(scope -> scope.workspaceId().equals(workspaceId))
+                .orElseThrow(() -> EafException.forbidden("MCP 只读委托已失效或 Workspace 不匹配。"));
+    }
+
+    private CapabilityDefinition requireBoundCapability(ActorContext actor, UUID workspaceId,
+                                                         McpReadonlyDelegationScope scope) {
+        var capability = capabilities.requirePublished(actor, workspaceId, scope.capabilityId(), scope.capabilityVersion());
+        if (!scope.capabilityHash().equals(capability.contentHash()))
+            throw EafException.notFound();
+        return capability;
     }
 
     static ContextRequest parseContextRequest(Map<String, Object> rawBody) {

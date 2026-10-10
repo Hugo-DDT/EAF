@@ -2,6 +2,7 @@ package io.eaf.usage.infrastructure;
 
 import io.eaf.shared.ActorContext;
 import io.eaf.shared.EafException;
+import io.eaf.shared.Hashing;
 import io.eaf.usage.api.UsageOperationsCursor;
 import io.eaf.usage.api.UsageOperationsItem;
 import io.eaf.usage.api.UsageOperationsPage;
@@ -33,7 +34,9 @@ public class JdbcUsageRecorder implements UsageRecorder {
     private static final String COLUMNS = "tenant_id, workspace_id, task_id, run_id, source, provider, model, input_tokens, output_tokens, "
             + "usage_status, estimated_cost, cost_currency, cost_status, cost_source, reserved_tokens, status, error_code, started_at, ended_at, call_no, "
             + "call_key, call_type, scope_type, scope_id, price_version, price_source_version, price_effective_at, billing_unit, "
-            + "input_price_per_million, output_price_per_million, request_price, actual_cost, actual_cost_currency, billing_source";
+            + "input_price_per_million, output_price_per_million, request_price, actual_cost, actual_cost_currency, billing_source, "
+            + "model_profile_id, model_profile_version, model_configuration_hash, requested_model, effective_output_token_limit, "
+            + "reported_response_model, finish_reason, model_operation_ms";
     private static final RowMapper<UsageRecord> ROW_MAPPER = JdbcUsageRecorder::map;
     private static final RowMapper<Price> PRICE_MAPPER = (rs, row) -> new Price(rs.getString("price_version"),
             rs.getString("source"), rs.getString("source_version"), rs.getString("currency"), rs.getString("billing_unit"),
@@ -56,6 +59,7 @@ public class JdbcUsageRecorder implements UsageRecorder {
     @Transactional
     public void record(UsageRecord record) {
         validateRecord(record);
+        verifySpendReservationIdentity(record);
         var price = reservedPrice(record.callKey());
         if (price == null) price = activePrice(record);
         var estimate = estimate(record, price);
@@ -67,8 +71,8 @@ public class JdbcUsageRecorder implements UsageRecorder {
         var costStatus = billed ? "BILLED" : estimate.status();
         var estimatedCost = "ESTIMATED".equals(estimate.status()) ? estimate.amount() : null;
         try {
-            var inserted = jdbc.update("insert into usage.model_usage(id, tenant_id, workspace_id, task_id, run_id, call_no, call_key, call_type, scope_type, scope_id, source, provider, model, input_tokens, output_tokens, usage_status, estimated_cost, cost_currency, cost_status, cost_source, price_version, price_source_version, price_effective_at, billing_unit, input_price_per_million, output_price_per_million, request_price, actual_cost, actual_cost_currency, billing_source, reserved_tokens, status, error_code, started_at, ended_at) "
-                            + "values (gen_random_uuid(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict (call_key) do nothing",
+            var inserted = jdbc.update("insert into usage.model_usage(id, tenant_id, workspace_id, task_id, run_id, call_no, call_key, call_type, scope_type, scope_id, source, provider, model, input_tokens, output_tokens, usage_status, estimated_cost, cost_currency, cost_status, cost_source, price_version, price_source_version, price_effective_at, billing_unit, input_price_per_million, output_price_per_million, request_price, actual_cost, actual_cost_currency, billing_source, reserved_tokens, status, error_code, started_at, ended_at, model_profile_id, model_profile_version, model_configuration_hash, requested_model, effective_output_token_limit, reported_response_model, finish_reason, model_operation_ms) "
+                            + "values (gen_random_uuid(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict (call_key) do nothing",
                     record.tenantId(), record.workspaceId(), record.taskId(), record.runId(), record.callNo(), record.callKey(),
                     record.callType(), record.scopeType(), record.scopeId(), record.source(), record.provider(), record.model(),
                     record.inputTokens(), record.outputTokens(), record.usageStatus(), estimatedCost,
@@ -78,7 +82,9 @@ public class JdbcUsageRecorder implements UsageRecorder {
                     price == null ? null : price.billingUnit(), price == null ? null : price.inputRate(),
                     price == null ? null : price.outputRate(), price == null ? null : price.requestPrice(), actualCost,
                     actualCurrency, billingSource, record.reservedTokens(), record.status(), record.errorCode(),
-                    Timestamp.from(record.startedAt()), record.endedAt() == null ? null : Timestamp.from(record.endedAt()));
+                    Timestamp.from(record.startedAt()), record.endedAt() == null ? null : Timestamp.from(record.endedAt()),
+                    record.modelProfileId(), record.modelProfileVersion(), record.modelConfigurationHash(), record.requestedModel(),
+                    record.effectiveOutputTokenLimit(), record.reportedResponseModel(), record.finishReason(), record.modelOperationMillis());
             if (inserted == 0) verifyReplay(record);
             settleReservedCall(record, estimate);
         } catch (DuplicateKeyException duplicate) {
@@ -159,7 +165,15 @@ public class JdbcUsageRecorder implements UsageRecorder {
         }
         jdbc.update("update usage.spend_scope set reserved_amount = reserved_amount + ?, updated_at = now() where tenant_id = ? and workspace_id = ? and scope_type = ? and scope_id = ?",
                 amount, command.tenantId(), command.workspaceId(), command.scopeType(), command.scopeId());
-        return new SpendReservation(true, null, amount, scope.currency());
+        var receiptText = String.join("\u001f", command.callKey(), command.provider(), command.model(), command.callType(),
+                Long.toString(command.maxTokens()), price.version(), price.source(), price.sourceVersion(),
+                String.valueOf(price.effectiveAt()), price.billingUnit(), String.valueOf(price.inputRate()),
+                String.valueOf(price.outputRate()), String.valueOf(price.requestPrice()), price.currency(), amount.toPlainString());
+        var receipt = new io.eaf.usage.api.PricingReceipt(command.callKey(), command.provider(), command.model(),
+                command.callType(), command.maxTokens(), price.version(), price.source(), price.sourceVersion(),
+                price.effectiveAt(), price.billingUnit(), price.inputRate(), price.outputRate(), price.requestPrice(),
+                price.currency(), amount, Hashing.sha256(receiptText));
+        return new SpendReservation(true, null, amount, scope.currency(), receipt);
     }
 
     @Override
@@ -406,6 +420,25 @@ public class JdbcUsageRecorder implements UsageRecorder {
                 || record.reservedTokens() < 0) throw EafException.invalid("Usage Token 数量不能为负数。");
     }
 
+    private void verifySpendReservationIdentity(UsageRecord record) {
+        var rows = jdbc.query("select tenant_id, workspace_id, scope_type, scope_id, provider, model, call_type "
+                        + "from usage.spend_reservation where call_key = ?",
+                (rs, row) -> new SpendIdentity(rs.getObject("tenant_id", UUID.class),
+                        rs.getObject("workspace_id", UUID.class), rs.getString("scope_type"),
+                        rs.getObject("scope_id", UUID.class), rs.getString("provider"), rs.getString("model"),
+                        rs.getString("call_type")), record.callKey());
+        if (rows.isEmpty()) return;
+        var reserved = rows.getFirst();
+        if (!Objects.equals(reserved.tenantId(), record.tenantId())
+                || !Objects.equals(reserved.workspaceId(), record.workspaceId())
+                || !Objects.equals(reserved.scopeType(), record.scopeType())
+                || !Objects.equals(reserved.scopeId(), record.scopeId())
+                || !Objects.equals(reserved.provider(), record.provider())
+                || !Objects.equals(reserved.model(), record.model())
+                || !Objects.equals(reserved.callType(), record.callType()))
+            throw EafException.conflict("SPEND_IDENTITY_MISMATCH", "Usage 记录与原费用预留身份不一致。");
+    }
+
     private void validateBilling(BigDecimal amount, String currency, String source) {
         if (amount == null || amount.signum() < 0 || currency == null || !currency.matches("[A-Z]{3}")
                 || source == null || source.isBlank() || source.length() > 120)
@@ -420,7 +453,15 @@ public class JdbcUsageRecorder implements UsageRecorder {
                 && Objects.equals(existing.source(), request.source()) && Objects.equals(existing.provider(), request.provider())
                 && Objects.equals(existing.model(), request.model()) && Objects.equals(existing.inputTokens(), request.inputTokens())
                 && Objects.equals(existing.outputTokens(), request.outputTokens()) && Objects.equals(existing.usageStatus(), request.usageStatus())
-                && existing.reservedTokens() == request.reservedTokens() && Objects.equals(existing.status(), request.status());
+                && existing.reservedTokens() == request.reservedTokens() && Objects.equals(existing.status(), request.status())
+                && Objects.equals(existing.modelProfileId(), request.modelProfileId())
+                && Objects.equals(existing.modelProfileVersion(), request.modelProfileVersion())
+                && Objects.equals(existing.modelConfigurationHash(), request.modelConfigurationHash())
+                && Objects.equals(existing.requestedModel(), request.requestedModel())
+                && Objects.equals(existing.effectiveOutputTokenLimit(), request.effectiveOutputTokenLimit())
+                && Objects.equals(existing.reportedResponseModel(), request.reportedResponseModel())
+                && Objects.equals(existing.finishReason(), request.finishReason())
+                && Objects.equals(existing.modelOperationMillis(), request.modelOperationMillis());
     }
 
     private static UsageRecord map(ResultSet rs, int row) throws SQLException {
@@ -435,7 +476,11 @@ public class JdbcUsageRecorder implements UsageRecorder {
                 rs.getString("price_source_version"), instant(rs, "price_effective_at"), rs.getString("billing_unit"),
                 rs.getBigDecimal("input_price_per_million"), rs.getBigDecimal("output_price_per_million"),
                 rs.getBigDecimal("request_price"), rs.getBigDecimal("actual_cost"), rs.getString("actual_cost_currency"),
-                rs.getString("billing_source"));
+                rs.getString("billing_source"), rs.getObject("model_profile_id", UUID.class),
+                rs.getString("model_profile_version"), rs.getString("model_configuration_hash"),
+                rs.getString("requested_model"), rs.getObject("effective_output_token_limit", Integer.class),
+                rs.getString("reported_response_model"), rs.getString("finish_reason"),
+                rs.getObject("model_operation_ms", Long.class));
     }
 
     private static Instant instant(ResultSet rs, String name) throws SQLException {
@@ -451,6 +496,8 @@ public class JdbcUsageRecorder implements UsageRecorder {
     private record SpendReference(UUID tenantId, UUID workspaceId, String scopeType, UUID scopeId) { }
     private record SpendRow(BigDecimal reservedAmount, BigDecimal settledAmount, BigDecimal billedAmount,
                             String currency, String state) { }
+    private record SpendIdentity(UUID tenantId, UUID workspaceId, String scopeType, UUID scopeId,
+                                 String provider, String model, String callType) { }
 
     private record Price(String version, String source, String sourceVersion, String currency, String billingUnit,
                          BigDecimal inputRate, BigDecimal outputRate, BigDecimal requestPrice, Instant effectiveAt) { }

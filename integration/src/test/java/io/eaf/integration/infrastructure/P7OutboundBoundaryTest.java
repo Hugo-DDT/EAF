@@ -13,6 +13,10 @@ import java.time.Instant;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
@@ -225,6 +229,128 @@ class P7OutboundBoundaryTest {
             assertThat(records).hasSize(1);
         } finally {
             crm.stop(0);
+        }
+    }
+
+    @Test
+    void timedOutCrmWriteRemainsUnknownAndIsVerifiedByTheSameOperationId() throws Exception {
+        var posts = new AtomicInteger();
+        var verifications = new AtomicInteger();
+        var receivedOperation = new AtomicReference<String>();
+        var serverExecutor = Executors.newCachedThreadPool();
+        var crm = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        crm.setExecutor(serverExecutor);
+        crm.createContext("/followups", exchange -> {
+            try {
+                posts.incrementAndGet();
+                exchange.getRequestBody().readAllBytes();
+                receivedOperation.set(exchange.getRequestHeaders().getFirst("Idempotency-Key"));
+                exchange.getResponseHeaders().add("Content-Type", "application/json");
+                exchange.sendResponseHeaders(201, 0);
+                exchange.getResponseBody().write('x');
+                exchange.getResponseBody().flush();
+                Thread.sleep(700);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            } catch (java.io.IOException clientTimedOut) {
+                // Fixture 先记录已接收的写入，再停住响应体以模拟结果未知。
+            } finally {
+                exchange.close();
+            }
+        });
+        crm.createContext("/followups/by-operation/operation-stable-42", exchange -> {
+            verifications.incrementAndGet();
+            var body = "{\"contractVersion\":\"EAF-CRM-WRITE-V1\",\"operationId\":\"operation-stable-42\","
+                    + "\"externalId\":\"fu-42\",\"customerId\":\"customer-1\",\"summary\":\"synthetic followup\","
+                    + "\"ownerId\":\"owner-1\",\"status\":\"CREATED\",\"acceptedAt\":\"2026-10-01T00:00:00Z\"}";
+            var bytes = body.getBytes(StandardCharsets.UTF_8);
+            try {
+                exchange.getResponseHeaders().add("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, bytes.length);
+                exchange.getResponseBody().write(bytes);
+            } catch (java.io.IOException ignored) {
+            } finally {
+                exchange.close();
+            }
+        });
+        crm.start();
+        var credentials = mock(CredentialResolutionPort.class);
+        when(credentials.resolve(any())).thenReturn(new ResolvedCredential("p7-crm-write", 1, TOKEN));
+        var adapter = new TestCrmHttpIntegration(new ObjectMapper(), credentials,
+                new OutboundTargetPolicy("local", false, ""));
+        try {
+            var connector = p7WriteCrm("http://127.0.0.1:" + crm.getAddress().getPort());
+            var unknown = adapter.createFollowup(connector, "operation-stable-42", "customer-1",
+                    "synthetic followup", "owner-1", Instant.now().plusMillis(250));
+            var verified = adapter.findFollowup(connector, "operation-stable-42", Instant.now().plusSeconds(3));
+
+            assertThat(unknown.state()).isEqualTo("UNKNOWN");
+            assertThat(unknown.errorCode()).isEqualTo("CRM_TIMEOUT");
+            assertThat(verified).isPresent();
+            assertThat(verified.orElseThrow().externalId()).isEqualTo("fu-42");
+            assertThat(posts).hasValue(1);
+            assertThat(receivedOperation).hasValue("operation-stable-42");
+            assertThat(verifications).hasValue(1);
+        } finally {
+            crm.stop(0);
+            serverExecutor.shutdownNow();
+        }
+    }
+
+    @Test
+    void timedOutCrmResponsesReleaseEveryOutboundPermit() throws Exception {
+        var slow = new AtomicBoolean(true);
+        var started = new CountDownLatch(17);
+        var release = new CountDownLatch(1);
+        var serverExecutor = Executors.newCachedThreadPool();
+        var crm = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        crm.setExecutor(serverExecutor);
+        crm.createContext("/customers/customer-1", exchange -> {
+            try {
+                if (slow.get()) {
+                    started.countDown();
+                    exchange.sendResponseHeaders(200, 0);
+                    exchange.getResponseBody().write('x');
+                    exchange.getResponseBody().flush();
+                    release.await(3, TimeUnit.SECONDS);
+                    return;
+                }
+                var bytes = ("{\"customerId\":\"customer-1\",\"renewalStatus\":\"ACTIVE\","
+                        + "\"lastContactDate\":\"2026-10-01\",\"complaintSummary\":\"none\",\"sourceId\":\"fixture\"}")
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, bytes.length);
+                exchange.getResponseBody().write(bytes);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            } catch (java.io.IOException clientClosed) {
+            } finally {
+                exchange.close();
+            }
+        });
+        crm.start();
+        var credentials = mock(CredentialResolutionPort.class);
+        when(credentials.resolve(any())).thenReturn(new ResolvedCredential("crm-fixture", 1, TOKEN));
+        var adapter = new TestCrmHttpIntegration(new ObjectMapper(), credentials,
+                new OutboundTargetPolicy("local", false, ""));
+        try {
+            var connector = crm("http://127.0.0.1:" + crm.getAddress().getPort());
+            for (var index = 0; index < 17; index++) {
+                var call = index;
+                assertThatThrownBy(() -> adapter.readCustomer(connector, "customer-1", Instant.now().plusMillis(100)))
+                        .as("timed out outbound call %s", call)
+                        .isInstanceOfSatisfying(EafException.class,
+                                failure -> assertThat(failure.code()).isEqualTo("CRM_TIMEOUT"));
+            }
+            assertThat(started.await(1, TimeUnit.SECONDS)).isTrue();
+            release.countDown();
+            slow.set(false);
+
+            assertThat(adapter.readCustomer(connector, "customer-1", Instant.now().plusSeconds(2)).customerId())
+                    .isEqualTo("customer-1");
+        } finally {
+            release.countDown();
+            crm.stop(0);
+            serverExecutor.shutdownNow();
         }
     }
 

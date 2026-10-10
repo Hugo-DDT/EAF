@@ -10,4 +10,9 @@ public interface EvaluationContextSnapshotReader {
 
     boolean isCurrentForTask(ActorContext actor, UUID workspaceId, UUID taskId, UUID snapshotId,
                              EnterpriseContext context);
+
+    /** 只为与固定 P31 Prompt 报告绑定的候选侧 EVALUATION Task 返回模板精确来源。 */
+    Optional<PromptCandidateTaskBinding> promptCandidateForTask(ActorContext actor, UUID workspaceId, UUID taskId);
+
+    record PromptCandidateTaskBinding(UUID candidateId, int candidateRevision) { }
 }

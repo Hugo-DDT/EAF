@@ -3,6 +3,7 @@ package io.eaf.evaluation.api;
 import io.eaf.shared.ActorContext;
 import io.eaf.task.api.TaskAssetBinding;
 import java.time.Instant;
+import java.util.Optional;
 import java.util.UUID;
 
 public interface EvaluationService {
@@ -21,6 +22,10 @@ public interface EvaluationService {
 
     // Learning 事实审核通过后冻结基线/候选上下文；此步骤不读取评测答案或改变正式资产。
     CandidateContextSnapshot captureCandidateContext(CandidateContextSnapshotCommand command);
+
+    /** 仅返回当前 Owner 的有效 TEAM preparation 快照元数据，不返回评测正文或答案。 */
+    Optional<CandidateContextSnapshot> findTeamPreparationSnapshot(ActorContext actor, UUID workspaceId,
+            UUID candidateId, int revision);
 
     // 候选修订后保留旧快照作审计，但禁止新任务继续读取旧 revision。
     void invalidateCandidateContext(ActorContext actor, UUID workspaceId, UUID candidateId, int revision);

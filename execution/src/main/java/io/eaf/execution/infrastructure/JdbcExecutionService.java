@@ -20,6 +20,8 @@ import io.eaf.connector.api.ExternalWriteResult;
 import io.eaf.connector.api.FollowupRecord;
 import io.eaf.connector.api.FollowupOutcomeRecord;
 import io.eaf.connector.api.ExternalOutcomeWriteResult;
+import io.eaf.connector.api.P27BusinessConnectionService;
+import io.eaf.connector.api.P27BusinessConnectionIntegrationPort;
 import io.eaf.connector.api.RemoteA2aOutcome;
 import io.eaf.connector.api.RemoteA2aResult;
 import io.eaf.connector.api.ServiceRequestPayload;
@@ -46,6 +48,8 @@ import io.eaf.shared.EafException;
 import io.eaf.shared.Hashing;
 import io.eaf.task.api.TaskExecutionCheck;
 import io.eaf.task.api.TaskService;
+import io.eaf.task.api.P27BusinessSourceVerifier;
+import io.eaf.task.api.P27BusinessTaskSource;
 import io.eaf.task.api.CustomerFollowupService;
 import io.eaf.tool.api.ToolCatalog;
 import io.eaf.tool.api.ToolDefinition;
@@ -61,6 +65,7 @@ import java.util.List;
 import java.util.Set;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
@@ -86,6 +91,8 @@ public class JdbcExecutionService implements ExecutionService {
     private final TaskService tasks;
     private final KnowledgeService knowledge;
     private final CustomerFollowupService customerFollowups;
+    private final P27BusinessConnectionService p27Connections;
+    private final P27BusinessSourceVerifier p27Sources;
     private final WorkspaceAuthorization workspaces;
     private final WorkspaceOperationalControl operationalControl;
     private final AuditPort audit;
@@ -100,7 +107,9 @@ public class JdbcExecutionService implements ExecutionService {
                                 WorkspaceAuthorization workspaces, WorkspaceOperationalControl operationalControl,
                                 AuditPort audit, Clock clock,
                                 RemoteAgentCatalog remoteAgents, CapabilityService capabilities,
-                                PlatformTransactionManager transactionManager) {
+                                PlatformTransactionManager transactionManager,
+                                P27BusinessConnectionService p27Connections,
+                                @Lazy P27BusinessSourceVerifier p27Sources) {
         this.jdbc = jdbc; this.json = json; this.tools = tools; this.policy = policy; this.approvals = approvals;
         this.connectors = connectors; this.tasks = tasks; this.customerFollowups = customerFollowups; this.knowledge = knowledge;
         this.workspaces = workspaces;
@@ -111,6 +120,7 @@ public class JdbcExecutionService implements ExecutionService {
         this.outsideTransaction = new TransactionTemplate(transactionManager);
         this.outsideTransaction.setPropagationBehavior(TransactionTemplate.PROPAGATION_NOT_SUPPORTED);
         this.remoteAgents = remoteAgents; this.capabilities = capabilities;
+        this.p27Connections = p27Connections; this.p27Sources = p27Sources;
     }
 
     @Override
@@ -187,8 +197,7 @@ public class JdbcExecutionService implements ExecutionService {
                 var messageId = id.toString();
                 var operationKey = Hashing.sha256(String.join("\u001f", c.actor().tenantId().toString(), c.workspaceId().toString(),
                         c.actor().actorId().toString(), c.taskId().toString(), Integer.toString(c.attempt()), c.idempotencyKey()));
-                var taskDeadline = jdbc.queryForObject("select deadline_at from task.task where id = ? and tenant_id = ? and workspace_id = ?",
-                        (rs, row) -> rs.getTimestamp(1).toInstant(), c.taskId(), c.actor().tenantId(), c.workspaceId());
+                var taskDeadline = tasks.deadlineAt(c.actor().tenantId(), c.workspaceId(), c.taskId());
                 var pollDeadline = min(taskDeadline, now.plus(Duration.ofMinutes(15)));
                 var traceId = c.traceId() == null ? evidence.snapshot().traceId() : c.traceId();
                 jdbc.update("insert into execution.execution(id, tenant_id, workspace_id, actor_id, task_id, attempt, agent_id, agent_version, tool_name, tool_version, arguments_json, request_hash, idempotency_key, status, policy_version, operation_id, connector_id, connector_version, row_version, created_at, started_at, lease_until) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, 'EXECUTING', ?, ?, ?, ?, 1, ?, ?, ?)",
@@ -220,7 +229,8 @@ public class JdbcExecutionService implements ExecutionService {
         try {
             response = outsideTransaction.execute(tx -> connectors.sendA2aTask(c.actor().tenantId(), c.workspaceId(),
                     binding.connector().id(), intent.execution().operationId().toString(), binding.registration().peerSkillId(),
-                    intent.execution().operationId().toString(), write(body), min(Instant.now(clock).plusSeconds(5), taskDeadline(c.taskId()))));
+                    intent.execution().operationId().toString(), write(body), min(Instant.now(clock).plusSeconds(5),
+                            taskDeadline(c.actor().tenantId(), c.workspaceId(), c.taskId()))));
         } catch (RuntimeException failure) {
             response = new RemoteA2aResult(RemoteA2aOutcome.UNKNOWN, null, null, null, null, "A2A_SEND_UNKNOWN");
         }
@@ -796,8 +806,8 @@ public class JdbcExecutionService implements ExecutionService {
         return false;
     }
 
-    private Instant taskDeadline(UUID taskId) {
-        return jdbc.queryForObject("select deadline_at from task.task where id = ?", (rs, row) -> rs.getTimestamp(1).toInstant(), taskId);
+    private Instant taskDeadline(UUID tenantId, UUID workspaceId, UUID taskId) {
+        return tasks.deadlineAt(tenantId, workspaceId, taskId);
     }
 
     private static Instant min(Instant a, Instant b) { return a.isBefore(b) ? a : b; }
@@ -817,10 +827,14 @@ public class JdbcExecutionService implements ExecutionService {
         if (!"EXECUTING".equals(current.status())) return current;
         try {
             var readAt = Instant.now(clock).plusSeconds(10);
-            CustomerRecord result = "EVALUATION".equals(beforeCall.source())
-                    ? connectors.readCustomerForEvaluation(c.actor().tenantId(), c.workspaceId(), args.customerId(), readAt)
-                    : connectors.readCustomer(c.actor().tenantId(), c.workspaceId(), tool.bindingRef(), args.customerId(), readAt);
-            var resultJson = customerJson(result);
+            String resultJson;
+            if (args.p27() != null) resultJson = p27ReadResult(c, args.p27(), args.json(), readAt);
+            else {
+                CustomerRecord result = "EVALUATION".equals(beforeCall.source())
+                        ? connectors.readCustomerForEvaluation(c.actor().tenantId(), c.workspaceId(), args.customerId(), readAt)
+                        : connectors.readCustomer(c.actor().tenantId(), c.workspaceId(), tool.bindingRef(), args.customerId(), readAt);
+                resultJson = customerJson(result);
+            }
             current = move(current, "EXECUTING", "VERIFYING", resultJson);
             if (!"VERIFYING".equals(current.status())) return current;
             var done = finish(current, "VERIFYING", "SUCCEEDED", resultJson, null, null, decision.policyVersion());
@@ -834,12 +848,52 @@ public class JdbcExecutionService implements ExecutionService {
         }
     }
 
+    private String p27ReadResult(ExecutionCommand command, P27BusinessTaskSource source, String argumentsJson,
+            Instant deadline) {
+        var bindingVersion = p27Connections.bindingVersion(command.actor(), command.workspaceId(), source.bindingRef());
+        var input = read(argumentsJson);
+        var output = json.createObjectNode().put("bindingVersion", bindingVersion);
+        switch (source.kind()) {
+            case "OA_LIST" -> {
+                Integer limit = input.has("limit") ? input.path("limit").asInt() : 20;
+                var status = input.path("status").asText(null);
+                var cursor = input.path("cursor").asText(null);
+                var page = p27Connections.listTodos(command.actor(), command.workspaceId(), source.bindingRef(),
+                        bindingVersion, status == null || status.isBlank() ? null : status,
+                        cursor == null || cursor.isBlank() ? null : cursor, limit, deadline);
+                output.set("page", json.valueToTree(page));
+            }
+            case "OA_ITEM" -> {
+                var todoId = input.path("todoId").asText(null);
+                var todo = p27Connections.getTodo(command.actor(), command.workspaceId(), source.bindingRef(),
+                        bindingVersion, todoId, deadline);
+                output.put("found", todo.isPresent());
+                if (todo.isPresent()) output.set("todo", json.valueToTree(todo.get())); else output.putNull("todo");
+            }
+            case "SERVICE_STATE" -> {
+                var state = p27Connections.readCurrentState(command.actor(), command.workspaceId(), source.bindingRef(),
+                        bindingVersion, source.requestId(), deadline);
+                if (!source.registrationOperationId().equals(state.registrationOperationId()))
+                    throw EafException.conflict("SERVICE_REQUEST_REGISTRATION_MISMATCH", "当前服务台状态与原登记操作不匹配。");
+                output.set("state", json.valueToTree(state));
+            }
+            default -> throw EafException.forbidden("P27 只读 Tool 来源无效。");
+        }
+        return write(output);
+    }
+
+    private JsonNode read(String value) {
+        try { return json.readTree(value); }
+        catch (Exception invalid) { throw EafException.invalid("P27 Tool 参数无效。"); }
+    }
+
     /** 写入先读取受授权客户事实生成预览；此处绝不调用 POST。 */
     private ExecutionSnapshot submitWrite(ExecutionCommand c, ToolDefinition tool, NormalizedArguments args, PolicyDecision decision) {
         var connector = connectors.requireActiveForTool(c.actor().tenantId(), c.workspaceId(), tool.bindingRef());
         if (args.serviceRequest() != null && !serviceRequestSourcesCurrent(c.actor(), c.workspaceId(), args.serviceRequest()))
             return persistDenied(c, decision.policyVersion(), "SERVICE_REQUEST_EVIDENCE_UNAVAILABLE",
                     "服务请求知识出处已撤回或当前身份失去读取权限。", args);
+        if (args.p27() != null) return submitP27Write(c, tool, args, decision, connector);
         CustomerRecord customer = null;
         if (args.serviceRequest() == null) {
             var readBinding = previewReadBinding(tool.bindingRef());
@@ -906,6 +960,55 @@ public class JdbcExecutionService implements ExecutionService {
         return pending;
     }
 
+    private ExecutionSnapshot submitP27Write(ExecutionCommand c, ToolDefinition tool, NormalizedArguments args,
+            PolicyDecision decision, ConnectorDefinition connector) {
+        var source = args.p27();
+        if (!"RESULT_SYNC".equals(source.kind()) || !"service.request.result.record".equals(tool.name()))
+            return persistDenied(c, decision.policyVersion(), "P27_WRITE_SOURCE_INVALID", "服务台写入缺少固定人工结果来源。", args);
+        try {
+            var mapping = p27Connections.requireEmployeeMapping(c.actor(), c.workspaceId(), source.bindingRef());
+            if (!mapping.bindingVersion().equals(source.bindingVersion())
+                    || !mapping.externalSubjectId().equals(source.externalSubjectId()))
+                return persistDenied(c, decision.policyVersion(), "P27_SOURCE_ACCESS_REVOKED",
+                        "当前员工映射或服务台请求读取权限已变化。", args);
+        } catch (EafException denied) {
+            return persistDenied(c, decision.policyVersion(), denied.code(), "当前业务绑定不允许创建写入审批。", args);
+        }
+        var connectorVersion = connectors.bindingVersion(connector);
+        var operationId = UUID.randomUUID();
+        var expiresAt = Instant.now(clock).plusSeconds(30 * 60);
+        ObjectNode preview = json.createObjectNode().put("operationId", operationId.toString())
+                .put("tool", tool.name() + "@" + tool.version()).put("requestId", source.requestId())
+                .put("registrationOperationId", source.registrationOperationId())
+                .put("workItemId", source.workItemId().toString()).put("workItemVersion", source.workItemVersion())
+                .put("sourceResultHash", source.sourceResultHash()).put("externalSubjectId", source.externalSubjectId())
+                .put("completedBy", source.completedBy().toString()).put("completedAt", source.completedAt().toString())
+                .put("outcome", source.outcome()).put("summary", source.summary())
+                .put("expectedExternalVersion", source.expectedExternalVersion())
+                .put("bindingRef", tool.bindingRef()).put("connectorBindingVersion", connectorVersion)
+                .put("employeeBindingVersion", source.bindingVersion())
+                .put("sourceId", "EAF-SERVICE-DESK-V1").put("policyVersion", decision.policyVersion())
+                .put("expiresAt", expiresAt.toString());
+        if (source.nextAction() == null) preview.putNull("nextAction"); else preview.put("nextAction", source.nextAction());
+        var previewJson = write(preview);
+        var id = UUID.randomUUID();
+        jdbc.update("insert into execution.execution(id, tenant_id, workspace_id, actor_id, task_id, attempt, agent_id, agent_version, tool_name, tool_version, arguments_json, request_hash, idempotency_key, status, policy_version, operation_id, connector_id, connector_version, preview_json, preview_hash, row_version, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, 'AWAITING_APPROVAL', ?, ?, ?, ?, ?::jsonb, ?, 1, ?) ",
+                id, c.actor().tenantId(), c.workspaceId(), c.actor().actorId(), c.taskId(), c.attempt(), c.agentId(), c.agentVersion(),
+                c.toolName(), c.toolVersion(), args.json(), Hashing.sha256(args.json()), c.idempotencyKey(), decision.policyVersion(),
+                operationId, connector.id(), connectorVersion, previewJson, Hashing.sha256(previewJson), Timestamp.from(Instant.now(clock)));
+        var binding = new ApprovalBinding(c.actor().tenantId(), c.workspaceId(), c.actor().actorId(), c.agentId(),
+                c.agentVersion(), id, operationId.toString(), c.toolName(), c.toolVersion(), connector.id(), connectorVersion,
+                args.json(), Hashing.sha256(args.json()), decision.policyVersion(), previewJson, Hashing.sha256(previewJson), expiresAt);
+        var approval = approvals.request(new ApprovalCreateCommand(c.actor(), c.workspaceId(), c.taskId(), binding,
+                c.idempotencyKey() + ":" + c.taskId()));
+        jdbc.update("update execution.execution set approval_id = ? where id = ?", approval.id(), id);
+        audit.append(new AuditFact("p27-result-sync-preview:" + id, c.actor().tenantId(), c.workspaceId(),
+                c.actor().actorId(), c.taskId(), "SERVICE_REQUEST_RESULT_PREVIEW_CREATED", "AWAITING_APPROVAL", previewJson, c.traceId()));
+        var pending = getInternal(id);
+        recordOutbox(pending);
+        return pending;
+    }
+
     @Override
     public ExecutionSnapshot resume(ActorContext actor, UUID workspaceId, UUID executionId) {
         var claim = transactions.execute(transaction -> {
@@ -937,6 +1040,13 @@ public class JdbcExecutionService implements ExecutionService {
             try {
                 tool = tools.requirePublished(current.tenantId(), workspaceId, current.toolName(), current.toolVersion());
                 connector = connectors.requireActiveForTool(current.tenantId(), workspaceId, tool.bindingRef());
+                if (args.p27() != null) {
+                    var mapping = p27Connections.requireEmployeeMapping(actor, workspaceId, args.p27().bindingRef());
+                    if (!mapping.bindingVersion().equals(args.p27().bindingVersion())
+                            || !mapping.externalSubjectId().equals(args.p27().externalSubjectId()))
+                        return new ResumeAttempt(finish(current, "AWAITING_APPROVAL", "DENIED", null,
+                                "EMPLOYEE_MAPPING_CHANGED", "审批后员工映射已变化，拒绝使用旧批准。", current.policyVersion()), false);
+                }
                 decision = args.serviceRequest() != null
                         ? evaluateServiceRequest(actor, workspaceId, authority.agentId(), authority.agentVersion(), tool, check.source())
                         : policy.evaluate(new PolicyRequest(actor, workspaceId, authority.agentId(), authority.agentVersion(),
@@ -969,6 +1079,8 @@ public class JdbcExecutionService implements ExecutionService {
         NormalizedArguments args;
         try {
             args = normalizeStored(actor, workspaceId, current);
+            if (args.p27() != null)
+                return resumeP27Write(actor, workspaceId, current, args);
             var node = json.readTree(current.previewJson());
             if (args.serviceRequest() != null) {
                 var payload = args.serviceRequest();
@@ -1021,12 +1133,12 @@ public class JdbcExecutionService implements ExecutionService {
             return transactions.execute(transaction -> finishUnknown(current, "EXECUTING", "CRM_WRITE_UNKNOWN", "写入调用异常，外部事实必须通过核验确认。", null));
         }
         // CRM 已返回后通过新的短事务 CAS；若过期扫描先赢，只保留回执证据。
-        return transactions.execute(transaction -> resolveExternal(actor, workspaceId, current, args, result));
+        return resolveExternal(actor, workspaceId, current, args, result);
     }
 
     @Override
     public ExecutionSnapshot verify(ActorContext actor, UUID workspaceId, UUID executionId) {
-        workspaces.require(actor, workspaceId, "execution:verify");
+        requireP27OrExecutionVerify(actor, workspaceId, executionId);
         var current = visible(actor, workspaceId, executionId);
         if (!"UNKNOWN".equals(current.status()) && !"VERIFICATION_FAILED".equals(current.status())) return current;
         // 先以短事务抢占核验状态，再在事务外查询 CRM，避免网络调用持有数据库事务或行锁。
@@ -1038,6 +1150,16 @@ public class JdbcExecutionService implements ExecutionService {
         if (!"VERIFYING".equals(verifying.status())) return verifying;
         try {
             var args = normalizeStored(actor, workspaceId, verifying);
+            if (args.p27() != null) {
+                var receipt = outsideTransaction.execute(transaction -> p27Connections.findHandlingResult(actor,
+                        workspaceId, args.p27().bindingRef(), args.p27().bindingVersion(),
+                        verifying.operationId().toString(), Instant.now(clock).plusSeconds(10)));
+                if (receipt == null || receipt.isEmpty()) return transactions.execute(transaction -> finishUnknown(verifying,
+                        "VERIFYING", "SERVICE_REQUEST_RESULT_NOT_FOUND",
+                        "原 operationId 暂无匹配回执；不会重新发送服务台写入。", "{\"found\":false}"));
+                return transactions.execute(transaction -> finishP27Verified(actor, workspaceId, verifying,
+                        args.p27(), receipt.get(), true));
+            }
             var target = approvedWriteTarget(actor, workspaceId, verifying, args);
             if (args.serviceRequest() != null) {
                 var record = outsideTransaction.execute(transaction -> connectors.findServiceRequest(actor.tenantId(), workspaceId,
@@ -1082,7 +1204,7 @@ public class JdbcExecutionService implements ExecutionService {
         if (requestKey == null || requestKey.isBlank() || requestKey.length() > 200
                 || normalizedReason == null || normalizedReason.isBlank() || normalizedReason.length() > 500)
             throw EafException.invalid("Execution 核验需要不超过 200 字符的请求键和 1 至 500 字符的原因。");
-        workspaces.require(actor, workspaceId, "execution:verify");
+        requireP27OrExecutionVerify(actor, workspaceId, executionId);
 
         var keyHash = Hashing.sha256(String.join("\u001f", actor.tenantId().toString(), workspaceId.toString(), requestKey));
         var requestHash = Hashing.sha256(String.join("\u001f", actor.actorId().toString(), executionId.toString(), normalizedReason));
@@ -1138,6 +1260,21 @@ public class JdbcExecutionService implements ExecutionService {
             var completed = operationalVerifyCommand(actor, workspaceId, keyHash);
             return verifyReceipt(completed, command.replayed());
         });
+    }
+
+    private void requireP27OrExecutionVerify(ActorContext actor, UUID workspaceId, UUID executionId) {
+        if (actor == null || actor.type() != ActorType.HUMAN || actor.delegated())
+            throw EafException.forbidden("Execution 核验只允许本人 HUMAN 操作者执行。");
+        var row = jdbc.query("select task_id, attempt, tool_name, tool_version, arguments_json::text arguments_json "
+                        + "from execution.execution where id = ? and tenant_id = ? and workspace_id = ? and actor_id = ?",
+                rs -> rs.next() ? new Object[]{rs.getObject("task_id", UUID.class), rs.getInt("attempt"),
+                        rs.getString("tool_name"), rs.getString("tool_version"), rs.getString("arguments_json")} : null,
+                executionId, actor.tenantId(), workspaceId, actor.actorId());
+        if (row != null && "service.request.result.record".equals(row[2]) && "1.0.0".equals(row[3])) {
+            workspaces.require(actor, workspaceId, "service-request:result:sync");
+            p27Sources.requireToolSource(actor, workspaceId, (UUID) row[0], (Integer) row[1], (String) row[2],
+                    (String) row[3], (String) row[4]);
+        } else workspaces.require(actor, workspaceId, "execution:verify");
     }
 
     private VerifyCommand operationalVerifyCommand(ActorContext actor, UUID workspaceId, String keyHash) {
@@ -1226,25 +1363,35 @@ public class JdbcExecutionService implements ExecutionService {
     private ExecutionSnapshot resolveExternal(ActorContext actor, UUID workspaceId, ExecutionSnapshot current,
                                               NormalizedArguments args, ExternalWriteResult result) {
         if ("REJECTED".equals(result.state()))
-            return finish(current, "EXECUTING", "FAILED", null, result.errorCode(), result.detail(), current.policyVersion());
-        if (!"ACCEPTED".equals(result.state())) return finishUnknown(current, "EXECUTING", result.errorCode(), result.detail(), null);
-        var verifying = move(current, "EXECUTING", "VERIFYING", null);
+            return transactions.execute(tx -> finish(current, "EXECUTING", "FAILED", null,
+                    result.errorCode(), result.detail(), current.policyVersion()));
+        if (!"ACCEPTED".equals(result.state()))
+            return transactions.execute(tx -> finishUnknown(current, "EXECUTING", result.errorCode(), result.detail(), null));
+
+        var verifying = transactions.execute(tx -> move(current, "EXECUTING", "VERIFYING", null));
         if (!"VERIFYING".equals(verifying.status())) {
             if (result.record() != null) preserveLateEvidence(verifying.id(), write(result.record()));
             return getInternal(verifying.id());
         }
+        if (result.record() != null)
+            return transactions.execute(tx -> finishVerified(actor, workspaceId, verifying, args, result.record(), true));
+
+        FollowupRecord record;
         try {
-            var record = result.record();
-            if (record == null) {
+            record = outsideTransaction.execute(tx -> {
                 var target = approvedWriteTarget(actor, workspaceId, verifying, args);
-                record = connectors.findFollowup(actor.tenantId(), workspaceId, target.tool().bindingRef(),
-                        verifying.connectorVersion(), verifying.operationId().toString(), Instant.now(clock).plusSeconds(10)).orElse(null);
-            }
-            if (record == null) return finishUnknown(verifying, "VERIFYING", "CRM_RECORD_NOT_FOUND", "CRM 接收后未返回可核验记录。", "{\"found\":false}");
-            return finishVerified(actor, workspaceId, verifying, args, record, true);
-        } catch (Exception e) {
-            return finishUnknown(verifying, "VERIFYING", "CRM_VERIFY_UNAVAILABLE", "写入结果待核验。", null);
+                return connectors.findFollowup(actor.tenantId(), workspaceId, target.tool().bindingRef(),
+                        verifying.connectorVersion(), verifying.operationId().toString(),
+                        Instant.now(clock).plusSeconds(10)).orElse(null);
+            });
+        } catch (Exception unavailable) {
+            return transactions.execute(tx -> finishUnknown(verifying, "VERIFYING", "CRM_VERIFY_UNAVAILABLE",
+                    "写入结果待核验。", null));
         }
+        if (record == null)
+            return transactions.execute(tx -> finishUnknown(verifying, "VERIFYING", "CRM_RECORD_NOT_FOUND",
+                    "CRM 接收后未返回可核验记录。", "{\"found\":false}"));
+        return transactions.execute(tx -> finishVerified(actor, workspaceId, verifying, args, record, true));
     }
 
     private ExecutionSnapshot resolveServiceRequestExternal(ActorContext actor, UUID workspaceId,
@@ -1293,6 +1440,108 @@ public class JdbcExecutionService implements ExecutionService {
         if (countExecution) tasks.recordToolExecution(current.taskId(), current.attempt());
         audit.append(new AuditFact("execution-service-request-verified:" + current.id(), actor.tenantId(), workspaceId,
                 actor.actorId(), current.taskId(), "SERVICE_REQUEST_REGISTERED", "SUCCEEDED", evidence, null));
+        return done;
+    }
+
+    private ExecutionSnapshot resumeP27Write(ActorContext actor, UUID workspaceId, ExecutionSnapshot current,
+            NormalizedArguments args) {
+        var source = args.p27();
+        var deadline = Instant.now(clock).plusSeconds(10);
+        try {
+            var allowed = outsideTransaction.execute(tx -> p27Connections.canReadServiceRequest(actor, workspaceId,
+                    source.bindingRef(), source.bindingVersion(), source.requestId(), deadline));
+            if (!Boolean.TRUE.equals(allowed))
+                return transactions.execute(tx -> finish(current, "EXECUTING", "FAILED", null,
+                        "SERVICE_REQUEST_ACCESS_REVOKED", "当前员工已失去该服务台请求读取权限，未发送结果写入。", current.policyVersion()));
+        } catch (Exception denied) {
+            return transactions.execute(tx -> finish(current, "EXECUTING", "FAILED", null,
+                    "SERVICE_REQUEST_ACCESS_UNAVAILABLE", "写入前无法确认当前服务台对象权限，未发送结果写入。", current.policyVersion()));
+        }
+        var payload = p27Payload(current.operationId(), source);
+        P27BusinessConnectionIntegrationPort.ServiceRequestResultWriteResult writeResult;
+        try {
+            writeResult = outsideTransaction.execute(tx -> p27Connections.recordHandlingResult(actor, workspaceId,
+                    source.bindingRef(), source.bindingVersion(), payload, deadline));
+        } catch (Exception uncertain) {
+            writeResult = P27BusinessConnectionIntegrationPort.ServiceRequestResultWriteResult.unknown(
+                    "SERVICE_REQUEST_RESULT_UNKNOWN", "服务台写入调用结果不明，需按原 operationId 核验。");
+        }
+        if (writeResult == null) writeResult = P27BusinessConnectionIntegrationPort.ServiceRequestResultWriteResult.unknown(
+                "SERVICE_REQUEST_RESULT_UNKNOWN", "服务台写入回执缺失，需按原 operationId 核验。");
+        final var settledWriteResult = writeResult;
+        if ("REJECTED".equals(settledWriteResult.state()))
+            return transactions.execute(tx -> finish(current, "EXECUTING", "FAILED", null, settledWriteResult.errorCode(),
+                    settledWriteResult.detail(), current.policyVersion()));
+        Optional<P27BusinessConnectionIntegrationPort.ServiceRequestHandlingReceipt> readback;
+        try {
+            readback = outsideTransaction.execute(tx -> p27Connections.findHandlingResult(actor, workspaceId,
+                    source.bindingRef(), source.bindingVersion(), current.operationId().toString(), Instant.now(clock).plusSeconds(10)));
+        } catch (Exception unavailable) { readback = Optional.empty(); }
+        if (readback == null || readback.isEmpty())
+            return transactions.execute(tx -> finishUnknown(current, "EXECUTING",
+                    settledWriteResult.errorCode() == null ? "SERVICE_REQUEST_RESULT_NOT_FOUND" : settledWriteResult.errorCode(),
+                    "没有取得原 operationId 的匹配回执；后续只核验该操作，不重新发送。", "{\"found\":false}"));
+        var receipt = readback.get();
+        var evidence = write(receipt);
+        var verifying = move(current, "EXECUTING", "VERIFYING", null);
+        if (!"VERIFYING".equals(verifying.status())) {
+            preserveLateEvidence(verifying.id(), evidence);
+            return getInternal(verifying.id());
+        }
+        return transactions.execute(tx -> finishP27Verified(actor, workspaceId, verifying, source, receipt, true));
+    }
+
+    private P27BusinessConnectionIntegrationPort.ServiceRequestHandlingPayload p27Payload(UUID operationId,
+            P27BusinessTaskSource source) {
+        return new P27BusinessConnectionIntegrationPort.ServiceRequestHandlingPayload(operationId.toString(),
+                source.requestId(), source.registrationOperationId(), source.workItemId().toString(),
+                source.workItemVersion(), source.sourceResultHash(), source.externalSubjectId(),
+                source.completedBy().toString(), source.completedAt(), source.outcome(), source.summary(),
+                source.nextAction(), source.expectedExternalVersion());
+    }
+
+    private ExecutionSnapshot finishP27Verified(ActorContext actor, UUID workspaceId, ExecutionSnapshot current,
+            P27BusinessTaskSource source, P27BusinessConnectionIntegrationPort.ServiceRequestHandlingReceipt receipt,
+            boolean countExecution) {
+        var evidence = receipt == null ? "null" : write(receipt);
+        var expectedStatus = "COMPLETED".equals(source.outcome()) ? "RESOLVED" : "IN_PROGRESS";
+        var matches = receipt != null && current.operationId().toString().equals(receipt.operationId())
+                && source.requestId().equals(receipt.requestId())
+                && source.registrationOperationId().equals(receipt.registrationOperationId())
+                && source.workItemId().toString().equals(receipt.workItemId())
+                && source.workItemVersion() == receipt.workItemVersion()
+                && source.sourceResultHash().equals(receipt.sourceResultHash())
+                && source.externalSubjectId().equals(receipt.externalSubjectId())
+                && source.completedBy().toString().equals(receipt.completedBy())
+                && source.completedAt().equals(receipt.completedAt())
+                && source.outcome().equals(receipt.outcome()) && source.summary().equals(receipt.summary())
+                && java.util.Objects.equals(source.nextAction(), receipt.nextAction())
+                && "RECORDED".equals(receipt.recordState())
+                && source.expectedExternalVersion().equals(receipt.previousExternalVersion())
+                && receipt.resultingExternalVersion() != null
+                && expectedStatus.equals(receipt.resultingStatus()) && receipt.acceptedAt() != null;
+        if (!matches) return finish(current, "VERIFYING", "VERIFICATION_FAILED", evidence,
+                "SERVICE_REQUEST_RESULT_MISMATCH", "服务台回执与已审批的人工来源、版本或 operationId 不一致。",
+                current.policyVersion(), evidence);
+        var result = json.createObjectNode().put("operationId", receipt.operationId())
+                .put("requestId", receipt.requestId()).put("registrationOperationId", receipt.registrationOperationId())
+                .put("resultId", receipt.resultId()).put("workItemId", receipt.workItemId())
+                .put("workItemVersion", receipt.workItemVersion()).put("sourceResultHash", receipt.sourceResultHash())
+                .put("externalSubjectId", receipt.externalSubjectId()).put("completedBy", receipt.completedBy())
+                .put("completedAt", receipt.completedAt().toString()).put("outcome", receipt.outcome())
+                .put("summary", receipt.summary()).put("recordState", receipt.recordState())
+                .put("previousExternalVersion", receipt.previousExternalVersion())
+                .put("resultingExternalVersion", receipt.resultingExternalVersion())
+                .put("resultingStatus", receipt.resultingStatus()).put("acceptedAt", receipt.acceptedAt().toString());
+        if (receipt.nextAction() == null) result.putNull("nextAction"); else result.put("nextAction", receipt.nextAction());
+        var done = finish(current, "VERIFYING", "SUCCEEDED", write(result), null, null, current.policyVersion(), evidence);
+        if (!"SUCCEEDED".equals(done.status())) {
+            preserveLateEvidence(current.id(), evidence);
+            return getInternal(current.id());
+        }
+        if (countExecution) tasks.recordToolExecution(current.taskId(), current.attempt());
+        audit.append(new AuditFact("p27-result-sync-verified:" + current.id(), actor.tenantId(), workspaceId,
+                actor.actorId(), current.taskId(), "SERVICE_REQUEST_RESULT_VERIFIED", "SUCCEEDED", evidence, null));
         return done;
     }
 
@@ -1455,6 +1704,25 @@ public class JdbcExecutionService implements ExecutionService {
                         + "? order by created_at desc, id desc limit 1",
                 rs -> rs.next() ? rs.getObject("id", UUID.class) : null, taskId, actor.tenantId(), workspaceId);
         return id == null ? Optional.empty() : Optional.of(visible(actor, workspaceId, id));
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public Optional<ExecutionSnapshot> findP27ResultSyncForTask(ActorContext actor, UUID workspaceId, UUID taskId) {
+        workspaces.require(actor, workspaceId, "service-request:result:sync");
+        if (actor == null || actor.type() != ActorType.HUMAN || actor.delegated() || taskId == null)
+            throw EafException.forbidden("P27 同步执行状态只对本人 HUMAN 申请人开放。");
+        var row = jdbc.query("select id, attempt, arguments_json::text arguments_json from execution.execution "
+                        + "where tenant_id = ? and workspace_id = ? and task_id = ? and actor_id = ? "
+                        + "and tool_name = 'service.request.result.record' and tool_version = '1.0.0' "
+                        + "order by created_at desc limit 1",
+                rs -> rs.next() ? new Object[]{rs.getObject("id", UUID.class), rs.getInt("attempt"), rs.getString("arguments_json")} : null,
+                actor.tenantId(), workspaceId, taskId, actor.actorId());
+        if (row == null) return Optional.empty();
+        var execution = getInternal((UUID) row[0]);
+        p27Sources.requireToolSource(actor, workspaceId, taskId, (Integer) row[1], execution.toolName(),
+                execution.toolVersion(), (String) row[2]);
+        return Optional.of(execution);
     }
 
     @Override
@@ -1814,6 +2082,11 @@ public class JdbcExecutionService implements ExecutionService {
     }
 
     private NormalizedArguments normalizeForTask(ExecutionCommand command, ToolDefinition tool) {
+        if (isP27Tool(tool.name())) {
+            var source = p27Sources.requireToolSource(command.actor(), command.workspaceId(), command.taskId(),
+                    command.attempt(), tool.name(), tool.version(), command.argumentsJson());
+            return new NormalizedArguments(null, null, command.argumentsJson(), null, null, source);
+        }
         if ("service.request.register".equals(tool.name())) {
             var submissionId = serviceRequestSubmissionId(command.argumentsJson());
             var payload = tasks.requireServiceRequestWritePayload(command.actor(), command.workspaceId(),
@@ -1826,7 +2099,17 @@ public class JdbcExecutionService implements ExecutionService {
         return normalizedResult(payload);
     }
 
+    private boolean isP27Tool(String name) {
+        return Set.of("oa.todo.list", "oa.todo.get", "service.request.status.get",
+                "service.request.result.record").contains(name);
+    }
+
     private NormalizedArguments normalizeStored(ActorContext actor, UUID workspaceId, ExecutionSnapshot execution) {
+        if (isP27Tool(execution.toolName())) {
+            var source = p27Sources.requireToolSource(actor, workspaceId, execution.taskId(), execution.attempt(),
+                    execution.toolName(), execution.toolVersion(), execution.argumentsJson());
+            return new NormalizedArguments(null, null, execution.argumentsJson(), null, null, source);
+        }
         if ("service.request.register".equals(execution.toolName())) {
             var submissionId = serviceRequestSubmissionId(execution.argumentsJson());
             var payload = tasks.requireServiceRequestWritePayload(actor, workspaceId, execution.taskId(),
@@ -1963,7 +2246,14 @@ public class JdbcExecutionService implements ExecutionService {
     private record ResultIds(UUID followupId, UUID resultId) { }
     private record NormalizedArguments(String customerId, String summary, String json,
                                        CustomerFollowupService.SyncWritePayload outcome,
-                                       io.eaf.task.api.ServiceRequestWritePayload serviceRequest) { }
+                                       io.eaf.task.api.ServiceRequestWritePayload serviceRequest,
+                                       P27BusinessTaskSource p27) {
+        private NormalizedArguments(String customerId, String summary, String json,
+                                    CustomerFollowupService.SyncWritePayload outcome,
+                                    io.eaf.task.api.ServiceRequestWritePayload serviceRequest) {
+            this(customerId, summary, json, outcome, serviceRequest, null);
+        }
+    }
     private record RemoteArguments(String customerId, String riskSummary, String json) { }
     private record RemoteBinding(RemoteAgentRegistration registration, CapabilityDefinition capability,
                                  ConnectorDefinition connector) { }

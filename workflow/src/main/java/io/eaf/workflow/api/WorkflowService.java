@@ -35,11 +35,33 @@ public interface WorkflowService {
     ServiceRequestHandlingSnapshot createServiceRequestHandlingWorkflow(ActorContext actor, UUID workspaceId,
             UUID submissionId, UUID assigneeId, String sharedBrief, String idempotencyKey, Instant deadlineAt,
             String scenarioKey, List<TeamExperienceRef> teamExperienceRefs);
+    ProjectBriefSnapshot createProjectBrief(CreateProjectBriefCommand command);
+    ProjectBriefSnapshot getProjectBrief(ActorContext actor, UUID workspaceId, UUID briefId);
+    ProjectBriefSnapshot cancelProjectBrief(ActorContext actor, UUID workspaceId, UUID briefId, long expectedVersion);
+    ProjectBriefWorkItem getProjectBriefWorkItem(ActorContext actor, UUID workspaceId, UUID workItemId);
+    ProjectBriefWorkItem reassignProjectBriefWorkItem(ActorContext actor, UUID workspaceId, UUID workItemId,
+            long expectedVersion, UUID assigneeId);
+    ProjectBriefWorkItem reviewProjectBriefWorkItem(ActorContext actor, UUID workspaceId, UUID workItemId,
+            long expectedVersion, String idempotencyKey, String decision, String notes, String nextAction);
+    ProjectBriefWorkItem receiveProjectBriefWorkItem(ActorContext actor, UUID workspaceId, UUID workItemId,
+            long expectedVersion, String idempotencyKey, String disposition, String note);
+    ProjectBriefArtifact getProjectBriefArtifact(ActorContext actor, UUID workspaceId, UUID briefId, int version);
+    ProjectBriefInboxPage listProjectBriefInbox(ActorContext actor, UUID workspaceId, Instant cursorUpdatedAt,
+            UUID cursorId, int pageSize);
+    WorkflowHumanInboxPage listMyHumanInbox(ActorContext actor, UUID workspaceId, Instant cursorUpdatedAt,
+            UUID cursorId, int pageSize);
+    ProjectBriefTaskSource requireProjectBriefTaskSource(ActorContext actor, UUID workspaceId, UUID taskId);
+    boolean beginProjectBriefGeneration(ActorContext actor, UUID workspaceId, UUID taskId, int attempt);
+    String recordProjectBriefGenerationResult(ActorContext actor, UUID workspaceId, UUID taskId, int attempt,
+            String resultJson);
     TeamExperienceSource requireTeamExperienceSource(ActorContext actor, UUID workspaceId, UUID workItemId);
     TeamExperienceTaskSelection requireTeamExperienceSelectionForTask(ActorContext actor, UUID workspaceId, UUID taskId);
     ServiceRequestHandlingSnapshot getServiceRequestHandling(ActorContext actor, UUID workspaceId, UUID instanceId);
     HumanWorkItemPage listHumanWorkItems(ActorContext actor, UUID workspaceId, String relation, String status,
             Instant cursorCreatedAt, UUID cursorId, int pageSize);
+    /** 仅返回当前 HUMAN 本人受派、可处理的固定 P16 OPEN 工作项摘要来源。 */
+    P16DigestSourcePage readMyP16DigestSources(ActorContext actor, UUID workspaceId, int maxItems);
+    P16DigestSource readP16DigestSource(ActorContext actor, UUID workspaceId, UUID workItemId);
     HumanWorkItem getHumanWorkItem(ActorContext actor, UUID workspaceId, UUID workItemId);
     HumanWorkItem reassignHumanWorkItem(ActorContext actor, UUID workspaceId, UUID workItemId,
             long expectedVersion, UUID assigneeId);
@@ -66,6 +88,9 @@ public interface WorkflowService {
             Instant completedAt, String outcome, String resultHash, String sourceType) { }
     record TeamExperienceTaskSelection(String scenarioKey, List<TeamExperienceRef> refs, UUID assigneeId) {
         public TeamExperienceTaskSelection { refs = refs == null ? List.of() : List.copyOf(refs); }
+    }
+    record P16DigestSourcePage(java.util.List<P16DigestSource> items, boolean hasMore) {
+        public P16DigestSourcePage { items = items == null ? java.util.List.of() : java.util.List.copyOf(items); }
     }
     record ParallelBranch(String role, String stepId, String dispatchKey, String inputJson, String inputHash,
             UUID capabilityId, String capabilityVersion, UUID childTaskId, String status, String errorCode) { }

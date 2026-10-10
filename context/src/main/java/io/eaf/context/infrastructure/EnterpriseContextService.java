@@ -75,6 +75,7 @@ public class EnterpriseContextService implements ContextService {
         if (topK < 1 || topK > 10) throw EafException.invalid("context topK 必须在 1-10 之间。");
         if (budget < 1 || budget > MAX_TOKEN_BUDGET) throw EafException.invalid("tokenBudget 必须在 1-2000 之间。");
         requireMemoryPolicy(request, topK, budget);
+        requireMcpReadonlyRequest(actor, request);
 
         // context 有自己的入口授权，再由 knowledge 对每个文档执行 read 过滤，拒绝借上下文绕过边界。
         workspaces.require(actor, workspaceId, "context:read");
@@ -110,7 +111,7 @@ public class EnterpriseContextService implements ContextService {
             items.add(item(hit, items.size() + 1, tokens));
         }
         // Memory 没有向量排序；仅在明确的实体绑定与剩余预算内，按模块给出的稳定顺序补入。
-        if (items.size() < topK && memories != null
+        if (!mcpReadonly(actor) && items.size() < topK && memories != null
                 && workspaces.isAuthorized(actor.tenantId(), actor.actorId(), workspaceId, "memory:read")) {
             for (var memory : memories.findApplicable(actor, workspaceId, request.businessEntityType(), request.businessEntityId())) {
                 var tokens = estimateTokens(memory.content());
@@ -167,7 +168,6 @@ public class EnterpriseContextService implements ContextService {
         validateRequest(actor, workspaceId, request, taskScope);
         var topK = request.topK() == null ? DEFAULT_TOP_K : request.topK();
         var budget = request.tokenBudget() == null ? MAX_TOKEN_BUDGET : request.tokenBudget();
-        requireMemoryPolicy(request, topK, budget);
         var canReadKnowledge = workspaces.isAuthorized(actor.tenantId(), actor.actorId(), workspaceId, "knowledge:read");
         if (!canReadKnowledge) return new EnterpriseContext("NO_EVIDENCE", topK, budget, 0, 0, null, java.util.List.of());
         var search = knowledge.search(actor, workspaceId, request.query(), Math.min(10, topK), knowledgeScope(taskScope),
@@ -228,7 +228,7 @@ public class EnterpriseContextService implements ContextService {
             used += item.estimatedTokens();
             selected.add(item);
         }
-        if (selected.size() < topK && memories != null
+        if (!mcpReadonly(actor) && selected.size() < topK && memories != null
                 && workspaces.isAuthorized(actor.tenantId(), actor.actorId(), workspaceId, "memory:read")) {
             for (var memory : memories.findApplicable(actor, workspaceId, request.businessEntityType(), request.businessEntityId())) {
                 var tokens = estimateTokens(memory.content());
@@ -254,6 +254,7 @@ public class EnterpriseContextService implements ContextService {
         var topK = request.topK() == null ? DEFAULT_TOP_K : request.topK();
         var budget = request.tokenBudget() == null ? MAX_TOKEN_BUDGET : request.tokenBudget();
         requireMemoryPolicy(request, topK, budget);
+        requireMcpReadonlyRequest(actor, request);
         if (topK < 1 || topK > 10) throw EafException.invalid("context topK 必须在 1-10 之间。");
         if (budget < 1 || budget > MAX_TOKEN_BUDGET) throw EafException.invalid("tokenBudget 必须在 1-2000 之间。");
         workspaces.require(actor, workspaceId, "context:read");
@@ -296,7 +297,8 @@ public class EnterpriseContextService implements ContextService {
                     return item.documentId() != null && item.chunkId() != null && item.buildId() != null
                             && knowledge.isUsable(actor, workspaceId, item.documentId(), item.documentVersion(),
                             item.chunkId(), item.buildId(), item.contentHash());
-                if ("MEMORY".equals(sourceType) && memories != null && item.memoryId() != null && item.memoryVersion() != null) {
+                if (!mcpReadonly(actor) && "MEMORY".equals(sourceType) && memories != null
+                        && item.memoryId() != null && item.memoryVersion() != null) {
                     var current = memories.requireUsable(actor, workspaceId, item.memoryId(), item.memoryVersion());
                     return current.contentHash().equals(item.contentHash());
                 }
@@ -319,6 +321,15 @@ public class EnterpriseContextService implements ContextService {
 
     private boolean personalExperience(ContextQuery request) {
         return request != null && "PERSONAL_EXPERIENCE_V1".equals(request.memoryPolicy());
+    }
+
+    private void requireMcpReadonlyRequest(ActorContext actor, ContextQuery request) {
+        if (mcpReadonly(actor) && (request.businessEntityType() != null || personalExperience(request)))
+            throw EafException.forbidden("MCP 只读委托只允许读取所选 Knowledge，不允许业务实体或 Memory 上下文。");
+    }
+
+    private boolean mcpReadonly(ActorContext actor) {
+        return actor != null && actor.delegated() && "eaf:mcp".equals(actor.delegationAudience());
     }
 
     private void requireMemoryPolicy(ContextQuery request, int topK, int budget) {

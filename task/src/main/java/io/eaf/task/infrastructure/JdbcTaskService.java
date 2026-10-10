@@ -7,13 +7,17 @@ import io.eaf.agent.api.AgentDefinition;
 import io.eaf.audit.api.AuditFact;
 import io.eaf.audit.api.AuditPort;
 import io.eaf.identity.api.IdentityService;
+import io.eaf.model.api.ModelProfileCatalog;
+import io.eaf.model.api.ModelProfileSelection;
 import io.eaf.shared.ActorContext;
+import io.eaf.shared.ActorType;
 import io.eaf.shared.EafException;
 import io.eaf.shared.Hashing;
 import io.eaf.task.api.CreateTaskCommand;
 import io.eaf.task.api.CreateChildTaskCommand;
 import io.eaf.task.api.CreateToolExecutionCommand;
 import io.eaf.task.api.CreateWorkflowTaskCommand;
+import io.eaf.task.api.CreateAutomationReadTaskCommand;
 import io.eaf.task.api.TaskRunner;
 import io.eaf.task.api.TaskService;
 import io.eaf.task.api.TaskSnapshot;
@@ -28,13 +32,17 @@ import io.eaf.task.api.ServiceRequestSubmission;
 import io.eaf.task.api.ServiceRequestWritePayload;
 import io.eaf.task.api.TaskExecutionCheck;
 import io.eaf.task.api.QualityRunSourceVerifier;
+import io.eaf.task.api.P29BriefTaskSourceVerifier;
+import io.eaf.task.api.P30AutomationTaskSourceVerifier;
 import io.eaf.task.api.TaskAttemptRecovery;
 import io.eaf.task.api.TaskAssetBinding;
 import io.eaf.task.api.TaskPage;
 import io.eaf.task.api.TaskPageCursor;
+import io.eaf.task.api.UserTaskResultPage;
 import io.eaf.task.api.RemoteTaskWakeStatus;
 import io.eaf.task.api.WorkflowTaskCancellation;
 import io.eaf.task.api.WorkflowTaskProvenance;
+import io.eaf.task.api.WorkflowExecutionSource;
 import io.eaf.task.api.CustomerFollowupService;
 import io.eaf.workspace.api.WorkspaceAuthorization;
 import io.eaf.workspace.api.WorkspaceOperationalControl;
@@ -71,6 +79,11 @@ public class JdbcTaskService implements TaskService {
     private static final UUID SERVICE_REQUEST_REGISTER_CAPABILITY_ID = UUID.fromString("54000000-0000-4000-8000-000000000013");
     private static final UUID SERVICE_REQUEST_WORKFLOW_ID = UUID.fromString("58000000-0000-4000-8000-00000000000e");
     private static final String SERVICE_REQUEST_TOOL = "service.request.register";
+    private static final UUID P27_AGENT_ID = UUID.fromString("20000000-0000-4000-8000-000000000021");
+    private static final UUID P27_CAPABILITY_ID = UUID.fromString("54000000-0000-4000-8000-000000000022");
+    private static final UUID P30_AGENT_ID = UUID.fromString("20000000-0000-4000-8000-000000000024");
+    private static final UUID P30_CAPABILITY_ID = UUID.fromString("54000000-0000-4000-8000-000000000024");
+    private static final UUID P30_SKILL_ID = UUID.fromString("53000000-0000-4000-8000-000000000024");
     private static final ObjectMapper JSON = new ObjectMapper();
     private final JdbcTemplate jdbc;
     private final WorkspaceAuthorization workspaces;
@@ -91,6 +104,24 @@ public class JdbcTaskService implements TaskService {
     private final int claimScanLimit;
     private final TransactionTemplate transactions;
     private final TaskOperationalMetrics metrics;
+    private P29BriefTaskSourceVerifier p29Sources;
+    private P30AutomationTaskSourceVerifier p30Sources;
+    private ModelProfileCatalog modelProfiles;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    void p29BriefTaskSourceVerifier(@org.springframework.context.annotation.Lazy P29BriefTaskSourceVerifier verifier) {
+        this.p29Sources = verifier;
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    void p30AutomationTaskSourceVerifier(@org.springframework.context.annotation.Lazy P30AutomationTaskSourceVerifier verifier) {
+        this.p30Sources = verifier;
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    void modelProfileCatalog(@org.springframework.context.annotation.Lazy ModelProfileCatalog catalog) {
+        this.modelProfiles = catalog;
+    }
 
     public JdbcTaskService(JdbcTemplate jdbc, WorkspaceAuthorization workspaces,
                            WorkspaceOperationalControl operationalControl, QualityRunSourceVerifier qualityRunSources,
@@ -128,7 +159,40 @@ public class JdbcTaskService implements TaskService {
     @Override
     @Transactional
     public TaskSnapshot create(CreateTaskCommand c) {
-        return create(c, null, false);
+        return create(c, null, false, null, null);
+    }
+
+    @Override
+    @Transactional
+    public TaskSnapshot createAutomationReadTask(CreateAutomationReadTaskCommand command) {
+        if (command == null || command.actor() == null || command.actor().type() != io.eaf.shared.ActorType.HUMAN
+                || command.actor().delegated() || command.workspaceId() == null || command.runId() == null
+                || command.subscriptionId() == null || command.authorizationEpoch() < 1
+                || !P30_AGENT_ID.equals(command.agentId()) || !"1.0.0".equals(command.agentVersion())
+                || command.assetBinding() == null || !P30_CAPABILITY_ID.equals(command.assetBinding().capabilityId())
+                || !"1.0.0".equals(command.assetBinding().capabilityVersion())
+                || !P30_SKILL_ID.equals(command.assetBinding().skillId())
+                || !"1.0.0".equals(command.assetBinding().skillVersion())
+                || command.inputHash() == null || !command.inputHash().matches("[0-9a-f]{64}")
+                || command.profileHash() == null || !command.profileHash().matches("[0-9a-f]{64}"))
+            throw EafException.invalid("自动化只读 Task 的固定来源绑定不完整。");
+        if (p30Sources == null) throw EafException.conflict("AUTOMATION_SOURCE_UNAVAILABLE", "自动化来源校验器未就绪。");
+        p30Sources.requireTaskCreation(command);
+        var task = new CreateTaskCommand(command.actor(), command.workspaceId(), command.agentId(), command.agentVersion(),
+                command.input(), null, null, "p30-run:" + command.runId(), command.traceId(), "USER",
+                command.assetBinding(), "REST");
+        return create(task, null, false, command, null);
+    }
+
+    @Override
+    @Transactional
+    public void cancelAutomationTask(ActorContext actor, UUID workspaceId, UUID taskId) {
+        requireCurrentActor(actor, workspaceId, "task:cancel");
+        var owner = jdbc.query("select owner_id from task.automation_task_binding where task_id = ? and tenant_id = ? and workspace_id = ?",
+                rs -> rs.next() ? rs.getObject(1, UUID.class) : null, taskId, actor.tenantId(), workspaceId);
+        if (owner == null || actor.type() != io.eaf.shared.ActorType.HUMAN || actor.delegated()
+                || !actor.actorId().equals(owner)) throw EafException.notFound();
+        cancelTaskInternal(actor.tenantId(), workspaceId, actor.actorId(), taskId, null, false);
     }
 
     @Override
@@ -268,6 +332,19 @@ public class JdbcTaskService implements TaskService {
     private boolean serviceRequestAnalysisVersion(String agentVersion, String capabilityVersion) {
         return "1.0.0".equals(agentVersion) && "1.0.0".equals(capabilityVersion)
                 || "1.1.0".equals(agentVersion) && "1.1.0".equals(capabilityVersion);
+    }
+
+    private boolean isP32P15Task(CreateTaskCommand command, AgentDefinition agent) {
+        var binding = command.assetBinding();
+        return command.actor().type() == io.eaf.shared.ActorType.HUMAN && !command.actor().delegated()
+                && "USER".equals(command.source()) && "REST".equals(command.entryProtocol())
+                && command.businessEntityType() == null && command.businessEntityId() == null
+                && SERVICE_REQUEST_PLAN_AGENT_ID.equals(agent.id())
+                && "SERVICE_REQUEST_PLAN_V1".equals(agent.responseProfile()) && agent.ragEnabled()
+                && "HYBRID".equals(agent.retrievalMode()) && "NONE".equals(agent.evidencePolicy())
+                && binding != null && SERVICE_REQUEST_PLAN_CAPABILITY_ID.equals(binding.capabilityId())
+                && serviceRequestAnalysisVersion(agent.version(), binding.capabilityVersion())
+                && agents.tools(command.actor().tenantId(), command.workspaceId(), agent.id(), agent.version()).isEmpty();
     }
 
     @Override
@@ -1041,13 +1118,28 @@ public class JdbcTaskService implements TaskService {
                     command.deadlineAt()))
                 throw EafException.conflict("TEAM_IMPROVEMENT_TASK_BINDING_MISMATCH", "Task 与登记的唯一生成输入、资产或运行状态不一致。");
         }
+        boolean p15ModelTask = SERVICE_REQUEST_PLAN_AGENT_ID.equals(command.agentId())
+                && SERVICE_REQUEST_PLAN_CAPABILITY_ID.equals(command.assetBinding() == null ? null : command.assetBinding().capabilityId())
+                && serviceRequestAnalysisVersion(command.agentVersion(), command.assetBinding() == null
+                ? null : command.assetBinding().capabilityVersion());
+        var modelSelection = command.modelSelection();
+        if (modelSelection != null && (!scenarioRun || !p15ModelTask || command.scenarioSampleId() == null
+                || !qualityRunSources.scenarioSampleModelProfileMatches(command.actor().tenantId(), command.workspaceId(),
+                command.actor().actorId(), command.qualityRunId(), command.scenarioSampleId(), modelSelection)))
+            throw EafException.conflict("SCENARIO_MODEL_PROFILE_BINDING_MISMATCH", "模型档位不匹配固定 P15 评测样本清单。");
+        if (modelSelection == null && p15ModelTask) {
+            if (modelProfiles == null) throw EafException.conflict("MODEL_PROFILE_CONFIGURATION_UNAVAILABLE", "模型档位目录未就绪。");
+            var p15Agent = agents.requirePublished(command.actor().tenantId(), command.workspaceId(),
+                    command.agentId(), command.agentVersion());
+            modelSelection = modelProfiles.resolveForTask(p15Agent.modelProfileId(), null);
+        }
         if (!scenarioRun && !teamPreparationRun && !teamImprovementRun && (command.scenarioSampleId() != null
                 || command.assetBinding() != null || command.deadlineAt() != null))
             throw EafException.invalid("只有场景样本可指定场景绑定字段。");
         var task = new CreateTaskCommand(command.actor(), command.workspaceId(), command.agentId(), command.agentVersion(),
                 command.input(), command.businessEntityType(), command.businessEntityId(), command.idempotencyKey(),
                 command.traceId(), command.source(), command.assetBinding());
-        var created = create(task, command.qualityRunId());
+        var created = create(task, command.qualityRunId(), false, null, modelSelection);
         if (scenarioRun || teamPreparationRun) jdbc.update("update task.task set deadline_at = least(deadline_at, ?), "
                         + "active_deadline_at = least(active_deadline_at, ?) where id = ?",
                 Timestamp.from(command.deadlineAt()), Timestamp.from(command.deadlineAt()), created.id());
@@ -1136,18 +1228,38 @@ public class JdbcTaskService implements TaskService {
     }
 
     private TaskSnapshot create(CreateTaskCommand c, UUID qualityRunId) {
-        return create(c, qualityRunId, false);
+        return create(c, qualityRunId, false, null, null);
     }
 
     private TaskSnapshot create(CreateTaskCommand c, UUID qualityRunId, boolean experienceDraftEntry) {
+        return create(c, qualityRunId, experienceDraftEntry, null, null);
+    }
+
+    private TaskSnapshot create(CreateTaskCommand c, UUID qualityRunId, boolean experienceDraftEntry,
+                                CreateAutomationReadTaskCommand automationCommand) {
+        return create(c, qualityRunId, experienceDraftEntry, automationCommand, null);
+    }
+
+    private TaskSnapshot create(CreateTaskCommand c, UUID qualityRunId, boolean experienceDraftEntry,
+                                CreateAutomationReadTaskCommand automationCommand,
+                                ModelProfileSelection trustedModelSelection) {
         if (c == null || c.actor() == null) throw EafException.invalid("Task 身份上下文缺失。");
         if (c.input() == null || c.input().isBlank()) throw EafException.invalid("input 不能为空。");
         if (c.input().length() > 8_000) throw EafException.invalid("input 超过 8,000 字符限制。");
         if (c.idempotencyKey() == null || c.idempotencyKey().isBlank()) throw EafException.invalid("Idempotency-Key 必填。");
         if (!"USER".equals(c.source()) && !"EVALUATION".equals(c.source())) throw EafException.invalid("Task source 无效。");
         if (!List.of("REST", "MCP", "A2A").contains(c.entryProtocol())) throw EafException.invalid("Task entryProtocol 无效。");
-        if (c.actor().delegated() && (!"USER".equals(c.source()) || !validDelegation(c.actor(), c.workspaceId())))
+        if (c.actor().delegated() && (!"USER".equals(c.source())
+                || !validDelegation(c.actor(), c.workspaceId(), c.entryProtocol())))
             throw EafException.forbidden("委托 Task 必须使用当前有效的一跳 USER 委托身份。");
+        var p30Asset = P30_AGENT_ID.equals(c.agentId()) || c.assetBinding() != null
+                && (P30_CAPABILITY_ID.equals(c.assetBinding().capabilityId()) || P30_SKILL_ID.equals(c.assetBinding().skillId()));
+        if (p30Asset != (automationCommand != null))
+            throw EafException.forbidden("P30 固定摘要 Agent/Capability 只能由已登记自动化运行创建。");
+        if (automationCommand != null && (!P30_AGENT_ID.equals(c.agentId()) || !P30_CAPABILITY_ID.equals(c.assetBinding().capabilityId())
+                || !P30_SKILL_ID.equals(c.assetBinding().skillId()) || !c.idempotencyKey().equals("p30-run:" + automationCommand.runId())
+                || c.businessEntityType() != null || c.businessEntityId() != null || !"USER".equals(c.source())))
+            throw EafException.forbidden("P30 摘要 Task 必须保持固定 USER 根任务和原运行身份。");
         boolean controlledEvaluation = qualityRunId != null
                 && (qualityRunSources.isScenarioRun(c.actor().tenantId(), c.workspaceId(), qualityRunId)
                 || qualityRunSources.isTeamImprovementRun(c.actor().tenantId(), c.workspaceId(), qualityRunId));
@@ -1155,8 +1267,18 @@ public class JdbcTaskService implements TaskService {
         var access = workspaces.require(c.actor(), c.workspaceId(), "task:create");
         var taskAdmissionOpen = operationalControl.taskAdmissionOpen(c.actor().tenantId(), access.workspaceId());
         AgentDefinition agent = agents.requirePublished(c.actor().tenantId(), access.workspaceId(), c.agentId(), c.agentVersion());
+        if (c.actor().delegated() && IdentityService.MCP_AUDIENCE.equals(c.actor().delegationAudience())
+                && !validMcpReadonlyTask(c.actor(), c.workspaceId(), c.entryProtocol(), c.source(),
+                c.businessEntityType(), c.businessEntityId(), agent.id(), agent.version(), c.assetBinding()))
+            throw EafException.forbidden("MCP 委托只能创建绑定范围内的只读服务请求 Task。");
         if ("EXPERIENCE_DRAFT_V1".equals(agent.responseProfile()) != experienceDraftEntry)
             throw EafException.forbidden("EXPERIENCE_DRAFT_V1 只能通过带来源绑定的个人整理入口创建。");
+        boolean p32P15Task = isP32P15Task(c, agent);
+        if (c.modelProfileRef() != null && !p32P15Task)
+            throw EafException.forbidden("显式模型档位只允许本人通过 REST 创建固定 P15 只读根 Task。");
+        if (c.modelProfileRef() != null && (c.modelProfileRef().profileId() == null
+                || c.modelProfileRef().version() == null || c.modelProfileRef().version().isBlank()))
+            throw EafException.invalid("modelProfileRef 必须包含精确 profileId 和 version。");
         var now = Instant.now(clock);
         var id = UUID.randomUUID();
         // 幂等摘要绑定入口协议，避免同一业务键在 REST 与 MCP 之间跨入口重放。
@@ -1165,19 +1287,73 @@ public class JdbcTaskService implements TaskService {
                 c.source(), c.entryProtocol(), "AGENT",
                 c.actor().actorId().toString(), String.valueOf(c.actor().principalId()),
                 String.valueOf(c.actor().delegationId()), String.valueOf(c.actor().authorizationHash())));
+        // DEFAULT 保留旧摘要以便迁移前请求可重放；显式 ref 进入摘要并与默认请求隔离。
+        if (c.modelProfileRef() != null)
+            hash = Hashing.sha256(hash + "\u001fmodel-profile:EXPLICIT:" + c.modelProfileRef().profileId()
+                    + "@" + c.modelProfileRef().version());
+        if (trustedModelSelection != null && "EXPLICIT".equals(trustedModelSelection.selectionKind())) {
+            var selected = trustedModelSelection.effectiveProfile();
+            hash = Hashing.sha256(hash + "\u001fmodel-profile:EXPLICIT:" + selected.profileId()
+                    + "@" + selected.version() + ":" + selected.configurationHash());
+        }
         if (qualityRunId != null) hash = Hashing.sha256(hash + "\u001fquality-run:" + qualityRunId);
         var storedKey = storedIdempotencyKey(c.actor(), c.workspaceId(), c.idempotencyKey());
-        if (findByIdempotency(c.actor(), c.workspaceId(), storedKey).isPresent())
-            return existingTask(c.actor(), c.workspaceId(), storedKey, hash);
+        var existing = findByIdempotency(c.actor(), c.workspaceId(), storedKey);
+        if (existing.isPresent()) {
+            if (automationCommand == null) return existingTask(c.actor(), c.workspaceId(), storedKey, hash);
+            if (!existing.get().requestHash().equals(hash))
+                throw EafException.conflict("IDEMPOTENCY_CONFLICT", "同一自动化运行键对应不同 Task 输入。");
+            requireAutomationBinding(existing.get().id(), automationCommand);
+            return readTask(c.actor(), c.workspaceId(), existing.get().id());
+        }
         if (!taskAdmissionOpen) throw taskAdmissionStopped();
+        var modelSelection = trustedModelSelection;
+        if (modelSelection == null && qualityRunId == null && p32P15Task) {
+            if (modelProfiles == null)
+                throw EafException.conflict("MODEL_PROFILE_CONFIGURATION_UNAVAILABLE", "模型档位目录未就绪。");
+            modelSelection = modelProfiles.resolveForTask(agent.modelProfileId(), c.modelProfileRef());
+        }
+        if (trustedModelSelection != null) {
+            if (qualityRunId == null || modelProfiles == null
+                    || !agent.modelProfileId().equals(trustedModelSelection.assetDefaultProfileId())
+                    || trustedModelSelection.effectiveProfile() == null)
+                throw EafException.forbidden("评测模型档位选择必须绑定已登记的 P15 Agent 默认档位。");
+            modelProfiles.requireCurrent(trustedModelSelection.effectiveProfile());
+        }
         if (insertTask(id, c.actor(), c.workspaceId(), agent, c.input(), c.businessEntityType(), c.businessEntityId(),
                 storedKey, hash, c.traceId(), c.source(), c.assetBinding(), id, null, c.entryProtocol(), "AGENT", null, null,
-                qualityRunId, null, now, now.plus(lifetime)) == 0)
-            return existingTask(c.actor(), c.workspaceId(), storedKey, hash);
+                qualityRunId, null, now, now.plus(lifetime), modelSelection) == 0) {
+            if (automationCommand == null) return existingTask(c.actor(), c.workspaceId(), storedKey, hash);
+            var concurrent = findByIdempotency(c.actor(), c.workspaceId(), storedKey)
+                    .orElseThrow(() -> EafException.conflict("IDEMPOTENCY_CONFLICT", "自动化 Task 创建竞争未能恢复原记录。"));
+            if (!concurrent.requestHash().equals(hash))
+                throw EafException.conflict("IDEMPOTENCY_CONFLICT", "同一自动化运行键对应不同 Task 输入。");
+            requireAutomationBinding(concurrent.id(), automationCommand);
+            return readTask(c.actor(), c.workspaceId(), concurrent.id());
+        }
         jdbc.update("insert into task.budget_scope(scope_id, tenant_id, workspace_id, root_task_id, max_steps, steps_used, max_model_calls, model_calls, max_tool_calls, tool_calls, max_tokens, token_used, token_reserved, max_active_ms, active_used_ms) values (?, ?, ?, ?, 24, 0, 8, 0, 16, 0, 8000, 0, 0, ?, 0)",
                 id, c.actor().tenantId(), c.workspaceId(), id, activeDuration.toMillis());
+        if (automationCommand != null)
+            jdbc.update("insert into task.automation_task_binding(task_id, tenant_id, workspace_id, owner_id, subscription_id, run_id, authorization_epoch, input_hash, profile_hash) "
+                            + "values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    id, c.actor().tenantId(), c.workspaceId(), c.actor().actorId(), automationCommand.subscriptionId(),
+                    automationCommand.runId(), automationCommand.authorizationEpoch(), automationCommand.inputHash(), automationCommand.profileHash());
         audit.append(new AuditFact("task-created:" + id, c.actor().tenantId(), c.workspaceId(), c.actor().actorId(), id, "TASK_CREATED", "ACCEPTED", "{}", c.traceId()));
-        return get(c.actor(), c.workspaceId(), id);
+        return automationCommand == null ? get(c.actor(), c.workspaceId(), id) : readTask(c.actor(), c.workspaceId(), id);
+    }
+
+    private void requireAutomationBinding(UUID taskId, CreateAutomationReadTaskCommand command) {
+        var binding = jdbc.query("select owner_id, subscription_id, run_id, authorization_epoch, input_hash, profile_hash "
+                        + "from task.automation_task_binding where task_id = ?",
+                rs -> rs.next() ? new Object[]{rs.getObject("owner_id", UUID.class),
+                        rs.getObject("subscription_id", UUID.class), rs.getObject("run_id", UUID.class),
+                        rs.getLong("authorization_epoch"), rs.getString("input_hash"), rs.getString("profile_hash")} : null,
+                taskId);
+        if (binding == null || !command.actor().actorId().equals(binding[0])
+                || !command.subscriptionId().equals(binding[1]) || !command.runId().equals(binding[2])
+                || command.authorizationEpoch() != (long) binding[3]
+                || !command.inputHash().equals(binding[4]) || !command.profileHash().equals(binding[5]))
+            throw EafException.conflict("AUTOMATION_TASK_BINDING_CONFLICT", "原自动化运行已绑定到不同 Task 或证据。");
     }
 
     @Override
@@ -1229,7 +1405,11 @@ public class JdbcTaskService implements TaskService {
             throw EafException.invalid("Workflow Task 绑定字段不完整。");
         if (!"USER".equals(c.source()) && !"EVALUATION".equals(c.source()))
             throw EafException.invalid("Workflow Task source 无效。");
-        if (c.actor().delegated() && (!"USER".equals(c.source()) || !validDelegation(c.actor(), c.workspaceId())))
+        if (P30_AGENT_ID.equals(c.agentId()) || P30_CAPABILITY_ID.equals(c.assetBinding().capabilityId())
+                || P30_SKILL_ID.equals(c.assetBinding().skillId()))
+            throw EafException.forbidden("P30 固定摘要 Agent/Capability 不能通过 Workflow Task 入口创建。");
+        if (c.actor().delegated() && (!"USER".equals(c.source())
+                || !validDelegation(c.actor(), c.workspaceId(), "REST")))
             throw EafException.forbidden("委托 Workflow Task 必须保留当前有效的一跳 USER 委托身份。");
         requireCurrentActor(c.actor(), c.workspaceId(), "task:create");
         var taskAdmissionOpen = operationalControl.taskAdmissionOpen(c.actor().tenantId(), c.workspaceId());
@@ -1258,6 +1438,24 @@ public class JdbcTaskService implements TaskService {
                     || !expectedCapability.equals(c.assetBinding().capabilityId()))
                 throw EafException.forbidden("分支 Task 必须由固定批次 Workflow 使用对应只读角色创建。");
         }
+        var p29Workflow = c.workflowProvenance() != null && UUID.fromString("58000000-0000-4000-8000-00000000001d")
+                .equals(c.workflowProvenance().workflowId());
+        var p29Asset = UUID.fromString("20000000-0000-4000-8000-000000000023").equals(c.agentId())
+                || c.assetBinding() != null && UUID.fromString("54000000-0000-4000-8000-000000000023")
+                        .equals(c.assetBinding().capabilityId());
+        if (p29Asset != p29Workflow) throw EafException.forbidden("P29 固定 Agent/Capability 只能用于固定项目简报 Workflow。");
+        if (p29Workflow) {
+            if (p29Sources == null || c.actor().type() != io.eaf.shared.ActorType.HUMAN || c.actor().delegated()
+                    || !"prepare".equals(c.workflowProvenance().stepId())
+                    || !"1.0.0".equals(c.workflowProvenance().workflowVersion())
+                    || !UUID.fromString("20000000-0000-4000-8000-000000000023").equals(c.agentId())
+                    || !"1.0.0".equals(c.agentVersion()) || c.assetBinding() == null
+                    || !UUID.fromString("54000000-0000-4000-8000-000000000023").equals(c.assetBinding().capabilityId())
+                    || !"1.0.0".equals(c.assetBinding().capabilityVersion()) || c.toolName() != null
+                    || c.qualityRunId() != null || !"USER".equals(c.source()))
+                throw EafException.forbidden("P29 Task 必须使用固定只读能力和 USER prepare 步骤。");
+            p29Sources.requireTaskCreation(c);
+        }
         validateAssetBinding(c.assetBinding(), c.source(), true);
         var agent = agents.requirePublished(c.actor().tenantId(), c.workspaceId(), c.agentId(), c.agentVersion());
         ToolDefinition tool = null;
@@ -1270,6 +1468,7 @@ public class JdbcTaskService implements TaskService {
             if ("crm.followup.result.record".equals(c.toolName()))
                 customerFollowups.requireSyncTaskCreation(c.actor(), c.workspaceId(), c.workflowProvenance(),
                         c.toolName(), c.toolArgumentsJson());
+            if (isP27Tool(c.toolName())) requireP27WorkflowTaskCreation(c);
             if (SERVICE_REQUEST_TOOL.equals(c.toolName())) {
                 if (!SERVICE_REQUEST_REGISTER_AGENT_ID.equals(c.agentId()) || !"1.0.0".equals(c.agentVersion())
                         || c.assetBinding() == null || !SERVICE_REQUEST_REGISTER_CAPABILITY_ID.equals(c.assetBinding().capabilityId())
@@ -1334,7 +1533,7 @@ public class JdbcTaskService implements TaskService {
         var traceId = traceOrParent(c.traceId(), root == null ? null : root.traceId());
         if (insertTask(id, c.actor(), c.workspaceId(), agent, c.input(), entityType, entityId, key, hash, traceId,
                 c.source(), c.assetBinding(), actualRoot, parentId, root == null ? "REST" : root.entryProtocol(),
-                runKind, tool, c.toolArgumentsJson(), c.qualityRunId(), c.workflowProvenance(), now, now.plus(lifetime)) == 0)
+                runKind, tool, c.toolArgumentsJson(), c.qualityRunId(), c.workflowProvenance(), now, now.plus(lifetime), null) == 0)
             return existingTask(c.actor(), c.workspaceId(), key, hash);
         if (c.workflowProvenance() != null && c.workflowProvenance().p21ParallelBranch()) {
             var slice = jdbc.queryForObject("select max_active_ms / 2 from task.budget_scope where scope_id = ?",
@@ -1350,7 +1549,7 @@ public class JdbcTaskService implements TaskService {
         var action = tool == null ? "WORKFLOW_CAPABILITY_TASK_CREATED" : "WORKFLOW_TOOL_TASK_CREATED";
         audit.append(new AuditFact("task-created:" + id, c.actor().tenantId(), c.workspaceId(), c.actor().actorId(), id,
                 action, "ACCEPTED", "{}", traceId));
-        return get(c.actor(), c.workspaceId(), id);
+        return p29Workflow ? readTask(c.actor(), c.workspaceId(), id) : get(c.actor(), c.workspaceId(), id);
     }
 
     @Override
@@ -1366,11 +1565,15 @@ public class JdbcTaskService implements TaskService {
     @Override
     @Transactional
     public TaskSnapshot createChild(CreateChildTaskCommand c) {
+        if (c != null && c.actor() != null && IdentityService.MCP_AUDIENCE.equals(c.actor().delegationAudience()))
+            throw EafException.forbidden("MCP 只读委托不创建子 Task。");
         // 稳定创建键按父 Task 隔离；重复键必须同时匹配原请求摘要。
         validateChildCommand(c == null ? null : c.actor(), c == null ? null : c.creationKey(), c == null ? null : c.input());
         requireCurrentActor(c.actor(), c.workspaceId(), "task:create");
         var taskAdmissionOpen = operationalControl.taskAdmissionOpen(c.actor().tenantId(), c.workspaceId());
         var parent = requireParent(c.actor(), c.workspaceId(), c.parentTaskId());
+        if (isP30AutomationTask(parent.id()))
+            throw EafException.forbidden("P30 摘要 Task 不创建子 Task。");
         if (qualityRunSources.isScenarioRun(c.actor().tenantId(), c.workspaceId(), parent.qualityRunId()))
             throw EafException.forbidden("只允许每个登记样本创建一个服务请求分析 Task。");
         var storedKey = childIdempotencyKey(c.actor(), c.workspaceId(), parent.id(), c.creationKey());
@@ -1384,7 +1587,7 @@ public class JdbcTaskService implements TaskService {
         var id = UUID.randomUUID();
         if (insertTask(id, c.actor(), c.workspaceId(), agent, c.input(), parent.businessEntityType(), parent.businessEntityId(),
                 storedKey, hash, traceOrParent(c.traceId(), parent.traceId()), parent.source(), parent.assetBinding(),
-                parent.rootTaskId(), parent.id(), parent.entryProtocol(), "AGENT", null, null, parent.qualityRunId(), null, now, parent.deadline()) == 0)
+                parent.rootTaskId(), parent.id(), parent.entryProtocol(), "AGENT", null, null, parent.qualityRunId(), null, now, parent.deadline(), null) == 0)
             return existingTask(c.actor(), c.workspaceId(), storedKey, hash);
         audit.append(new AuditFact("task-created:" + id, c.actor().tenantId(), c.workspaceId(), c.actor().actorId(), id,
                 "CHILD_TASK_CREATED", "ACCEPTED", "{}", traceOrParent(c.traceId(), parent.traceId())));
@@ -1394,15 +1597,20 @@ public class JdbcTaskService implements TaskService {
     @Override
     @Transactional
     public TaskSnapshot createToolExecution(CreateToolExecutionCommand c) {
+        if (c != null && c.actor() != null && IdentityService.MCP_AUDIENCE.equals(c.actor().delegationAudience()))
+            throw EafException.forbidden("MCP 只读委托不创建 Tool Task。");
         // 服务端解析并冻结 Tool 版本与绑定，禁止调用方指定适配器或执行实现。
         validateChildCommand(c == null ? null : c.actor(), c == null ? null : c.creationKey(), c == null ? null : c.argumentsJson());
         if (c.toolName() == null || c.toolName().isBlank() || c.toolVersion() == null || c.toolVersion().isBlank())
             throw EafException.invalid("固定工具 Task 必须指定 Tool 名称和版本。");
-        if ("crm.followup.result.record".equals(c.toolName()) || SERVICE_REQUEST_TOOL.equals(c.toolName()))
+        if ("crm.followup.result.record".equals(c.toolName()) || SERVICE_REQUEST_TOOL.equals(c.toolName())
+                || isP27Tool(c.toolName()))
             throw EafException.forbidden("保留业务写入 Tool Task 只能由固定 Workflow 创建。");
         requireCurrentActor(c.actor(), c.workspaceId(), "task:create");
         var taskAdmissionOpen = operationalControl.taskAdmissionOpen(c.actor().tenantId(), c.workspaceId());
         var parent = requireParent(c.actor(), c.workspaceId(), c.parentTaskId());
+        if (isP30AutomationTask(parent.id()))
+            throw EafException.forbidden("P30 摘要 Task 不创建工具 Task。");
         if (qualityRunSources.isScenarioRun(c.actor().tenantId(), c.workspaceId(), parent.qualityRunId()))
             throw EafException.forbidden("评测运行不能创建子 Task 或 Tool Task。");
         var storedKey = childIdempotencyKey(c.actor(), c.workspaceId(), parent.id(), c.creationKey());
@@ -1422,7 +1630,7 @@ public class JdbcTaskService implements TaskService {
         var label = "固定工具执行 " + tool.name() + "@" + tool.version();
         if (insertTask(id, c.actor(), c.workspaceId(), agent, label, "TOOL_EXECUTION", tool.name() + "@" + tool.version(),
                 storedKey, hash, traceOrParent(c.traceId(), parent.traceId()), parent.source(), parent.assetBinding(),
-                parent.rootTaskId(), parent.id(), parent.entryProtocol(), "TOOL_EXECUTION", tool, c.argumentsJson(), parent.qualityRunId(), null, now, parent.deadline()) == 0)
+                parent.rootTaskId(), parent.id(), parent.entryProtocol(), "TOOL_EXECUTION", tool, c.argumentsJson(), parent.qualityRunId(), null, now, parent.deadline(), null) == 0)
             return existingTask(c.actor(), c.workspaceId(), storedKey, hash);
         audit.append(new AuditFact("task-created:" + id, c.actor().tenantId(), c.workspaceId(), c.actor().actorId(), id,
                 "TOOL_TASK_CREATED", "ACCEPTED", "{}", traceOrParent(c.traceId(), parent.traceId())));
@@ -1434,9 +1642,13 @@ public class JdbcTaskService implements TaskService {
                            String entityType, String entityId, String storedKey, String hash, String traceId,
                            String source, TaskAssetBinding binding, UUID rootTaskId, UUID parentTaskId,
                            String entryProtocol, String runKind, ToolDefinition tool, String toolArguments,
-                           UUID qualityRunId, WorkflowTaskProvenance workflowProvenance, Instant now, Instant deadline) {
+                           UUID qualityRunId, WorkflowTaskProvenance workflowProvenance, Instant now, Instant deadline,
+                           ModelProfileSelection modelSelection) {
         if (!admitQueuedTask(actor, workspaceId, storedKey, hash)) return 0;
-        var inserted = jdbc.update("insert into task.task(id, tenant_id, workspace_id, actor_id, principal_id, delegate_id, delegation_id, authorization_hash, agent_id, agent_version, prompt_id, prompt_version, model_profile_id, input_text, business_entity_type, business_entity_id, idempotency_key, request_hash, trace_id, status, attempt, row_version, source, quality_run_id, workflow_instance_id, workflow_id, workflow_version, workflow_step_id, created_at, updated_at, active_deadline_at, deadline_at, capability_id, capability_version, capability_hash, skill_id, skill_version, skill_hash, root_task_id, parent_task_id, entry_protocol, run_kind, tool_name, tool_version, tool_binding_ref, tool_arguments_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb) on conflict (tenant_id, workspace_id, actor_id, idempotency_key) do nothing",
+        String modelSelectionJson = null;
+        if (modelSelection != null) try { modelSelectionJson = JSON.writeValueAsString(modelSelection); }
+        catch (com.fasterxml.jackson.core.JsonProcessingException invalid) { throw EafException.invalid("模型选择快照无法编码。"); }
+        var inserted = jdbc.update("insert into task.task(id, tenant_id, workspace_id, actor_id, principal_id, delegate_id, delegation_id, authorization_hash, agent_id, agent_version, prompt_id, prompt_version, model_profile_id, input_text, business_entity_type, business_entity_id, idempotency_key, request_hash, trace_id, status, attempt, row_version, source, quality_run_id, workflow_instance_id, workflow_id, workflow_version, workflow_step_id, created_at, updated_at, active_deadline_at, deadline_at, capability_id, capability_version, capability_hash, skill_id, skill_version, skill_hash, root_task_id, parent_task_id, entry_protocol, run_kind, tool_name, tool_version, tool_binding_ref, tool_arguments_json, model_selection) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb) on conflict (tenant_id, workspace_id, actor_id, idempotency_key) do nothing",
                 id, actor.tenantId(), workspaceId, actor.actorId(), actor.delegated() ? actor.principalId() : null,
                 actor.delegated() ? actor.actorId() : null, actor.delegationId(), actor.authorizationHash(),
                 agent.id(), agent.version(), agent.promptId(), agent.promptVersion(), agent.modelProfileId(), input, entityType, entityId,
@@ -1449,7 +1661,7 @@ public class JdbcTaskService implements TaskService {
                 bindingValue(binding, 0), bindingValue(binding, 1), bindingValue(binding, 2),
                 bindingValue(binding, 3), bindingValue(binding, 4), bindingValue(binding, 5), rootTaskId, parentTaskId,
                 entryProtocol, runKind, tool == null ? null : tool.name(), tool == null ? null : tool.version(),
-                tool == null ? null : tool.bindingRef(), toolArguments);
+                tool == null ? null : tool.bindingRef(), toolArguments, modelSelectionJson);
         if (inserted == 1) jdbc.update("insert into task.task_attempt(task_id, attempt, status) values (?, 1, 'QUEUED')", id);
         return inserted;
     }
@@ -1560,14 +1772,62 @@ public class JdbcTaskService implements TaskService {
                               TaskAssetBinding assetBinding, UUID qualityRunId) { }
 
     @Override
+    public Optional<WorkflowExecutionSource> findWorkflowExecutionSource(ActorContext actor, UUID workspaceId,
+            UUID taskId, int attempt) {
+        if (actor == null || actor.type() != ActorType.HUMAN || actor.delegated() || workspaceId == null
+                || taskId == null || attempt < 1)
+            throw EafException.forbidden("Workflow 来源元数据只允许固定 P27 的直接 HUMAN 查询。");
+        return jdbc.query("select status, attempt, row_version, workflow_instance_id, workflow_id, workflow_version, "
+                        + "workflow_step_id from task.task where id = ? and tenant_id = ? and workspace_id = ? "
+                        + "and actor_id = ? and attempt = ? and workflow_instance_id is not null and workflow_id is not null "
+                        + "and workflow_version is not null and workflow_step_id is not null",
+                rs -> rs.next() ? Optional.of(new WorkflowExecutionSource(TaskStatus.valueOf(rs.getString("status")),
+                        rs.getInt("attempt"), rs.getLong("row_version"), new WorkflowTaskProvenance(
+                        rs.getObject("workflow_instance_id", UUID.class), rs.getObject("workflow_id", UUID.class),
+                        rs.getString("workflow_version"), rs.getString("workflow_step_id")))) : Optional.empty(),
+                taskId, actor.tenantId(), workspaceId, actor.actorId(), attempt);
+    }
+
+    @Override
     public TaskSnapshot get(ActorContext actor, UUID workspaceId, UUID taskId) {
         requireCurrentActor(actor, workspaceId, "task:read");
         requireConversationTaskOwner(actor, workspaceId, taskId);
         requireP21BatchTaskOwner(actor, workspaceId, taskId);
         var task = readTask(actor, workspaceId, taskId);
+        var p29Attempt = jdbc.query("select attempt from task.task where id = ? and workflow_id = '58000000-0000-4000-8000-00000000001d'::uuid",
+                rs -> rs.next() ? rs.getInt(1) : null, taskId);
+        if (p29Attempt != null && p29Sources != null)
+            p29Sources.requireTaskResultCurrent(actor, workspaceId, taskId, p29Attempt);
+        var p30Attempt = automationTaskAttempt(taskId, actor.tenantId(), workspaceId);
+        if (p30Attempt != null) {
+            if (p30Sources == null) throw EafException.conflict("AUTOMATION_SOURCE_UNAVAILABLE", "自动化来源校验器未就绪。");
+            p30Sources.requireTaskResultCurrent(actor, workspaceId, taskId, p30Attempt);
+        }
         return qualityRunSources.isScenarioTask(actor.tenantId(), workspaceId, taskId)
                 || qualityRunSources.isTeamImprovementTask(actor.tenantId(), workspaceId, taskId)
                 ? redactScenarioTask(task) : task;
+    }
+
+    @Override
+    public Instant deadlineAt(UUID tenantId, UUID workspaceId, UUID taskId) {
+        var deadline = jdbc.query("select deadline_at from task.task where id = ? and tenant_id = ? and workspace_id = ?",
+                rs -> rs.next() ? rs.getTimestamp(1).toInstant() : null, taskId, tenantId, workspaceId);
+        if (deadline == null) throw EafException.notFound();
+        return deadline;
+    }
+
+    @Override
+    public ModelProfileSelection modelSelection(ActorContext actor, UUID workspaceId, UUID taskId) {
+        var task = get(actor, workspaceId, taskId);
+        var row = jdbc.query("select model_selection::text, model_profile_id, capability_id from task.task "
+                        + "where id = ? and tenant_id = ? and workspace_id = ?",
+                rs -> rs.next() ? new Object[]{rs.getString(1), rs.getObject(2, UUID.class), rs.getObject(3, UUID.class)} : null,
+                taskId, actor.tenantId(), workspaceId);
+        if (row == null) throw EafException.notFound();
+        if (row[0] != null) return readModelSelection((String) row[0]);
+        if (SERVICE_REQUEST_PLAN_AGENT_ID.equals(task.agentId()) && SERVICE_REQUEST_PLAN_CAPABILITY_ID.equals(row[2]))
+            return new ModelProfileSelection("LEGACY_UNSNAPSHOTTED", (UUID) row[1], null);
+        return null;
     }
 
     @Override
@@ -1591,14 +1851,8 @@ public class JdbcTaskService implements TaskService {
         if (actor == null || actor.type() != io.eaf.shared.ActorType.HUMAN || actor.delegated())
             throw EafException.forbidden("样本正文只允许直接 HUMAN 发起人读取。");
         workspaces.require(actor, workspaceId, "evaluation:read");
-        if (!qualityRunSources.isScenarioTask(actor.tenantId(), workspaceId, taskId)) throw EafException.notFound();
-        var owner = jdbc.query("select r.owner_id from evaluation.scenario_run r join evaluation.scenario_sample s on s.run_id = r.id "
-                        + "where s.task_id = ? and r.tenant_id = ? and r.workspace_id = ? union all "
-                        + "select r.owner_id from evaluation.team_preparation_run r join evaluation.team_preparation_sample s on s.run_id = r.id "
-                        + "where s.task_id = ? and r.tenant_id = ? and r.workspace_id = ?",
-                rs -> rs.next() ? rs.getObject("owner_id", UUID.class) : null,
-                taskId, actor.tenantId(), workspaceId, taskId, actor.tenantId(), workspaceId);
-        if (owner == null || !owner.equals(actor.actorId())) throw EafException.notFound();
+        if (qualityRunSources.scenarioTaskOwner(actor.tenantId(), workspaceId, taskId)
+                .filter(actor.actorId()::equals).isEmpty()) throw EafException.notFound();
         return readTask(actor, workspaceId, taskId);
     }
 
@@ -1657,12 +1911,18 @@ public class JdbcTaskService implements TaskService {
     }
 
     private TaskSnapshot readTask(ActorContext actor, UUID workspaceId, UUID taskId) {
-        var visibility = actor.delegated() ? " and actor_id = ? and principal_id = ? and delegation_id = ? and authorization_hash = ?" : "";
+        var protocolScope = IdentityService.MCP_AUDIENCE.equals(actor.delegationAudience())
+                ? " and entry_protocol = 'MCP'" : " and entry_protocol in ('REST','A2A')";
+        var visibility = actor.delegated() ? " and actor_id = ? and principal_id = ? and delegation_id = ? and authorization_hash = ?" + protocolScope : "";
         var args = actor.delegated()
                 ? new Object[]{taskId, actor.tenantId(), workspaceId, actor.actorId(), actor.principalId(), actor.delegationId(), actor.authorizationHash()}
                 : new Object[]{taskId, actor.tenantId(), workspaceId};
-        return jdbc.query("select id, tenant_id, workspace_id, actor_id, agent_id, agent_version, prompt_version, status, attempt, row_version, trace_id, input_text, result_json::text, error_code, error_detail, source, created_at, updated_at, capability_id, capability_version, capability_hash, skill_id, skill_version, skill_hash, root_task_id, parent_task_id, entry_protocol, run_kind, external_effect_status, external_effect_operation_id from task.task where id = ? and tenant_id = ? and workspace_id = ?" + visibility,
+        var task = jdbc.query("select id, tenant_id, workspace_id, actor_id, agent_id, agent_version, prompt_version, status, attempt, row_version, trace_id, input_text, result_json::text, error_code, error_detail, source, created_at, updated_at, capability_id, capability_version, capability_hash, skill_id, skill_version, skill_hash, root_task_id, parent_task_id, entry_protocol, run_kind, external_effect_status, external_effect_operation_id from task.task where id = ? and tenant_id = ? and workspace_id = ?" + visibility,
                 (ResultSetExtractor<Optional<TaskSnapshot>>) rs -> rs.next() ? Optional.of(mapSnapshot(rs)) : Optional.empty(), args).orElseThrow(EafException::notFound);
+        if (IdentityService.MCP_AUDIENCE.equals(actor.delegationAudience())
+                && !validMcpReadonlyTask(actor, workspaceId, task.entryProtocol(), task.source(), null, null,
+                task.agentId(), task.agentVersion(), task.assetBinding())) throw EafException.notFound();
+        return task;
     }
 
     private TaskSnapshot redactScenarioTask(TaskSnapshot task) {
@@ -1680,12 +1940,15 @@ public class JdbcTaskService implements TaskService {
             throw EafException.invalid("Task 列表分页参数无效。");
         requireCurrentActor(actor, workspaceId, "task:read");
         var where = new StringBuilder(" where t.tenant_id = ? and t.workspace_id = ?");
+        where.append(" and t.workflow_id is distinct from '58000000-0000-4000-8000-00000000001d'::uuid");
         var filters = new java.util.ArrayList<Object>();
         filters.add(actor.tenantId());
         filters.add(workspaceId);
         // 委托列表严格沿用单 Task 查询的原 actor、principal、delegation 与授权摘要快照。
         if (actor.delegated()) {
-            where.append(" and t.actor_id = ? and t.principal_id = ? and t.delegation_id = ? and t.authorization_hash = ?");
+            where.append(" and t.actor_id = ? and t.principal_id = ? and t.delegation_id = ? and t.authorization_hash = ?")
+                    .append(IdentityService.MCP_AUDIENCE.equals(actor.delegationAudience())
+                            ? " and t.entry_protocol = 'MCP'" : " and t.entry_protocol in ('REST','A2A')");
             filters.add(actor.actorId());
             filters.add(actor.principalId());
             filters.add(actor.delegationId());
@@ -1716,6 +1979,9 @@ public class JdbcTaskService implements TaskService {
         where.append(" and (t.workflow_id is distinct from '58000000-0000-4000-8000-000000000018'::uuid "
                 + "or (t.actor_id = ? and ? = 'HUMAN' and ? = false))");
         filters.add(actor.actorId()); filters.add(actor.type().name()); filters.add(actor.delegated());
+        where.append(" and not exists (select 1 from task.automation_task_binding ab where ab.task_id = t.id "
+                + "and (ab.owner_id <> ? or ? <> 'HUMAN' or ? = true))");
+        filters.add(actor.actorId()); filters.add(actor.type().name()); filters.add(actor.delegated());
         var totalSize = jdbc.queryForObject("select count(*) from task.task t" + where, Long.class, filters.toArray());
         var pageWhere = new StringBuilder(where);
         var pageArgs = new java.util.ArrayList<>(filters);
@@ -1731,11 +1997,52 @@ public class JdbcTaskService implements TaskService {
         selected = selected.stream().map(task -> qualityRunSources.isScenarioTask(actor.tenantId(), workspaceId, task.id())
                 || qualityRunSources.isTeamImprovementTask(actor.tenantId(), workspaceId, task.id())
                 ? redactScenarioTask(task) : task).toList();
+        selected = selected.stream().filter(task -> {
+            var attempt = automationTaskAttempt(task.id(), actor.tenantId(), workspaceId);
+            if (attempt == null) return true;
+            try {
+                if (p30Sources == null) return false;
+                p30Sources.requireTaskResultCurrent(actor, workspaceId, task.id(), attempt);
+                return true;
+            } catch (EafException unavailable) { return false; }
+        }).toList();
         var hasNext = selected.size() > pageSize;
         var items = hasNext ? List.copyOf(selected.subList(0, pageSize)) : List.copyOf(selected);
         var nextCursor = hasNext ? new TaskPageCursor(items.get(items.size() - 1).updatedAt(),
                 items.get(items.size() - 1).id()) : null;
         return new TaskPage(items, totalSize == null ? 0 : totalSize, nextCursor);
+    }
+
+    @Override
+    public UserTaskResultPage listMyRootResults(ActorContext actor, UUID workspaceId, Instant cursorUpdatedAt,
+            UUID cursorId, int pageSize) {
+        if (actor == null || actor.type() != io.eaf.shared.ActorType.HUMAN || actor.delegated())
+            throw EafException.forbidden("员工任务成果列表只接受本人直接操作的 HUMAN 身份。");
+        requireCurrentActor(actor, workspaceId, "task:read");
+        if (pageSize < 1 || pageSize > 50 || (cursorUpdatedAt == null) != (cursorId == null))
+            throw EafException.invalid("本人任务成果分页参数无效。");
+        var args = new java.util.ArrayList<Object>(List.of(actor.tenantId(), workspaceId, actor.actorId()));
+        var where = new StringBuilder(" where t.tenant_id = ? and t.workspace_id = ? and t.actor_id = ? "
+                + "and t.parent_task_id is null and t.root_task_id = t.id and t.source = 'USER' "
+                + "and t.workflow_id is null and t.quality_run_id is null and t.run_kind = 'AGENT' "
+                + "and t.business_entity_type is null and t.status in ('SUCCEEDED','FAILED','TIMED_OUT','CANCELLED') "
+                + "and not exists (select 1 from task.conversation_turn ct where ct.task_id = t.id) "
+                + "and not exists (select 1 from task.experience_draft_binding ed where ed.task_id = t.id)");
+        if (cursorUpdatedAt != null) {
+            where.append(" and (t.updated_at, t.id) < (?, ?)");
+            args.add(Timestamp.from(cursorUpdatedAt));
+            args.add(cursorId);
+        }
+        args.add(pageSize + 1);
+        var selected = jdbc.query("select t.id, t.agent_id, t.agent_version, t.status, t.updated_at from task.task t"
+                        + where + " order by t.updated_at desc, t.id desc limit ?",
+                (rs, row) -> new UserTaskResultPage.Item(rs.getObject("id", UUID.class),
+                        rs.getObject("agent_id", UUID.class), rs.getString("agent_version"), rs.getString("status"),
+                        rs.getTimestamp("updated_at").toInstant()), args.toArray());
+        var hasNext = selected.size() > pageSize;
+        var items = hasNext ? List.copyOf(selected.subList(0, pageSize)) : List.copyOf(selected);
+        var last = hasNext ? items.get(items.size() - 1) : null;
+        return new UserTaskResultPage(items, last == null ? null : last.updatedAt(), last == null ? null : last.id());
     }
 
     @Override
@@ -1903,6 +2210,9 @@ public class JdbcTaskService implements TaskService {
         if (idempotencyKey == null || idempotencyKey.isBlank()) throw EafException.invalid("重试 Idempotency-Key 必填。");
         requireCurrentActor(actor, workspaceId, "task:create");
         requireConversationTaskOwner(actor, workspaceId, taskId);
+        requireAutomationTaskCurrent(actor, workspaceId, taskId, false);
+        if (isP30AutomationTask(taskId))
+            throw EafException.conflict("AUTOMATION_TASK_RETRY_UNSUPPORTED", "自动摘要只允许原运行中的一次生成；请创建新的订阅运行。 ");
         if (qualityRunSources.isScenarioTask(actor.tenantId(), workspaceId, taskId))
             throw EafException.conflict("SCENARIO_TASK_RETRY_UNSUPPORTED", "样本 Task 不支持单独重试；请显式创建新评测运行。");
         if (qualityRunSources.isTeamImprovementTask(actor.tenantId(), workspaceId, taskId))
@@ -1942,6 +2252,9 @@ public class JdbcTaskService implements TaskService {
         if (idempotencyKey == null || idempotencyKey.isBlank()) throw EafException.invalid("恢复 Idempotency-Key 必填。");
         requireCurrentActor(actor, workspaceId, "task:resume");
         requireConversationTaskOwner(actor, workspaceId, taskId);
+        requireAutomationTaskCurrent(actor, workspaceId, taskId, false);
+        if (isP30AutomationTask(taskId))
+            throw EafException.conflict("AUTOMATION_TASK_RETRY_UNSUPPORTED", "自动摘要不支持人工恢复；请从订阅查看原运行。 ");
         if (qualityRunSources.isScenarioTask(actor.tenantId(), workspaceId, taskId))
             throw EafException.conflict("SCENARIO_TASK_RETRY_UNSUPPORTED", "样本 Task 不支持单独恢复。");
         if (qualityRunSources.isTeamImprovementTask(actor.tenantId(), workspaceId, taskId))
@@ -2070,7 +2383,7 @@ public class JdbcTaskService implements TaskService {
     }
 
     private Optional<TaskWorkItem> claimLockedCandidate(UUID candidateId) {
-        var work = jdbc.query("select id, tenant_id, workspace_id, actor_id, principal_id, delegate_id, delegation_id, authorization_hash, agent_id, agent_version, prompt_id, prompt_version, model_profile_id, input_text, business_entity_type, business_entity_id, trace_id, attempt, row_version, active_deadline_at, deadline_at, source, capability_id, capability_version, capability_hash, skill_id, skill_version, skill_hash, root_task_id, parent_task_id, entry_protocol, run_kind, tool_name, tool_version, tool_binding_ref, tool_arguments_json::text, quality_run_id from task.task where id = ? and status = 'QUEUED' and active_deadline_at > now() and deadline_at > now() for update skip locked",
+        var work = jdbc.query("select id, tenant_id, workspace_id, actor_id, principal_id, delegate_id, delegation_id, authorization_hash, agent_id, agent_version, prompt_id, prompt_version, model_profile_id, input_text, business_entity_type, business_entity_id, trace_id, attempt, row_version, active_deadline_at, deadline_at, source, capability_id, capability_version, capability_hash, skill_id, skill_version, skill_hash, root_task_id, parent_task_id, entry_protocol, run_kind, tool_name, tool_version, tool_binding_ref, tool_arguments_json::text, model_selection::text, quality_run_id from task.task where id = ? and status = 'QUEUED' and active_deadline_at > now() and deadline_at > now() for update skip locked",
                 (ResultSetExtractor<Optional<TaskWorkItem>>) rs -> rs.next() ? Optional.of(mapWork(rs)) : Optional.empty(), candidateId);
         if (work.isEmpty()) {
             metrics.claimAttempt("task_busy");
@@ -2108,7 +2421,7 @@ public class JdbcTaskService implements TaskService {
         var leaseFence = jdbc.queryForObject("update task.task set status = 'RUNNING', active_deadline_at = ?, active_budget_reservation_key = ?, active_reserved_ms = ?, lease_owner_id = ?, lease_fence = lease_fence + 1, lease_until = ?, row_version = row_version + 1, updated_at = ? where id = ? and row_version = ? returning lease_fence",
                 Long.class, Timestamp.from(activeDeadline), activeKey, activeReserved, leaseOwnerId, Timestamp.from(leaseUntil), Timestamp.from(now), w.id(), w.rowVersion());
         jdbc.update("update task.task_attempt set status = 'RUNNING', started_at = ? where task_id = ? and attempt = ?", Timestamp.from(now), w.id(), w.attempt());
-        return Optional.of(new TaskWorkItem(w.id(), w.tenantId(), w.workspaceId(), w.actorId(), w.agentId(), w.agentVersion(), w.promptId(), w.promptVersion(), w.modelProfileId(), w.inputText(), w.businessEntityType(), w.businessEntityId(), w.traceId(), w.attempt(), w.rowVersion() + 1, activeDeadline, w.deadline(), w.source(), w.assetBinding(), w.principalId(), w.delegationId(), w.authorizationHash(), w.rootTaskId(), w.parentTaskId(), w.entryProtocol(), w.runKind(), w.toolName(), w.toolVersion(), w.toolBindingRef(), w.toolArgumentsJson(), leaseOwnerId, leaseFence, w.qualityRunId()));
+        return Optional.of(new TaskWorkItem(w.id(), w.tenantId(), w.workspaceId(), w.actorId(), w.agentId(), w.agentVersion(), w.promptId(), w.promptVersion(), w.modelProfileId(), w.inputText(), w.businessEntityType(), w.businessEntityId(), w.traceId(), w.attempt(), w.rowVersion() + 1, activeDeadline, w.deadline(), w.source(), w.assetBinding(), w.principalId(), w.delegationId(), w.authorizationHash(), w.rootTaskId(), w.parentTaskId(), w.entryProtocol(), w.runKind(), w.toolName(), w.toolVersion(), w.toolBindingRef(), w.toolArgumentsJson(), leaseOwnerId, leaseFence, w.qualityRunId(), w.modelSelection()));
     }
 
     private void registerMissingDispatchScopes() {
@@ -2183,7 +2496,11 @@ public class JdbcTaskService implements TaskService {
                     && workspaces.isAuthorized(workItem.tenantId(), workItem.actorId(), workItem.workspaceId(), "task:create");
         return currentDelegation(workItem).filter(actor -> actor.can("task:create"))
                 .filter(actor -> workspaces.isAuthorized(actor.tenantId(), actor.principalId(), workItem.workspaceId(), "task:create"))
-                .filter(actor -> workspaces.isAuthorized(actor.tenantId(), actor.actorId(), workItem.workspaceId(), "task:create")).isPresent();
+                .filter(actor -> workspaces.isAuthorized(actor.tenantId(), actor.actorId(), workItem.workspaceId(), "task:create"))
+                .filter(actor -> !IdentityService.MCP_AUDIENCE.equals(actor.delegationAudience())
+                        || validMcpReadonlyTask(actor, workItem.workspaceId(), workItem.entryProtocol(), workItem.source(),
+                        workItem.businessEntityType(), workItem.businessEntityId(), workItem.agentId(), workItem.agentVersion(),
+                        workItem.assetBinding())).isPresent();
     }
 
     @Override
@@ -2195,15 +2512,17 @@ public class JdbcTaskService implements TaskService {
         // 同根先锁预算、后锁 Task，与领取/取消/结算保持统一顺序。
         // ponytail: 根预算锁在 Execution 外部调用期间也保持，首版以单根串行换取取消与提交的明确先后；有并行写入需求再拆专用 permit 行。
         lockBudgetScope(rootTaskId);
-        var row = jdbc.query("select status, attempt, active_deadline_at, deadline_at, source, actor_id, principal_id, delegate_id, delegation_id, authorization_hash, lease_until from task.task where id = ? and tenant_id = ? and workspace_id = ? for update",
-                rs -> rs.next() ? new Object[]{rs.getString("status"), rs.getInt("attempt"), rs.getTimestamp("active_deadline_at").toInstant(), rs.getTimestamp("deadline_at").toInstant(), rs.getString("source"), rs.getObject("actor_id", UUID.class), rs.getObject("principal_id", UUID.class), rs.getObject("delegate_id", UUID.class), rs.getObject("delegation_id", UUID.class), rs.getString("authorization_hash"), rs.getTimestamp("lease_until")} : null,
+        var row = jdbc.query("select status, attempt, active_deadline_at, deadline_at, source, actor_id, principal_id, delegate_id, delegation_id, authorization_hash, lease_until, entry_protocol, agent_id, agent_version, business_entity_type, business_entity_id, capability_id, capability_version, capability_hash, skill_id, skill_version, skill_hash from task.task where id = ? and tenant_id = ? and workspace_id = ? for update",
+                rs -> rs.next() ? new Object[]{rs.getString("status"), rs.getInt("attempt"), rs.getTimestamp("active_deadline_at").toInstant(), rs.getTimestamp("deadline_at").toInstant(), rs.getString("source"), rs.getObject("actor_id", UUID.class), rs.getObject("principal_id", UUID.class), rs.getObject("delegate_id", UUID.class), rs.getObject("delegation_id", UUID.class), rs.getString("authorization_hash"), rs.getTimestamp("lease_until"), rs.getString("entry_protocol"), rs.getObject("agent_id", UUID.class), rs.getString("agent_version"), rs.getString("business_entity_type"), rs.getString("business_entity_id"), rs.getObject("capability_id", UUID.class), rs.getString("capability_version"), rs.getString("capability_hash"), rs.getObject("skill_id", UUID.class), rs.getString("skill_version"), rs.getString("skill_hash")} : null,
                 taskId, actor.tenantId(), workspaceId);
         if (row == null) return new TaskExecutionCheck(false, "TASK_NOT_FOUND", "Task 不存在或不可见。", null);
         var source = (String) row[4];
+        var taskAudience = audienceForEntryProtocol((String) row[11]);
         var identityMatches = actor.delegated()
                 ? actor.type() == io.eaf.shared.ActorType.AGENT && actor.actorId().equals(row[5])
                     && actor.principalId().equals(row[6]) && actor.actorId().equals(row[7])
                     && actor.delegationId().equals(row[8]) && actor.authorizationHash().equals(row[9])
+                    && taskAudience != null && taskAudience.equals(actor.delegationAudience())
                 : !actor.delegated() && actor.actorId().equals(row[5]) && row[6] == null && row[7] == null && row[8] == null && row[9] == null;
         if (!identityMatches) return new TaskExecutionCheck(false, "AUTHORIZATION_REVOKED", "Task 身份快照与当前执行身份不一致。", source);
         if (!"RUNNING".equals(row[0]) || ((Integer) row[1]) != attempt) return new TaskExecutionCheck(false, "TASK_NOT_RUNNING", "Task 当前不允许继续执行。", source);
@@ -2211,9 +2530,15 @@ public class JdbcTaskService implements TaskService {
         if (((Instant) row[2]).isBefore(now) || ((Instant) row[3]).isBefore(now)) return new TaskExecutionCheck(false, "DEADLINE_EXCEEDED", "Task 截止时间已到。", source);
         if (row[10] == null || !((Timestamp) row[10]).toInstant().isAfter(now)) return new TaskExecutionCheck(false, "WORKER_LEASE_EXPIRED", "Task Worker 租约已失效。", source);
         if (actor.delegated()) {
-            var current = identities.resolveDelegation(actor.tenantId(), actor.principalId(), actor.actorId(), actor.delegationId(), workspaceId, IdentityService.REST_AUDIENCE)
+            var current = taskAudience != null && taskAudience.equals(actor.delegationAudience())
+                    && identities.resolveDelegation(actor.tenantId(), actor.principalId(), actor.actorId(), actor.delegationId(), workspaceId, taskAudience)
                     .filter(a -> a.authorizationHash().equals(actor.authorizationHash())).filter(a -> a.can("task:create")).isPresent();
-            if (!current || !workspaces.isAuthorized(actor.tenantId(), actor.principalId(), workspaceId, "task:create")
+            var scopedMcpTask = !IdentityService.MCP_AUDIENCE.equals(taskAudience)
+                    || validMcpReadonlyTask(actor, workspaceId, (String) row[11], source,
+                    (String) row[14], (String) row[15], (UUID) row[12], (String) row[13],
+                    new TaskAssetBinding((UUID) row[16], (String) row[17], (String) row[18],
+                            (UUID) row[19], (String) row[20], (String) row[21]));
+            if (!current || !scopedMcpTask || !workspaces.isAuthorized(actor.tenantId(), actor.principalId(), workspaceId, "task:create")
                     || !workspaces.isAuthorized(actor.tenantId(), actor.actorId(), workspaceId, "task:create"))
                 return new TaskExecutionCheck(false, "AUTHORIZATION_REVOKED", "委托、Workspace 或 Agent 授权已撤销或变化。", source);
         } else if ("EVALUATION".equals(source)) {
@@ -2224,6 +2549,11 @@ public class JdbcTaskService implements TaskService {
         } else if (!"USER".equals(source)
                 || !workspaces.isAuthorized(actor.tenantId(), actor.actorId(), workspaceId, "task:create"))
             return new TaskExecutionCheck(false, "AUTHORIZATION_REVOKED", "Workspace 执行授权已撤销。", source);
+        try {
+            requireAutomationTaskCurrent(actor, workspaceId, taskId, true);
+        } catch (EafException denied) {
+            return new TaskExecutionCheck(false, denied.code(), denied.getMessage(), source);
+        }
         return new TaskExecutionCheck(true, null, "OK", source);
     }
 
@@ -2410,6 +2740,25 @@ public class JdbcTaskService implements TaskService {
                 Integer.class, taskId, tenantId, workspaceId) > 0;
     }
 
+    private Integer automationTaskAttempt(UUID taskId, UUID tenantId, UUID workspaceId) {
+        return jdbc.query("select t.attempt from task.automation_task_binding b join task.task t on t.id = b.task_id "
+                        + "where b.task_id = ? and b.tenant_id = ? and b.workspace_id = ?",
+                rs -> rs.next() ? rs.getInt(1) : null, taskId, tenantId, workspaceId);
+    }
+
+    private boolean isP30AutomationTask(UUID taskId) {
+        return Boolean.TRUE.equals(jdbc.query("select exists(select 1 from task.automation_task_binding where task_id = ?)",
+                rs -> rs.next() && rs.getBoolean(1), taskId));
+    }
+
+    private void requireAutomationTaskCurrent(ActorContext actor, UUID workspaceId, UUID taskId, boolean execution) {
+        var attempt = automationTaskAttempt(taskId, actor.tenantId(), workspaceId);
+        if (attempt == null) return;
+        if (p30Sources == null) throw EafException.conflict("AUTOMATION_SOURCE_UNAVAILABLE", "自动化来源校验器未就绪。");
+        if (execution) p30Sources.requireTaskExecutionCurrent(actor, workspaceId, taskId, attempt);
+        else p30Sources.requireTaskResultCurrent(actor, workspaceId, taskId, attempt);
+    }
+
     private void requireP21BatchTaskOwner(ActorContext actor, UUID workspaceId, UUID taskId) {
         var owner = jdbc.query("select actor_id, workflow_id from task.task where id = ? and tenant_id = ? and workspace_id = ?",
                 rs -> rs.next() ? new Object[]{rs.getObject("actor_id", UUID.class), rs.getObject("workflow_id", UUID.class)} : null,
@@ -2592,9 +2941,83 @@ public class JdbcTaskService implements TaskService {
     }
 
     private boolean validDelegation(ActorContext actor, UUID workspaceId) {
-        return actor.type() == io.eaf.shared.ActorType.AGENT && workspaceId.equals(actor.delegationWorkspaceId())
+        var entryProtocol = IdentityService.MCP_AUDIENCE.equals(actor.delegationAudience()) ? "MCP" : "REST";
+        return validDelegation(actor, workspaceId, entryProtocol);
+    }
+
+    private boolean validDelegation(ActorContext actor, UUID workspaceId, String entryProtocol) {
+        var audience = audienceForEntryProtocol(entryProtocol);
+        return audience != null && audience.equals(actor.delegationAudience())
+                && actor.type() == io.eaf.shared.ActorType.AGENT && workspaceId.equals(actor.delegationWorkspaceId())
                 && identities.resolveDelegation(actor.tenantId(), actor.principalId(), actor.actorId(), actor.delegationId(),
-                workspaceId, IdentityService.REST_AUDIENCE).filter(current -> current.authorizationHash().equals(actor.authorizationHash())).isPresent();
+                workspaceId, audience).filter(current -> current.authorizationHash().equals(actor.authorizationHash())).isPresent();
+    }
+
+    private String audienceForEntryProtocol(String entryProtocol) {
+        return switch (entryProtocol == null ? "" : entryProtocol) {
+            case "MCP" -> IdentityService.MCP_AUDIENCE;
+            case "REST", "A2A" -> IdentityService.REST_AUDIENCE;
+            default -> null;
+        };
+    }
+
+    private boolean validMcpReadonlyTask(ActorContext actor, UUID workspaceId, String entryProtocol, String source,
+                                         String businessEntityType, String businessEntityId, UUID agentId,
+                                         String agentVersion,
+                                         TaskAssetBinding binding) {
+        var scope = identities.mcpReadonlyScope(actor).orElse(null);
+        return "MCP".equals(entryProtocol) && "USER".equals(source) && businessEntityType == null
+                && businessEntityId == null && scope != null && scope.workspaceId().equals(workspaceId)
+                && SERVICE_REQUEST_PLAN_AGENT_ID.equals(agentId) && "1.0.0".equals(agentVersion)
+                && binding != null && scope.capabilityId().equals(binding.capabilityId())
+                && scope.capabilityVersion().equals(binding.capabilityVersion())
+                && scope.capabilityHash().equals(binding.capabilityHash());
+    }
+
+    private boolean isP27Tool(String name) {
+        return java.util.Set.of("oa.todo.list", "oa.todo.get", "service.request.status.get",
+                "service.request.result.record").contains(name);
+    }
+
+    private void requireP27WorkflowTaskCreation(CreateWorkflowTaskCommand command) {
+        var provenance = command.workflowProvenance();
+        var expectedWorkflow = switch (command.toolName()) {
+            case "oa.todo.list" -> "58000000-0000-4000-8000-000000000019";
+            case "oa.todo.get" -> "58000000-0000-4000-8000-00000000001a";
+            case "service.request.status.get" -> "58000000-0000-4000-8000-00000000001b";
+            case "service.request.result.record" -> "58000000-0000-4000-8000-00000000001c";
+            default -> null;
+        };
+        var args = parseJsonNode(command.toolArgumentsJson());
+        var validArgs = switch (command.toolName()) {
+            case "oa.todo.list" -> args != null && args.isObject() && args.path("limit").canConvertToInt()
+                    && args.path("limit").asInt() >= 1 && args.path("limit").asInt() <= 50;
+            case "oa.todo.get" -> args != null && args.isObject() && args.path("todoId").isTextual()
+                    && args.path("todoId").asText().matches("[A-Za-z0-9._:-]{1,160}");
+            case "service.request.status.get" -> args != null && args.isObject() && validUuidText(args.path("workItemId").asText(null));
+            case "service.request.result.record" -> args != null && args.isObject() && validUuidText(args.path("syncId").asText(null));
+            default -> false;
+        };
+        if (provenance == null || !provenance.complete() || expectedWorkflow == null
+                || !expectedWorkflow.equals(provenance.workflowId().toString()) || !"1.0.0".equals(provenance.workflowVersion())
+                || !("read".equals(provenance.stepId()) || "record".equals(provenance.stepId()))
+                || "service.request.result.record".equals(command.toolName()) != "record".equals(provenance.stepId())
+                || !"1.0.0".equals(command.toolVersion()) || command.actor().type() != io.eaf.shared.ActorType.HUMAN
+                || command.actor().delegated() || !"USER".equals(command.source()) || command.qualityRunId() != null
+                || !P27_AGENT_ID.equals(command.agentId())
+                || !P27_CAPABILITY_ID.equals(command.assetBinding().capabilityId())
+                || !"1.0.0".equals(command.assetBinding().capabilityVersion()) || !validArgs)
+            throw EafException.forbidden("P27 Tool Task 只能由对应固定 Workflow 步骤创建。");
+    }
+
+    private com.fasterxml.jackson.databind.JsonNode parseJsonNode(String value) {
+        try { return value == null ? null : JSON.readTree(value); }
+        catch (Exception invalid) { return null; }
+    }
+
+    private boolean validUuidText(String value) {
+        try { return value != null && java.util.UUID.fromString(value).toString().equals(value); }
+        catch (IllegalArgumentException invalid) { return false; }
     }
 
     // Task 边界再次验证委托快照，避免绕过 HTTP Filter 的内部调用继续使用旧 ActorContext。
@@ -2611,8 +3034,10 @@ public class JdbcTaskService implements TaskService {
     private Optional<ActorContext> currentDelegation(TaskWorkItem workItem) {
         if (workItem.principalId() == null || workItem.delegationId() == null || workItem.authorizationHash() == null)
             return Optional.empty();
+        var audience = audienceForEntryProtocol(workItem.entryProtocol());
+        if (audience == null) return Optional.empty();
         return identities.resolveDelegation(workItem.tenantId(), workItem.principalId(), workItem.actorId(),
-                workItem.delegationId(), workItem.workspaceId(), IdentityService.REST_AUDIENCE)
+                workItem.delegationId(), workItem.workspaceId(), audience)
                 .filter(actor -> actor.authorizationHash().equals(workItem.authorizationHash()));
     }
 
@@ -2629,7 +3054,15 @@ public class JdbcTaskService implements TaskService {
     }
 
     private TaskWorkItem mapWork(java.sql.ResultSet rs) throws java.sql.SQLException {
-        return new TaskWorkItem(rs.getObject("id", UUID.class), rs.getObject("tenant_id", UUID.class), rs.getObject("workspace_id", UUID.class), rs.getObject("actor_id", UUID.class), rs.getObject("agent_id", UUID.class), rs.getString("agent_version"), rs.getObject("prompt_id", UUID.class), rs.getString("prompt_version"), rs.getObject("model_profile_id", UUID.class), rs.getString("input_text"), rs.getString("business_entity_type"), rs.getString("business_entity_id"), rs.getString("trace_id"), rs.getInt("attempt"), rs.getLong("row_version"), rs.getTimestamp("active_deadline_at").toInstant(), rs.getTimestamp("deadline_at").toInstant(), rs.getString("source"), mapAssetBinding(rs), rs.getObject("principal_id", UUID.class), rs.getObject("delegation_id", UUID.class), rs.getString("authorization_hash"), rs.getObject("root_task_id", UUID.class), rs.getObject("parent_task_id", UUID.class), rs.getString("entry_protocol"), rs.getString("run_kind"), rs.getString("tool_name"), rs.getString("tool_version"), rs.getString("tool_binding_ref"), rs.getString("tool_arguments_json"), null, 0, rs.getObject("quality_run_id", UUID.class));
+        return new TaskWorkItem(rs.getObject("id", UUID.class), rs.getObject("tenant_id", UUID.class), rs.getObject("workspace_id", UUID.class), rs.getObject("actor_id", UUID.class), rs.getObject("agent_id", UUID.class), rs.getString("agent_version"), rs.getObject("prompt_id", UUID.class), rs.getString("prompt_version"), rs.getObject("model_profile_id", UUID.class), rs.getString("input_text"), rs.getString("business_entity_type"), rs.getString("business_entity_id"), rs.getString("trace_id"), rs.getInt("attempt"), rs.getLong("row_version"), rs.getTimestamp("active_deadline_at").toInstant(), rs.getTimestamp("deadline_at").toInstant(), rs.getString("source"), mapAssetBinding(rs), rs.getObject("principal_id", UUID.class), rs.getObject("delegation_id", UUID.class), rs.getString("authorization_hash"), rs.getObject("root_task_id", UUID.class), rs.getObject("parent_task_id", UUID.class), rs.getString("entry_protocol"), rs.getString("run_kind"), rs.getString("tool_name"), rs.getString("tool_version"), rs.getString("tool_binding_ref"), rs.getString("tool_arguments_json"), null, 0, rs.getObject("quality_run_id", UUID.class), readModelSelection(rs.getString("model_selection")));
+    }
+
+    private ModelProfileSelection readModelSelection(String value) {
+        if (value == null || value.isBlank()) return null;
+        try { return JSON.readValue(value, ModelProfileSelection.class); }
+        catch (com.fasterxml.jackson.core.JsonProcessingException invalid) {
+            throw EafException.conflict("MODEL_PROFILE_SNAPSHOT_INVALID", "任务模型选择快照无效。");
+        }
     }
 
     private TaskAssetBinding mapAssetBinding(java.sql.ResultSet rs) throws java.sql.SQLException {

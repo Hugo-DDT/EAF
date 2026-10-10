@@ -9,6 +9,8 @@ import io.eaf.approval.api.ApprovalSnapshot;
 import io.eaf.approval.api.ApprovalOutboxItem;
 import io.eaf.approval.api.ApprovalOutboxPage;
 import io.eaf.approval.api.ApprovalPendingPage;
+import io.eaf.approval.api.ApprovalActionablePage;
+import io.eaf.identity.api.IdentityDirectory;
 import io.eaf.shared.ActorType;
 import io.eaf.shared.EafException;
 import io.eaf.shared.Hashing;
@@ -31,12 +33,15 @@ public class JdbcApprovalService implements ApprovalService {
     private final JdbcTemplate jdbc;
     private final ObjectMapper json;
     private final WorkspaceAuthorization workspaces;
+    private final IdentityDirectory identities;
     private final Clock clock;
 
-    public JdbcApprovalService(JdbcTemplate jdbc, ObjectMapper json, WorkspaceAuthorization workspaces, Clock clock) {
+    public JdbcApprovalService(JdbcTemplate jdbc, ObjectMapper json, WorkspaceAuthorization workspaces,
+                               IdentityDirectory identities, Clock clock) {
         this.jdbc = jdbc;
         this.json = json;
         this.workspaces = workspaces;
+        this.identities = identities;
         this.clock = clock;
     }
 
@@ -107,6 +112,38 @@ public class JdbcApprovalService implements ApprovalService {
         var last = hasNext ? items.get(items.size() - 1) : null;
         return new ApprovalPendingPage(items, last == null ? null : last.createdAt(),
                 last == null ? null : last.id());
+    }
+
+    @Override
+    public ApprovalActionablePage listActionablePending(io.eaf.shared.ActorContext actor, UUID workspaceId,
+            Instant cursorCreatedAt, UUID cursorId, int pageSize) {
+        if (actor == null || actor.type() != ActorType.HUMAN || actor.delegated())
+            throw EafException.forbidden("员工收件箱只接受本人直接操作的 HUMAN 身份。");
+        var access = workspaces.require(actor, workspaceId, "approval:read");
+        workspaces.require(actor, workspaceId, "approval:decide");
+        if (!identities.isActiveHuman(actor.tenantId(), actor.actorId())) throw EafException.notFound();
+        if (pageSize < 1 || pageSize > 50 || (cursorCreatedAt == null) != (cursorId == null))
+            throw EafException.invalid("可处理审批分页参数无效。");
+        var args = new ArrayList<Object>(List.of(access.tenantId(), workspaceId));
+        var where = new StringBuilder(" where tenant_id = ? and workspace_id = ? and state = 'PENDING' "
+                + "and expires_at > ? and binding_json->>'requesterId' <> ?");
+        args.add(Timestamp.from(Instant.now(clock)));
+        args.add(actor.actorId().toString());
+        if (cursorCreatedAt != null) {
+            where.append(" and (created_at, id) < (?, ?)");
+            args.add(Timestamp.from(cursorCreatedAt));
+            args.add(cursorId);
+        }
+        args.add(pageSize + 1);
+        var selected = jdbc.query("select id, task_id, expires_at, row_version, created_at from approval.request"
+                        + where + " order by created_at desc, id desc limit ?",
+                (rs, row) -> new ApprovalActionablePage.Item(rs.getObject("id", UUID.class),
+                        rs.getObject("task_id", UUID.class), rs.getTimestamp("expires_at").toInstant(),
+                        rs.getLong("row_version"), rs.getTimestamp("created_at").toInstant()), args.toArray());
+        var hasNext = selected.size() > pageSize;
+        var items = hasNext ? List.copyOf(selected.subList(0, pageSize)) : List.copyOf(selected);
+        var last = hasNext ? items.get(items.size() - 1) : null;
+        return new ApprovalActionablePage(items, last == null ? null : last.createdAt(), last == null ? null : last.id());
     }
 
     @Override

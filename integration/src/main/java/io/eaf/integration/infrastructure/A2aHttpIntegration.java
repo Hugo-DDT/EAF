@@ -10,10 +10,8 @@ import io.eaf.connector.api.RemoteA2aResult;
 import io.eaf.credential.api.CredentialRequest;
 import io.eaf.credential.api.CredentialResolutionPort;
 import io.eaf.shared.EafException;
-import java.io.InputStream;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -104,10 +102,9 @@ public class A2aHttpIntegration implements A2aIntegrationPort {
                     .header("A2A-Version", "1.0")
                     .header("Authorization", "Bearer " + token)
                     .POST(HttpRequest.BodyPublishers.ofByteArray(requestBody)).build();
-            var response = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
-            try (InputStream stream = response.body()) {
-                var bytes = stream.readNBytes(MAX_RESPONSE_BYTES + 1);
-                if (bytes.length > MAX_RESPONSE_BYTES) return unknown("A2A_RESPONSE_TOO_LARGE");
+            var response = BoundedHttpResponse.send(client, request, MAX_RESPONSE_BYTES, deadline, Duration.ofSeconds(5));
+            var bytes = response.body();
+            if (response.oversized()) return unknown("A2A_RESPONSE_TOO_LARGE");
                 if (response.statusCode() >= 500 || response.statusCode() == 408 || response.statusCode() == 429)
                     return unknown("A2A_UPSTREAM_UNAVAILABLE");
                 if (response.statusCode() < 200 || response.statusCode() >= 300)
@@ -127,9 +124,8 @@ public class A2aHttpIntegration implements A2aIntegrationPort {
                 var id = task.path("id").asText(null);
                 var contextId = task.path("contextId").asText(null);
                 var state = task.path("status").path("state").asText(null);
-                return new RemoteA2aResult(RemoteA2aOutcome.TASK, id, contextId, state,
-                        json.writeValueAsString(task), null);
-            }
+            return new RemoteA2aResult(RemoteA2aOutcome.TASK, id, contextId, state,
+                    json.writeValueAsString(task), null);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             return unknown("A2A_INTERRUPTED");

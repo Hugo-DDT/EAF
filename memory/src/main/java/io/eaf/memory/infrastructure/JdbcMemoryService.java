@@ -33,12 +33,14 @@ import io.eaf.shared.EafException;
 import io.eaf.shared.Hashing;
 import io.eaf.workspace.api.WorkspaceAuthorization;
 import java.sql.Timestamp;
+import java.text.Normalizer;
 import java.time.Clock;
 import java.time.Instant;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -344,6 +346,61 @@ public class JdbcMemoryService implements MemoryService, ExperienceCardService {
         var items = hasNext ? cards.subList(0, limit) : cards;
         var last = items.isEmpty() ? null : items.get(items.size() - 1);
         return new TeamExperiencePage(items, hasNext ? last.updatedAt() : null, hasNext ? last.id() : null);
+    }
+
+    @Transactional(readOnly = true)
+    public TeamExperienceService.TeamExperienceDiscovery discoverTeam(ActorContext actor, UUID workspaceId,
+            String scenarioKey, List<String> keywords, int limit) {
+        requireTeamAccess(actor, workspaceId, "memory:read");
+        var scenario = teamScenario(scenarioKey);
+        if (keywords == null || keywords.isEmpty() || keywords.size() > 8 || limit < 1 || limit > 20)
+            throw EafException.invalid("团队经验发现仅接受 1—8 个关键词和 1—20 条结果。");
+        var terms = new ArrayList<String>();
+        for (var keyword : keywords) {
+            if (keyword == null) throw EafException.invalid("发现关键词不能为空。");
+            var normalized = Normalizer.normalize(keyword.trim(), Normalizer.Form.NFKC).trim().toLowerCase(Locale.ROOT);
+            var length = normalized.codePointCount(0, normalized.length());
+            if (length < 1 || length > 40) throw EafException.invalid("发现关键词长度须为 1—40 个字符。");
+            if (!terms.contains(normalized)) terms.add(normalized);
+        }
+        var score = "sum((case when strpos(lower(r.title), kw.term) > 0 then 3 else 0 end) + "
+                + "(case when strpos(lower(r.applies_when), kw.term) > 0 then 2 else 0 end) + "
+                + "(case when strpos(lower(r.experience_content), kw.term) > 0 then 1 else 0 end))";
+        var sql = new StringBuilder("with kw(term) as (values ");
+        sql.append(String.join(", ", java.util.Collections.nCopies(terms.size(), "(?)")));
+        sql.append(") select c.memory_id, ").append(score).append(" as score "
+                + "from memory.experience_card c "
+                + "join memory.experience_card_revision r on r.tenant_id = c.tenant_id and r.workspace_id = c.workspace_id "
+                + "and r.memory_id = c.memory_id and r.revision = c.active_revision "
+                + "join memory.version v on v.tenant_id = r.tenant_id and v.workspace_id = r.workspace_id "
+                + "and v.memory_id = r.memory_id and v.asset_version = r.memory_version "
+                + "cross join kw where c.tenant_id = ? and c.workspace_id = ? and c.card_kind = 'TEAM' "
+                + "and c.scenario_key = ? and c.active_revision is not null and v.status = 'PUBLISHED' and v.expires_at > now() "
+                + "group by c.memory_id having ").append(score).append(" > 0 order by score desc, c.memory_id asc limit ?");
+        var args = new ArrayList<Object>(terms);
+        args.add(actor.tenantId()); args.add(workspaceId); args.add(scenario); args.add(limit);
+        var ranked = jdbc.query(sql.toString(), (rs, row) -> new RankedExperience(
+                rs.getObject("memory_id", UUID.class), rs.getInt("score")), args.toArray());
+        var items = ranked.stream().map(row -> {
+            var card = getTeam(actor, workspaceId, row.cardId());
+            var revision = card.active();
+            if (revision == null) return null;
+            var fields = new java.util.LinkedHashSet<String>();
+            var matched = terms.stream().filter(term -> {
+                var found = false;
+                if (revision.title().toLowerCase(Locale.ROOT).contains(term)) { fields.add("title"); found = true; }
+                if (revision.appliesWhen().toLowerCase(Locale.ROOT).contains(term)) { fields.add("appliesWhen"); found = true; }
+                if (revision.content().toLowerCase(Locale.ROOT).contains(term)) { fields.add("content"); found = true; }
+                return found;
+            }).toList();
+            if (matched.isEmpty()) return null;
+            var source = revision.source() == null ? null : new TeamExperienceService.TeamExperienceSourceSummary(
+                    revision.source().workItemId(), revision.source().outcome(), revision.source().completedAt());
+            return new TeamExperienceService.DiscoveredTeamExperience(card.id(), revision.revision(),
+                    revision.memoryVersion(), revision.contentHash(), revision.title(), revision.appliesWhen(), row.score(),
+                    matched, List.copyOf(fields), preview(revision.content(), 200), revision.expiresAt(), source);
+        }).filter(java.util.Objects::nonNull).toList();
+        return new TeamExperienceService.TeamExperienceDiscovery("TEAM_KEYWORD_DISCOVERY_V1", items);
     }
 
     @Transactional(readOnly = true)
@@ -752,6 +809,11 @@ public class JdbcMemoryService implements MemoryService, ExperienceCardService {
         return value;
     }
 
+    private String preview(String value, int maxCodePoints) {
+        var count = value.codePointCount(0, value.length());
+        return count <= maxCodePoints ? value : value.substring(0, value.offsetByCodePoints(0, maxCodePoints));
+    }
+
     private String teamExperienceContent(String appliesWhen, String content) {
         return "适用条件：" + appliesWhen + "\n建议：" + content;
     }
@@ -879,6 +941,7 @@ public class JdbcMemoryService implements MemoryService, ExperienceCardService {
     private record TeamCandidateOrigin(UUID cardId, int revision, String memoryVersion, long cardVersion,
             int baseRevision, String baseMemoryVersion, String contentHash, Long withdrawalCardVersion) { }
     private record TeamCandidateRevision(int revision, String memoryVersion) { }
+    private record RankedExperience(UUID cardId, int score) { }
     private record TeamExperienceCreateHash(String scenarioKey, String title, String appliesWhen, String content,
             Instant expiresAt, UUID sourceWorkItemId) { }
     private record TeamExperienceSaveHash(UUID cardId, long expectedVersion, String title, String appliesWhen,

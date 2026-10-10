@@ -175,15 +175,12 @@ public final class TypesafeJevEvidenceAssessmentGateway implements EvidenceAsses
     }
 
     private boolean causedByCredentialFailure(Throwable cause) {
-        for (var current = cause; current != null; current = current.getCause())
-            if (current instanceof ProviderCredentialUnavailableException) return true;
-        return false;
+        return ProviderFailureSupport.causedBy(cause, ProviderCredentialUnavailableException.class) != null;
     }
 
     private Integer causedByHttpStatus(Throwable cause) {
-        for (var current = cause; current != null; current = current.getCause())
-            if (current instanceof ProviderHttpStatusException status) return status.status();
-        return null;
+        var status = ProviderFailureSupport.causedBy(cause, ProviderHttpStatusException.class);
+        return status == null ? null : status.status();
     }
 
     private ModelFailure invalidResponse() {

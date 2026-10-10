@@ -11,6 +11,8 @@ public interface ExecutionService {
     ExecutionSnapshot get(ActorContext actor, UUID workspaceId, UUID executionId);
     /** 供已授权的业务关联读取某个固定 Workflow Task 的当前 Execution 投影。 */
     Optional<ExecutionSnapshot> findForTask(ActorContext actor, UUID workspaceId, UUID taskId);
+    /** P27 source-bound status read; does not require the general execution:read grant. */
+    Optional<ExecutionSnapshot> findP27ResultSyncForTask(ActorContext actor, UUID workspaceId, UUID taskId);
     /** 仅读取本人固定 register Task 的 Execution 回执，不要求额外授予 execution:read。 */
     Optional<ExecutionSnapshot> findServiceRequestRegistration(ActorContext actor, UUID workspaceId,
             UUID taskId, int attempt, UUID submissionId);

@@ -15,7 +15,9 @@ import jakarta.servlet.http.HttpServletRequest;
 import java.net.URI;
 import java.util.List;
 import java.util.Map;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.web.servlet.ServletRegistrationBean;
 import org.springframework.context.annotation.Bean;
@@ -70,14 +72,19 @@ public class McpTransportConfiguration {
 
     @Bean(destroyMethod = "close")
     McpSyncServer mcpServer(@Qualifier("mcpVersionPinnedTransport") McpStreamableServerTransportProvider transport,
-                            McpTaskTools tools) {
-        return McpServer.sync(transport)
+                            McpTaskTools tools, ObjectProvider<McpDeclarativeResources> declarativeResources,
+                            @Value("${eaf.agent-protocol.declarative-resources-enabled:false}") boolean resourcesEnabled) {
+        var capabilities = ServerCapabilities.builder().tools(false);
+        var server = McpServer.sync(transport)
                 .serverInfo("eaf", "0.1.0")
-                .capabilities(ServerCapabilities.builder().tools(false).build())
                 .strictToolNameValidation(false)
-                .validateToolInputs(true)
-                .tools(tools.specifications())
-                .build();
+                .validateToolInputs(true);
+        if (resourcesEnabled) {
+            capabilities.resources(false, false);
+            var resources = declarativeResources.getObject();
+            server.resources(resources.resourceSpecifications()).resourceTemplates(resources.templateSpecifications());
+        }
+        return server.capabilities(capabilities.build()).tools(tools.specifications()).build();
     }
 
     private static McpTransportContext transportContext(HttpServletRequest request) {

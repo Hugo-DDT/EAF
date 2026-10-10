@@ -132,6 +132,10 @@ public class WorkflowDispatcher {
         if (runtime.childTaskId() == null) {
             var capability = capabilities.requirePublished(actor, instance.workspaceId(), step.capabilityId(), step.capabilityVersion());
             var command = taskCommand(instance, actor, step, runtime, capability);
+            if (UUID.fromString("58000000-0000-4000-8000-00000000001d").equals(instance.workflowId())) {
+                workflows.createProjectBriefTaskAndLink(lease, step.id(), command);
+                return;
+            }
             // 查询是丢失创建响应后的恢复路径；再次走创建 API 会校验同键绑定并安全地重放。
             var existing = tasks.findByIdempotencyKey(actor, instance.workspaceId(), runtime.dispatchKey());
             var child = tasks.createWorkflowTask(command);

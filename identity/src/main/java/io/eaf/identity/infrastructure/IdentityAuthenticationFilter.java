@@ -32,13 +32,25 @@ public class IdentityAuthenticationFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
         if ("local".equals(mode)) {
-            var header = request.getHeader("Authorization");
-            if (header != null && header.startsWith("Bearer ")) {
+            var authHeaders = headers(request, "Authorization");
+            var delegationHeaders = headers(request, "X-EAF-Delegation");
+            if (authHeaders.size() == 1 && delegationHeaders.size() <= 1) {
+                var header = authHeaders.getFirst();
+                if (header == null || !header.startsWith("Bearer ")) {
+                    chain.doFilter(request, response);
+                    return;
+                }
                 var token = header.substring(7).trim();
-                var delegationHeader = request.getHeader("X-EAF-Delegation");
+                var delegationHeader = delegationHeaders.isEmpty() ? null : delegationHeaders.getFirst();
+                if (token.isEmpty() || token.chars().anyMatch(Character::isWhitespace)
+                        || delegationHeader != null && delegationHeader.isBlank()) {
+                    chain.doFilter(request, response);
+                    return;
+                }
+                var audience = isMcpRequest(request) ? IdentityService.MCP_AUDIENCE : IdentityService.REST_AUDIENCE;
                 var resolved = delegationHeader == null || delegationHeader.isBlank()
                         ? identities.resolveToken(token).filter(actor -> actor.type() != io.eaf.shared.ActorType.AGENT)
-                        : resolveDelegated(token, delegationHeader);
+                        : resolveDelegated(token, delegationHeader, audience);
                 resolved.ifPresent(actor ->
                         SecurityContextHolder.getContext().setAuthentication(
                                 new UsernamePasswordAuthenticationToken(actor, null, java.util.List.of())));
@@ -65,12 +77,29 @@ public class IdentityAuthenticationFilter extends OncePerRequestFilter {
         return java.util.Optional.of(token);
     }
 
-    private java.util.Optional<io.eaf.shared.ActorContext> resolveDelegated(String token, String delegationHeader) {
+    private java.util.Optional<io.eaf.shared.ActorContext> resolveDelegated(String token, String delegationHeader,
+                                                                            String audience) {
         try {
-            return identities.resolveDelegatedToken(token, UUID.fromString(delegationHeader), IdentityService.REST_AUDIENCE);
+            return identities.resolveDelegatedToken(token, UUID.fromString(delegationHeader), audience);
         } catch (IllegalArgumentException malformed) {
             return java.util.Optional.empty();
         }
+    }
+
+    private static java.util.List<String> headers(HttpServletRequest request, String name) {
+        var values = request.getHeaders(name);
+        if (values == null) return java.util.List.of();
+        var result = new java.util.ArrayList<String>();
+        while (values.hasMoreElements()) result.add(values.nextElement());
+        return result;
+    }
+
+    private static boolean isMcpRequest(HttpServletRequest request) {
+        var path = request.getRequestURI();
+        var contextPath = request.getContextPath();
+        if (contextPath != null && !contextPath.isEmpty() && path.startsWith(contextPath))
+            path = path.substring(contextPath.length());
+        return "/mcp".equals(path);
     }
 }
 // 本文件负责实现 EAF 的 IdentityAuthenticationFilter.java 相关代码。

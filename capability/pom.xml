@@ -7,6 +7,7 @@
     <artifactId>eaf-capability</artifactId>
     <dependencies>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-shared</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-identity</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-workspace</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-agent</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-prompt</artifactId><version>${project.version}</version></dependency>

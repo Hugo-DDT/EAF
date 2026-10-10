@@ -9,6 +9,8 @@ import java.util.List;
 import java.util.UUID;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class JdbcWorkspaceAuthorization implements WorkspaceAuthorization {
@@ -50,6 +52,21 @@ public class JdbcWorkspaceAuthorization implements WorkspaceAuthorization {
                 Integer.class, workspaceId, actor.actorId(), action);
         if (allowed == null || allowed == 0) throw EafException.forbidden("当前身份没有动作 " + action + " 的权限。");
         return workspace;
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
+    public WorkspaceAccess requireActionForUpdate(ActorContext actor, UUID workspaceId, String action) {
+        if (workspaceId == null) throw EafException.invalid("workspaceId 不能为空。");
+        if (actor == null || actor.type() != io.eaf.shared.ActorType.HUMAN || actor.delegated())
+            throw EafException.forbidden("授权变更串行化只支持直接 HUMAN 身份。");
+        require(actor, workspaceId, action);
+        jdbc.query("select action from workspace.\"grant\" where tenant_id = ? and workspace_id = ? "
+                        + "and actor_id = ? and action = ? and status = 'ACTIVE' for update",
+                rs -> rs.next() ? rs.getString("action") : null,
+                actor.tenantId(), workspaceId, actor.actorId(), action);
+        // 锁等待后重查授权，确保并发撤权先提交时创建不会继续。
+        return require(actor, workspaceId, action);
     }
 
     @Override

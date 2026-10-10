@@ -48,6 +48,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -667,6 +668,25 @@ public class JdbcEvaluationService implements EvaluationService {
         }
         return new CandidateContextSnapshot(snapshot.id(), command.candidateId(), command.candidateRevision(),
                 snapshot.targetType(), snapshot.candidateContentHash(), snapshot.createdAt());
+    }
+
+    @Override
+    public Optional<CandidateContextSnapshot> findTeamPreparationSnapshot(ActorContext actor, UUID workspaceId,
+            UUID candidateId, int revision) {
+        requireDirectEvaluation(actor, workspaceId, "evaluation:run");
+        if (candidateId == null || revision < 1) throw EafException.invalid("TEAM preparation 快照查询参数无效。");
+        return Optional.ofNullable(jdbc.query("select c.id, c.candidate_id, c.candidate_revision, c.target_type, "
+                        + "c.candidate_content_hash, c.created_at from evaluation.candidate_context_snapshot c "
+                        + "join evaluation.team_preparation_snapshot s on s.snapshot_id = c.id "
+                        + "where c.tenant_id = ? and c.workspace_id = ? and c.candidate_id = ? and c.candidate_revision = ? "
+                        + "and c.owner_id = ? and s.owner_id = ? and c.target_type = 'TEAM_EXPERIENCE_UPDATE' "
+                        + "and s.candidate_id = c.candidate_id and s.candidate_revision = c.candidate_revision "
+                        + "and c.invalidated_at is null",
+                rs -> rs.next() ? new CandidateContextSnapshot(rs.getObject("id", UUID.class),
+                        rs.getObject("candidate_id", UUID.class), rs.getInt("candidate_revision"),
+                        rs.getString("target_type"), rs.getString("candidate_content_hash"),
+                        rs.getTimestamp("created_at").toInstant()) : null,
+                actor.tenantId(), workspaceId, candidateId, revision, actor.actorId(), actor.actorId()));
     }
 
     @Override

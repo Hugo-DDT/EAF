@@ -2,6 +2,8 @@ package io.eaf.task.api;
 
 import java.util.UUID;
 import java.time.Instant;
+import java.util.Optional;
+import io.eaf.model.api.ModelProfileSelection;
 
 /** Task 通过此端口验证服务端质量运行绑定，避免自身持有 Evaluation 表读权限。 */
 public interface QualityRunSourceVerifier {
@@ -24,6 +26,9 @@ public interface QualityRunSourceVerifier {
                                   UUID sampleId, String taskKey, UUID agentId, String agentVersion,
                                   String inputHash, TaskAssetBinding assetBinding);
 
+    boolean scenarioSampleModelProfileMatches(UUID tenantId, UUID workspaceId, UUID actorId, UUID qualityRunId,
+            UUID sampleId, ModelProfileSelection selection);
+
     /** Runtime 在每次检索/生成前调用，复核原样本 Task、期限、资产与合成 Knowledge 清单。 */
     boolean scenarioTaskMatches(UUID tenantId, UUID workspaceId, UUID actorId, UUID taskId, UUID rootTaskId,
                                 UUID qualityRunId, int attempt, UUID agentId, String agentVersion,
@@ -31,6 +36,8 @@ public interface QualityRunSourceVerifier {
 
     boolean isScenarioRun(UUID tenantId, UUID workspaceId, UUID qualityRunId);
     boolean isScenarioTask(UUID tenantId, UUID workspaceId, UUID taskId);
+    /** 仅唯一登记在当前租户和 Workspace 的评测样本 Task 返回其运行 Owner。 */
+    Optional<UUID> scenarioTaskOwner(UUID tenantId, UUID workspaceId, UUID taskId);
 
     /** 生成 Task 只能使用登记的单次输入、固定资产、稳定键和截止时间。 */
     boolean isTeamImprovementRun(UUID tenantId, UUID workspaceId, UUID qualityRunId);

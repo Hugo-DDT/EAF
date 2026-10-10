@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class DeterministicModelGateway implements ModelGateway {
     private static final Pattern CUSTOMER_ID = Pattern.compile("(?:customer[-_ ]?id|客户)\\s*[:=：]?\\s*([A-Za-z0-9._:-]{1,160})", Pattern.CASE_INSENSITIVE);
     private static final Pattern CITATION_ID = Pattern.compile("\"citationId\"\\s*:\\s*\"([^\"]{1,80})\"");
+    private static final Pattern EVIDENCE_ID = Pattern.compile("\"evidenceId\"\\s*:\\s*\"([A-Z][A-Z0-9]{0,19})\"");
     private static final Pattern KNOWLEDGE_CITATION = Pattern.compile("\\{[^{}]*\"citationId\"\\s*:\\s*\"([^\"]{1,80})\"[^{}]*\"sourceType\"\\s*:\\s*\"KNOWLEDGE\"[^{}]*}", Pattern.DOTALL);
     private final String scenario;
     private final AtomicInteger calls = new AtomicInteger();
@@ -71,6 +72,23 @@ public final class DeterministicModelGateway implements ModelGateway {
         if (candidateRule && taskText.contains("续约中断")) risk = "HIGH";
         var profileMarker = request.messages().stream().filter(message -> "system".equals(message.role()))
                 .map(message -> message.content()).findFirst().orElse("");
+        if (profileMarker.contains("MY_P16_WORK_DIGEST_RESPONSE_V1")) {
+            var matcher = EVIDENCE_ID.matcher(latestText);
+            var evidence = matcher.find() ? matcher.group(1) : "W1";
+            return new ModelResult("deterministic", "p30-test",
+                    ("{\"overview\":\"已按当前快照整理本人待办；请对照证据核验状态、截止时间和摘要预览。\","
+                            + "\"attentionItems\":[{\"text\":\"优先核对当前状态与截止时间；摘要预览不代表处理结果。\",\"evidenceIds\":[\"%s\"]}]}")
+                            .formatted(evidence), 48, 19, "KNOWN");
+        }
+        if (profileMarker.contains("PROJECT_BRIEF_PREPARE_V1")) {
+            var matcher = EVIDENCE_ID.matcher(latestText);
+            var citation = matcher.find() ? matcher.group(1) : null;
+            var citations = citation == null ? "[]"
+                    : "[{\"evidenceId\":\"%s\",\"reason\":\"依据已选来源整理\"}]".formatted(citation);
+            return new ModelResult("deterministic", "p29-test",
+                    ("{\"overview\":\"依据用户选择的资料与待办整理项目简报草稿，事实仍以来源快照为准。\","
+                            + "\"attentionItems\":[],\"citations\":%s}").formatted(citations), 48, 18, "KNOWN");
+        }
         if (profileMarker.contains("P15_SERVICE_REQUEST_PLAN_V1")) {
             var citation = citation(request);
             if ("SERVICE_REQUEST_SEARCH".equals(scenario) && calls.get() == 1)

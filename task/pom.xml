@@ -11,6 +11,7 @@
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-identity</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-policy</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-agent</artifactId><version>${project.version}</version></dependency>
+        <dependency><groupId>io.eaf</groupId><artifactId>eaf-model</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-tool</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>io.eaf</groupId><artifactId>eaf-audit</artifactId><version>${project.version}</version></dependency>
         <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId></dependency>

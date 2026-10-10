@@ -54,6 +54,11 @@ final class DeclarativeCapabilityPackageCodec {
             .enable(DeserializationFeature.FAIL_ON_READING_DUP_TREE_KEY);
 
     byte[] export(ExportSource source) {
+        var rendered = render(source);
+        return zip(rendered.root(), rendered.files());
+    }
+
+    RenderedPackage render(ExportSource source) {
         if (source == null || source.sourceWorkspaceId() == null || source.capability() == null || source.skill() == null)
             throw EafException.invalid("声明包导出来源不完整。");
         var capability = source.capability();
@@ -86,8 +91,39 @@ final class DeclarativeCapabilityPackageCodec {
         var manifest = (ObjectNode) base.deepCopy();
         manifest.put("packageHash", packageHash);
         files.put(MANIFEST, text(write(normalize(manifest))));
-        return zip(root, files);
+        validateRenderedFiles(files);
+        return new RenderedPackage(root, packageHash, Map.copyOf(files));
     }
+
+    List<SkillPackageService.DeclarationFileInfo> describe(RenderedPackage rendered) {
+        return ZIP_ORDER.stream().map(path -> {
+            var content = bytes(rendered.files().get(path));
+            var mimeType = path.endsWith(".md") ? "text/markdown" : "application/json";
+            return new SkillPackageService.DeclarationFileInfo(path, mimeType, content.length,
+                    Hashing.sha256(text(content)));
+        }).toList();
+    }
+
+    byte[] readFile(RenderedPackage rendered, String path) {
+        var content = rendered.files().get(path);
+        if (content == null) throw EafException.invalid("声明文件路径无效。");
+        return bytes(content);
+    }
+
+    private void validateRenderedFiles(Map<String, String> files) {
+        // 在线声明不经过 ZIP 解包；按原始 UTF-8 文件字节复用 P25 导入限额。
+        long total = 0;
+        for (var content : files.values()) {
+            var size = bytes(content).length;
+            if (size > MAX_FILE_BYTES)
+                throw packageError("PACKAGE_TOO_LARGE", "生成的声明包单文件超过 256 KiB 限制。");
+            total += size;
+        }
+        if (total > MAX_TOTAL_BYTES)
+            throw packageError("PACKAGE_TOO_LARGE", "生成的声明包解压内容超过 1 MiB 限制。");
+    }
+
+    record RenderedPackage(String root, String packageHash, Map<String, String> files) { }
 
     Decoded validate(byte[] zip) {
         if (zip == null || zip.length == 0) throw EafException.invalid("声明包 ZIP 不能为空。");

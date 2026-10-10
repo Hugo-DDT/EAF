@@ -28,6 +28,7 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class JdbcSkillService implements SkillService {
     private static final int MAX_SCHEMA_LENGTH = 16_384;
+    private static final UUID P15_SKILL = UUID.fromString("53000000-0000-4000-8000-00000000000f");
     private final JdbcTemplate jdbc;
     private final WorkspaceAuthorization workspaces;
     private final PromptCatalog prompts;
@@ -142,6 +143,102 @@ public class JdbcSkillService implements SkillService {
                 UUID.randomUUID(), access.tenantId(), workspaceId, skillId, version, actor.actorId());
         return load(access.tenantId(), workspaceId, skillId, version);
     }
+
+    @Override
+    @Transactional
+    public PromptVariant publishPromptAnalysisVariant(ActorContext actor, UUID workspaceId, UUID candidateId,
+            int revision, UUID adoptionId, UUID promptId, String promptVersion, String promptHash,
+            UUID approvalId, UUID reportId, String reportHash) {
+        requirePromptOwner(actor, workspaceId, "skill:write");
+        workspaces.require(actor, workspaceId, "skill:publish");
+        if (candidateId == null || revision < 1 || adoptionId == null || promptId == null
+                || !"1.0.0".equals(promptVersion) || !hexHash(promptHash) || approvalId == null || reportId == null
+                || !hexHash(reportHash)) throw EafException.invalid("Skill 派生来源必须绑定精确 Prompt、批准和报告。");
+        var prior = findPromptVariant(actor, workspaceId, candidateId, revision, adoptionId);
+        if (prior != null) {
+            if (!prior.promptId().equals(promptId) || !prior.promptVersion().equals(promptVersion)
+                    || !prior.promptHash().equals(promptHash) || !prior.approvalId().equals(approvalId)
+                    || !prior.reportId().equals(reportId) || !prior.reportHash().equals(reportHash))
+                throw EafException.conflict("PROMPT_VARIANT_CONFLICT", "Skill 派生来源已绑定其他 Prompt。");
+            return prior;
+        }
+        var base = requirePublished(actor, workspaceId, P15_SKILL, "1.0.0");
+        if (!base.toolDependencies().isEmpty()) throw EafException.conflict("PROMPT_VARIANT_BASE_UNSAFE", "P15 基线 Skill 必须没有 Tool。");
+        // 派生 Skill 绑定新发布的 Prompt ID；基线只固定原 P15 Skill 修订。
+        if (!"1.0.0".equals(base.promptVersion()))
+            throw EafException.conflict("PROMPT_VARIANT_BASE_STALE", "P15 基线 Skill Prompt 修订已变化。");
+        prompts.requirePublished(actor.tenantId(), workspaceId, promptId, promptVersion);
+        var id = UUID.randomUUID();
+        var version = "1.0.0";
+        var name = "service-request-plan-p31-" + id.toString().substring(0, 8);
+        jdbc.update("insert into skill.definition(id, tenant_id, workspace_id, owner_id, name, description) "
+                        + "values (?, ?, ?, ?, ?, ?)", id, actor.tenantId(), workspaceId, actor.actorId(), name,
+                "P31 显式采用的只读 P15 分析 Skill。");
+        jdbc.update("insert into skill.version(skill_id, tenant_id, workspace_id, asset_version, input_schema, output_schema, "
+                        + "prompt_id, prompt_version, evaluation_ref, status) select ?, tenant_id, workspace_id, ?, input_schema, "
+                        + "output_schema, ?, ?, evaluation_ref, 'PUBLISHED' from skill.version where skill_id = ? "
+                        + "and tenant_id = ? and workspace_id = ? and asset_version = ? and status = 'PUBLISHED'",
+                id, version, promptId, promptVersion, base.id(), actor.tenantId(), workspaceId, base.version());
+        jdbc.update("insert into skill.release(release_id, tenant_id, workspace_id, skill_id, skill_version, action, actor_id) "
+                        + "values (?, ?, ?, ?, ?, 'PUBLISHED', ?)", UUID.randomUUID(), actor.tenantId(), workspaceId, id, version, actor.actorId());
+        jdbc.update("insert into skill.prompt_variant_origin(tenant_id, workspace_id, candidate_id, candidate_revision, adoption_id, "
+                        + "owner_id, skill_id, skill_version, base_skill_id, base_skill_version, prompt_id, prompt_version, prompt_hash, "
+                        + "approval_id, report_id, report_hash, status) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PUBLISHED')",
+                actor.tenantId(), workspaceId, candidateId, revision, adoptionId, actor.actorId(), id, version, base.id(), base.version(),
+                promptId, promptVersion, promptHash, approvalId, reportId, reportHash);
+        return findPromptVariant(actor, workspaceId, candidateId, revision, adoptionId);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public java.util.Optional<PromptVariant> findPromptAnalysisVariant(ActorContext actor, UUID workspaceId,
+            UUID candidateId, int revision, UUID adoptionId) {
+        requirePromptOwner(actor, workspaceId, "skill:read");
+        return java.util.Optional.ofNullable(findPromptVariant(actor, workspaceId, candidateId, revision, adoptionId));
+    }
+
+    @Override
+    @Transactional
+    public PromptVariant revokePromptAnalysisVariant(ActorContext actor, UUID workspaceId,
+            UUID candidateId, int revision, UUID adoptionId) {
+        requirePromptOwner(actor, workspaceId, "skill:publish");
+        var variant = findPromptVariant(actor, workspaceId, candidateId, revision, adoptionId);
+        if (variant == null) throw EafException.notFound();
+        jdbc.update("update skill.version set status = 'REVOKED', row_version = row_version + 1 where tenant_id = ? "
+                        + "and workspace_id = ? and skill_id = ? and asset_version = ? and status = 'PUBLISHED'",
+                actor.tenantId(), workspaceId, variant.id(), variant.version());
+        jdbc.update("update skill.prompt_variant_origin set status = 'REVOKED' where tenant_id = ? and workspace_id = ? "
+                        + "and candidate_id = ? and candidate_revision = ? and adoption_id = ? and status = 'PUBLISHED'",
+                actor.tenantId(), workspaceId, candidateId, revision, adoptionId);
+        jdbc.update("insert into skill.release(release_id, tenant_id, workspace_id, skill_id, skill_version, action, actor_id) "
+                        + "values (?, ?, ?, ?, ?, 'REVOKED', ?) on conflict do nothing",
+                UUID.randomUUID(), actor.tenantId(), workspaceId, variant.id(), variant.version(), actor.actorId());
+        return findPromptVariant(actor, workspaceId, candidateId, revision, adoptionId);
+    }
+
+    private PromptVariant findPromptVariant(ActorContext actor, UUID workspaceId, UUID candidateId, int revision, UUID adoptionId) {
+        return jdbc.query("select o.skill_id, o.skill_version, o.base_skill_id, o.base_skill_version, o.prompt_id, o.prompt_version, "
+                        + "o.prompt_hash, o.approval_id, o.report_id, o.report_hash, "
+                        + "o.status from skill.prompt_variant_origin o where o.tenant_id = ? and o.workspace_id = ? and o.owner_id = ? "
+                        + "and o.candidate_id = ? and o.candidate_revision = ? and o.adoption_id = ?",
+                rs -> rs.next() ? new PromptVariant(rs.getObject("skill_id", UUID.class), rs.getString("skill_version"),
+                        rs.getObject("base_skill_id", UUID.class), rs.getString("base_skill_version"),
+                        rs.getObject("prompt_id", UUID.class), rs.getString("prompt_version"),
+                        rs.getString("prompt_hash"), rs.getObject("approval_id", UUID.class),
+                        rs.getObject("report_id", UUID.class), rs.getString("report_hash"),
+                        load(actor.tenantId(), workspaceId, rs.getObject("skill_id", UUID.class), rs.getString("skill_version")).contentHash(),
+                        rs.getString("status")) : null,
+                actor.tenantId(), workspaceId, actor.actorId(), candidateId, revision, adoptionId);
+    }
+
+    private void requirePromptOwner(ActorContext actor, UUID workspaceId, String permission) {
+        if (actor == null || actor.type() != io.eaf.shared.ActorType.HUMAN || actor.delegated())
+            throw EafException.forbidden("P31 Skill 变体只允许直接 HUMAN Owner 操作。");
+        workspaces.require(actor, workspaceId, "agent:read");
+        workspaces.require(actor, workspaceId, permission);
+    }
+
+    private boolean hexHash(String value) { return value != null && value.matches("[0-9a-f]{64}"); }
 
     private ValidatedVersion validateVersion(ActorContext actor, UUID workspaceId, CreateSkillVersionCommand command) {
         if (command == null) throw EafException.invalid("Skill 版本不能为空。");
